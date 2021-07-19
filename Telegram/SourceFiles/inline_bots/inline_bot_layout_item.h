@@ -12,6 +12,10 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 class Image;
 
+namespace Ui {
+class PathShiftGradient;
+} // namespace Ui
+
 namespace Data {
 class CloudImageView;
 } // namespace Data
@@ -27,16 +31,23 @@ class ItemBase;
 class PaintContext : public PaintContextBase {
 public:
 	PaintContext(crl::time ms, bool selecting, bool paused, bool lastRow)
-		: PaintContextBase(ms, selecting)
-		, paused(paused)
-		, lastRow(lastRow) {
+	: PaintContextBase(ms, selecting)
+	, paused(paused)
+	, lastRow(lastRow) {
 	}
 	bool paused, lastRow;
+	Ui::PathShiftGradient *pathGradient = nullptr;
 
 };
 
 // this type used as a flag, we dynamic_cast<> to it
 class SendClickHandler : public ClickHandler {
+public:
+	void onClick(ClickContext context) const override {
+	}
+};
+
+class OpenFileClickHandler : public ClickHandler {
 public:
 	void onClick(ClickContext context) const override {
 	}
@@ -131,6 +142,7 @@ protected:
 	PhotoData *_photo = nullptr;
 
 	ClickHandlerPtr _send = ClickHandlerPtr{ new SendClickHandler() };
+	ClickHandlerPtr _open = ClickHandlerPtr{ new OpenFileClickHandler() };
 
 	int _position = 0; // < 0 means removed from layout
 

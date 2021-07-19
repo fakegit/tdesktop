@@ -75,14 +75,6 @@ bool finished = true;
 QMargins simpleMargins, margins;
 HICON bigIcon = 0, smallIcon = 0, overlayIcon = 0;
 
-class _PsInitializer {
-public:
-	_PsInitializer() {
-		Dlls::start();
-	}
-};
-_PsInitializer _psInitializer;
-
 BOOL CALLBACK _ActivateProcess(HWND hWnd, LPARAM lParam) {
 	uint64 &processId(*(uint64*)lParam);
 
@@ -104,7 +96,7 @@ BOOL CALLBACK _ActivateProcess(HWND hWnd, LPARAM lParam) {
 	return TRUE;
 }
 
-}
+} // namespace
 
 void psActivateProcess(uint64 pid) {
 	if (pid) {
@@ -244,7 +236,6 @@ void start() {
 } // namespace ThirdParty
 
 void start() {
-	Dlls::init();
 }
 
 void finish() {
@@ -291,6 +282,31 @@ std::optional<bool> IsDarkMode() {
 
 bool AutostartSupported() {
 	return !IsWindowsStoreBuild();
+}
+
+void WriteCrashDumpDetails() {
+#ifndef DESKTOP_APP_DISABLE_CRASH_REPORTS
+	PROCESS_MEMORY_COUNTERS data = { 0 };
+	if (Dlls::GetProcessMemoryInfo
+		&& Dlls::GetProcessMemoryInfo(
+			GetCurrentProcess(),
+			&data,
+			sizeof(data))) {
+		const auto mb = 1024 * 1024;
+		CrashReports::dump()
+			<< "Memory-usage: "
+			<< (data.PeakWorkingSetSize / mb)
+			<< " MB (peak), "
+			<< (data.WorkingSetSize / mb)
+			<< " MB (current)\n";
+		CrashReports::dump()
+			<< "Pagefile-usage: "
+			<< (data.PeakPagefileUsage / mb)
+			<< " MB (peak), "
+			<< (data.PagefileUsage / mb)
+			<< " MB (current)\n";
+	}
+#endif // DESKTOP_APP_DISABLE_CRASH_REPORTS
 }
 
 } // namespace Platform
@@ -356,49 +372,6 @@ namespace {
 
 namespace Platform {
 
-void RegisterCustomScheme(bool force) {
-	if (cExeName().isEmpty()) {
-		return;
-	}
-	DEBUG_LOG(("App Info: Checking custom scheme 'tg'..."));
-
-	HKEY rkey;
-	QString exe = QDir::toNativeSeparators(cExeDir() + cExeName());
-
-	// Legacy URI scheme registration
-	if (!_psOpenRegKey(L"Software\\Classes\\tg", &rkey)) return;
-	if (!_psSetKeyValue(rkey, L"URL Protocol", QString())) return;
-	if (!_psSetKeyValue(rkey, 0, qsl("URL:Telegram Link"))) return;
-
-	if (!_psOpenRegKey(L"Software\\Classes\\tg\\DefaultIcon", &rkey)) return;
-	if (!_psSetKeyValue(rkey, 0, '"' + exe + qsl(",1\""))) return;
-
-	if (!_psOpenRegKey(L"Software\\Classes\\tg\\shell", &rkey)) return;
-	if (!_psOpenRegKey(L"Software\\Classes\\tg\\shell\\open", &rkey)) return;
-	if (!_psOpenRegKey(L"Software\\Classes\\tg\\shell\\open\\command", &rkey)) return;
-	if (!_psSetKeyValue(rkey, 0, '"' + exe + qsl("\" -workdir \"") + cWorkingDir() + qsl("\" -- \"%1\""))) return;
-
-	// URI scheme registration as Default Program - Windows Vista and above
-	if (!_psOpenRegKey(L"Software\\Classes\\tdesktop.tg", &rkey)) return;
-	if (!_psOpenRegKey(L"Software\\Classes\\tdesktop.tg\\DefaultIcon", &rkey)) return;
-	if (!_psSetKeyValue(rkey, 0, '"' + exe + qsl(",1\""))) return;
-
-	if (!_psOpenRegKey(L"Software\\Classes\\tdesktop.tg\\shell", &rkey)) return;
-	if (!_psOpenRegKey(L"Software\\Classes\\tdesktop.tg\\shell\\open", &rkey)) return;
-	if (!_psOpenRegKey(L"Software\\Classes\\tdesktop.tg\\shell\\open\\command", &rkey)) return;
-	if (!_psSetKeyValue(rkey, 0, '"' + exe + qsl("\" -workdir \"") + cWorkingDir() + qsl("\" -- \"%1\""))) return;
-
-	if (!_psOpenRegKey(L"Software\\TelegramDesktop", &rkey)) return;
-	if (!_psOpenRegKey(L"Software\\TelegramDesktop\\Capabilities", &rkey)) return;
-	if (!_psSetKeyValue(rkey, L"ApplicationName", qsl("Telegram Desktop"))) return;
-	if (!_psSetKeyValue(rkey, L"ApplicationDescription", qsl("Telegram Desktop"))) return;
-	if (!_psOpenRegKey(L"Software\\TelegramDesktop\\Capabilities\\UrlAssociations", &rkey)) return;
-	if (!_psSetKeyValue(rkey, L"tg", qsl("tdesktop.tg"))) return;
-
-	if (!_psOpenRegKey(L"Software\\RegisteredApplications", &rkey)) return;
-	if (!_psSetKeyValue(rkey, L"Telegram Desktop", qsl("SOFTWARE\\TelegramDesktop\\Capabilities"))) return;
-}
-
 PermissionStatus GetPermissionStatus(PermissionType type) {
 	if (type==PermissionType::Microphone) {
 		PermissionStatus result=PermissionStatus::Granted;
@@ -451,7 +424,6 @@ bool OpenSystemSettings(SystemSettingsType type) {
 } // namespace Platform
 
 void psNewVersion() {
-	Platform::RegisterCustomScheme();
 	if (Local::oldSettingsVersion() < 8051) {
 		AppUserModelId::checkPinned();
 	}
@@ -520,31 +492,6 @@ void psAutoStart(bool start, bool silent) {
 
 void psSendToMenu(bool send, bool silent) {
 	_manageAppLnk(send, silent, CSIDL_SENDTO, L"-sendpath", L"Telegram send to link.\nYou can disable send to menu item in Telegram settings.");
-}
-
-void psWriteDump() {
-#ifndef DESKTOP_APP_DISABLE_CRASH_REPORTS
-	PROCESS_MEMORY_COUNTERS data = { 0 };
-	if (Dlls::GetProcessMemoryInfo
-		&& Dlls::GetProcessMemoryInfo(
-			GetCurrentProcess(),
-			&data,
-			sizeof(data))) {
-		const auto mb = 1024 * 1024;
-		CrashReports::dump()
-			<< "Memory-usage: "
-			<< (data.PeakWorkingSetSize / mb)
-			<< " MB (peak), "
-			<< (data.WorkingSetSize / mb)
-			<< " MB (current)\n";
-		CrashReports::dump()
-			<< "Pagefile-usage: "
-			<< (data.PeakPagefileUsage / mb)
-			<< " MB (peak), "
-			<< (data.PagefileUsage / mb)
-			<< " MB (current)\n";
-	}
-#endif // DESKTOP_APP_DISABLE_CRASH_REPORTS
 }
 
 bool psLaunchMaps(const Data::LocationPoint &point) {

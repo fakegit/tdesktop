@@ -48,8 +48,8 @@ QByteArray SessionSettings::serialize() const {
 		stream << qint32(kVersionTag) << qint32(kVersion);
 		stream << static_cast<qint32>(_selectorTab);
 		stream << qint32(_groupStickersSectionHidden.size());
-		for (auto peerId : _groupStickersSectionHidden) {
-			stream << quint64(peerId);
+		for (const auto peerId : _groupStickersSectionHidden) {
+			stream << SerializePeerId(peerId);
 		}
 		stream << qint32(_supportSwitch);
 		stream << qint32(_supportFixChatsOrder ? 1 : 0);
@@ -66,10 +66,11 @@ QByteArray SessionSettings::serialize() const {
 		}
 		stream << qint32(_hiddenPinnedMessages.size());
 		for (const auto &[key, value] : _hiddenPinnedMessages) {
-			stream << quint64(key) << qint32(value);
+			stream << SerializePeerId(key) << qint32(value);
 		}
 		stream << qint32(_dialogsFiltersEnabled ? 1 : 0);
 		stream << qint32(_supportAllSilent ? 1 : 0);
+		stream << qint32(_photoEditorHintShowsCount);
 	}
 	return result;
 }
@@ -129,6 +130,7 @@ void SessionSettings::addFromSerialized(const QByteArray &serialized) {
 	base::flat_map<PeerId, MsgId> hiddenPinnedMessages;
 	qint32 dialogsFiltersEnabled = _dialogsFiltersEnabled ? 1 : 0;
 	qint32 supportAllSilent = _supportAllSilent ? 1 : 0;
+	qint32 photoEditorHintShowsCount = _photoEditorHintShowsCount;
 
 	stream >> versionTag;
 	if (versionTag == kVersionTag) {
@@ -177,7 +179,8 @@ void SessionSettings::addFromSerialized(const QByteArray &serialized) {
 						"Bad data for SessionSettings::addFromSerialized()"));
 					return;
 				}
-				groupStickersSectionHidden.insert(peerId);
+				groupStickersSectionHidden.emplace(
+					DeserializePeerId(peerId));
 			}
 		}
 	}
@@ -316,7 +319,7 @@ void SessionSettings::addFromSerialized(const QByteArray &serialized) {
 						"Bad data for SessionSettings::addFromSerialized()"));
 					return;
 				}
-				hiddenPinnedMessages.emplace(key, value);
+				hiddenPinnedMessages.emplace(DeserializePeerId(key), value);
 			}
 		}
 	}
@@ -325,6 +328,9 @@ void SessionSettings::addFromSerialized(const QByteArray &serialized) {
 	}
 	if (!stream.atEnd()) {
 		stream >> supportAllSilent;
+	}
+	if (!stream.atEnd()) {
+		stream >> photoEditorHintShowsCount;
 	}
 	if (stream.status() != QDataStream::Ok) {
 		LOG(("App Error: "
@@ -368,6 +374,7 @@ void SessionSettings::addFromSerialized(const QByteArray &serialized) {
 	_hiddenPinnedMessages = std::move(hiddenPinnedMessages);
 	_dialogsFiltersEnabled = (dialogsFiltersEnabled == 1);
 	_supportAllSilent = (supportAllSilent == 1);
+	_photoEditorHintShowsCount = std::move(photoEditorHintShowsCount);
 
 	if (version < 2) {
 		app.setLastSeenWarningSeen(appLastSeenWarningSeen == 1);
@@ -504,6 +511,16 @@ bool SessionSettings::skipArchiveInSearch() const {
 
 rpl::producer<bool> SessionSettings::skipArchiveInSearchChanges() const {
 	return _skipArchiveInSearch.changes();
+}
+
+bool SessionSettings::photoEditorHintShown() const {
+	return _photoEditorHintShowsCount < kPhotoEditorHintMaxShowsCount;
+}
+
+void SessionSettings::incrementPhotoEditorHintShown() {
+	if (photoEditorHintShown()) {
+		_photoEditorHintShowsCount++;
+	}
 }
 
 } // namespace Main

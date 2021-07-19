@@ -13,7 +13,6 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "base/openssl_help.h"
 #include "boxes/confirm_box.h"
 #include "boxes/confirm_phone_box.h" // ExtractPhonePrefix.
-#include "boxes/photo_crop_box.h"
 #include "boxes/peer_list_controllers.h"
 #include "boxes/peers/add_participants_box.h"
 #include "boxes/peers/edit_participant_box.h"
@@ -94,7 +93,7 @@ void ChatCreateDone(
 		}
 		| [&](auto chats) {
 			return navigation->session().data().chat(
-				chats->front().c_chat().vid().v);
+				chats->front().c_chat().vid());
 		}
 		| [&](not_null<ChatData*> chat) {
 			if (!image.isNull()) {
@@ -159,7 +158,7 @@ void ShowAddParticipantsError(
 				auto box = Box<EditAdminBox>(
 					channel,
 					user,
-					MTP_chatAdminRights(MTP_flags(0)),
+					ChatAdminRightsInfo(),
 					QString());
 				box->setSaveCallback(saveCallback);
 				*weak = Ui::show(std::move(box));
@@ -268,7 +267,7 @@ AddContactBox::AddContactBox(
 	this,
 	st::defaultInputField,
 	tr::lng_contact_phone(),
-	ExtractPhonePrefix(session->user()->phone()),
+	Ui::ExtractPhonePrefix(session->user()->phone()),
 	phone)
 , _invertOrder(langFirstNameGoesSecond()) {
 	if (!phone.isEmpty()) {
@@ -401,7 +400,7 @@ void AddContactBox::save() {
 			const auto extractUser = [&](const MTPImportedContact &data) {
 				return data.match([&](const MTPDimportedContact &data) {
 					return (data.vclient_id().v == _contactId)
-						? _session->data().userLoaded(data.vuser_id().v)
+						? _session->data().userLoaded(data.vuser_id())
 						: nullptr;
 				});
 			};
@@ -466,6 +465,7 @@ void GroupInfoBox::prepare() {
 
 	_photo.create(
 		this,
+		&_navigation->parentController()->window(),
 		((_type == Type::Channel)
 			? tr::lng_create_channel_crop
 			: tr::lng_create_group_crop)(tr::now),
@@ -687,7 +687,7 @@ void GroupInfoBox::createChannel(const QString &title, const QString &descriptio
 			}
 			| [&](auto chats) {
 				return _navigation->session().data().channel(
-					chats->front().c_channel().vid().v);
+					chats->front().c_channel().vid());
 			}
 			| [&](not_null<ChannelData*> channel) {
 				auto image = _photo->takeResultImage();

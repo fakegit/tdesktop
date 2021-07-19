@@ -27,13 +27,14 @@ You will require **api_id** and **api_hash** to access the Telegram API servers.
 * Download **CMake** installer from [https://cmake.org/download/](https://cmake.org/download/) and install to ***BuildPath*\\ThirdParty\\cmake**
 * Download **Ninja** executable from [https://github.com/ninja-build/ninja/releases/download/v1.7.2/ninja-win.zip](https://github.com/ninja-build/ninja/releases/download/v1.7.2/ninja-win.zip) and unpack to ***BuildPath*\\ThirdParty\\Ninja**
 * Download **Git** installer from [https://git-scm.com/download/win](https://git-scm.com/download/win) and install it.
+* Download **NuGet** executable from [https://dist.nuget.org/win-x86-commandline/latest/nuget.exe](https://dist.nuget.org/win-x86-commandline/latest/nuget.exe) and put to ***BuildPath*\\ThirdParty\\NuGet**
 
 Open **x64 Native Tools Command Prompt for VS 2019.bat**, go to ***BuildPath*** and run
 
     cd ThirdParty
     git clone https://github.com/desktop-app/patches.git
     cd patches
-    git checkout 41ead72
+    git checkout 87a2e9ee07
     cd ../
     git clone https://chromium.googlesource.com/external/gyp
     cd gyp
@@ -41,14 +42,15 @@ Open **x64 Native Tools Command Prompt for VS 2019.bat**, go to ***BuildPath*** 
     git apply ../patches/gyp.diff
     cd ..\..
 
-Add **GYP** and **Ninja** to your PATH:
+Add **GYP**, **Ninja** and **NuGet** to your PATH:
 
-* Open **Control Panel** -> **System** -> **Advanced system settings**
-* Press **Environment Variables...**
-* Select **Path**
-* Press **Edit**
-* Add ***BuildPath*\\ThirdParty\\gyp** value
-* Add ***BuildPath*\\ThirdParty\\Ninja** value
+* Open **Control Panel** -> **System** -> **Advanced system settings**.
+* Press **Environment Variables...**.
+* Select **Path**.
+* Press **Edit**.
+* Add ***BuildPath*\\ThirdParty\\gyp** value.
+* Add ***BuildPath*\\ThirdParty\\Ninja** value.
+* Add ***BuildPath*\\ThirdParty\\NuGet** value.
 
 ## Clone source code and prepare libraries
 
@@ -63,7 +65,7 @@ Open **x64 Native Tools Command Prompt for VS 2019.bat**, go to ***BuildPath*** 
 
     git clone https://github.com/desktop-app/patches.git
     cd patches
-    git checkout 41ead72
+    git checkout 87a2e9ee07
     cd ..
 
     git clone https://github.com/desktop-app/lzma.git
@@ -108,9 +110,9 @@ Open **x64 Native Tools Command Prompt for VS 2019.bat**, go to ***BuildPath*** 
     cmake --build . --config Release
     cd ..
 
-    git clone https://github.com/kcat/openal-soft.git
+    git clone https://github.com/telegramdesktop/openal-soft.git
     cd openal-soft
-    git checkout openal-soft-1.21.0
+    git checkout wasapi_exact_device_time
     cd build
     cmake .. ^
         -G "Visual Studio 16 2019" ^
@@ -143,15 +145,25 @@ Open **x64 Native Tools Command Prompt for VS 2019.bat**, go to ***BuildPath*** 
     cd win32\VS2015
     msbuild opus.sln /property:Configuration=Debug /property:Platform="x64"
     msbuild opus.sln /property:Configuration=Release /property:Platform="x64"
+    cd ..\..\..
 
-    cd ..\..\..\..\..
+    git clone https://github.com/desktop-app/rnnoise.git
+    cd rnnoise
+    mkdir out
+    cd out
+    cmake -A x64 ..
+    cmake --build . --config Debug
+    cmake --build . --config Release
+    cd ..\..
+
+    cd ..\..
     SET PATH_BACKUP_=%PATH%
     SET PATH=%cd%\ThirdParty\msys64\usr\bin;%PATH%
     cd Libraries\win64
 
     git clone https://github.com/FFmpeg/FFmpeg.git ffmpeg
     cd ffmpeg
-    git checkout release/4.2
+    git checkout release/4.4
 
     set CHERE_INVOKING=enabled_from_arguments
     set MSYS2_PATH_TYPE=inherit
@@ -159,6 +171,28 @@ Open **x64 Native Tools Command Prompt for VS 2019.bat**, go to ***BuildPath*** 
 
     SET PATH=%PATH_BACKUP_%
     cd ..
+
+    git clone https://github.com/desktop-app/tg_angle.git
+    cd tg_angle
+    git checkout f7b17cd
+    mkdir out
+    cd out
+    mkdir Debug
+    cd Debug
+    cmake -G Ninja ^
+        -DCMAKE_BUILD_TYPE=Debug ^
+        -DTG_ANGLE_SPECIAL_TARGET=win64 ^
+        -DTG_ANGLE_ZLIB_INCLUDE_PATH=%cd%/../../../zlib ../..
+    ninja
+    cd ..
+    mkdir Release
+    cd Release
+    cmake -G Ninja ^
+        -DCMAKE_BUILD_TYPE=Release ^
+        -DTG_ANGLE_SPECIAL_TARGET=win64 ^
+        -DTG_ANGLE_ZLIB_INCLUDE_PATH=%cd%/../../../zlib ../..
+    ninja
+    cd ..\..\..
 
     SET LibrariesPath=%cd%
     git clone git://code.qt.io/qt/qt5.git qt_5_15_2
@@ -178,7 +212,16 @@ Open **x64 Native Tools Command Prompt for VS 2019.bat**, go to ***BuildPath*** 
         -confirm-license ^
         -static ^
         -static-runtime ^
-        -no-opengl ^
+        -opengl es2 -no-angle ^
+        -I "%LibrariesPath%\tg_angle\include" ^
+        -D "GL_APICALL=" ^
+        QMAKE_LIBS_OPENGL_ES2_DEBUG="%LibrariesPath%\tg_angle\out\Debug\tg_angle.lib %LibrariesPath%\zlib\contrib\vstudio\vc14\x64\ZlibStatDebug\zlibstat.lib d3d9.lib dxgi.lib dxguid.lib" ^
+        QMAKE_LIBS_OPENGL_ES2_RELEASE="%LibrariesPath%\tg_angle\out\Release\tg_angle.lib %LibrariesPath%\zlib\contrib\vstudio\vc14\x64\ZlibStatReleaseWithoutAsm\zlibstat.lib d3d9.lib dxgi.lib dxguid.lib" ^
+        -egl ^
+        -D "EGLAPI=" ^
+        -D "DESKTOP_APP_QT_STATIC_ANGLE=" ^
+        QMAKE_LIBS_EGL_DEBUG="%LibrariesPath%\tg_angle\out\Debug\tg_angle.lib %LibrariesPath%\zlib\contrib\vstudio\vc14\x64\ZlibStatDebug\zlibstat.lib d3d9.lib dxgi.lib dxguid.lib Gdi32.lib User32.lib" ^
+        QMAKE_LIBS_EGL_RELEASE="%LibrariesPath%\tg_angle\out\Release\tg_angle.lib %LibrariesPath%\zlib\contrib\vstudio\vc14\x64\ZlibStatReleaseWithoutAsm\zlibstat.lib d3d9.lib dxgi.lib dxguid.lib Gdi32.lib User32.lib" ^
         -openssl-linked ^
         -I "%LibrariesPath%\openssl_1_1_1\include" ^
         OPENSSL_LIBS_DEBUG="%LibrariesPath%\openssl_1_1_1\out64.dbg\libssl.lib %LibrariesPath%\openssl_1_1_1\out64.dbg\libcrypto.lib Ws2_32.lib Gdi32.lib Advapi32.lib Crypt32.lib User32.lib" ^
@@ -195,14 +238,18 @@ Open **x64 Native Tools Command Prompt for VS 2019.bat**, go to ***BuildPath*** 
     jom -j8 install
     cd ..
 
-    git clone --recursive https://github.com/desktop-app/tg_owt.git
+    git clone https://github.com/desktop-app/tg_owt.git
     cd tg_owt
+    git checkout 91d836dc84
+    git submodule init
+    git submodule update
     mkdir out
     cd out
     mkdir Debug
     cd Debug
     cmake -G Ninja ^
         -DCMAKE_BUILD_TYPE=Debug ^
+        -DTG_OWT_BUILD_AUDIO_BACKENDS=OFF ^
         -DTG_OWT_SPECIAL_TARGET=win64 ^
         -DTG_OWT_LIBJPEG_INCLUDE_PATH=%cd%/../../../mozjpeg ^
         -DTG_OWT_OPENSSL_INCLUDE_PATH=%cd%/../../../openssl_1_1_1/include ^
@@ -214,6 +261,7 @@ Open **x64 Native Tools Command Prompt for VS 2019.bat**, go to ***BuildPath*** 
     cd Release
     cmake -G Ninja ^
         -DCMAKE_BUILD_TYPE=Release ^
+        -DTG_OWT_BUILD_AUDIO_BACKENDS=OFF ^
         -DTG_OWT_SPECIAL_TARGET=win64 ^
         -DTG_OWT_LIBJPEG_INCLUDE_PATH=%cd%/../../../mozjpeg ^
         -DTG_OWT_OPENSSL_INCLUDE_PATH=%cd%/../../../openssl_1_1_1/include ^

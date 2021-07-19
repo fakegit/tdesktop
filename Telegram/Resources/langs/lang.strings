@@ -184,6 +184,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 "lng_edit_media_album_error" = "This file cannot be saved as a part of an album.";
 "lng_edit_media_invalid_file" = "Sorry, no way to use this file.";
+"lng_edit_photo_editor_hint" = "Left-click on the photo to edit.";
 "lng_edit_caption_attach" = "Sorry, you can't attach a new media while you're editing your message.";
 "lng_edit_caption_voice" = "Sorry, you can't edit your message while you're having an unsent voice message.";
 
@@ -216,6 +217,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 "lng_code_desc" = "We have sent you a message with activation\ncode to your phone. Please enter it below.";
 "lng_code_from_telegram" = "Please enter the code you've just received\nin your previous **Telegram** app.";
 "lng_code_no_telegram" = "Send code via SMS";
+"lng_code_register_phone" = "If you already signed up for Telegram, please enter the code which was sent to your mobile app.\n\nIf you haven’t signed up yet, please register from your phone or tablet first.";
 "lng_code_call" = "Telegram will call you in {minutes}:{seconds}";
 "lng_code_calling" = "Requesting a call from Telegram...";
 "lng_code_called" = "Telegram dialed your number";
@@ -450,9 +452,26 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 "lng_settings_system_integration" = "System integration";
 "lng_settings_performance" = "Performance";
 "lng_settings_enable_animations" = "Enable animations";
+"lng_settings_enable_opengl" = "Enable OpenGL rendering for media";
+"lng_settings_angle_backend" = "ANGLE graphics backend";
+"lng_settings_angle_backend_auto" = "Auto";
+"lng_settings_angle_backend_d3d9" = "Direct3D 9";
+"lng_settings_angle_backend_d3d11" = "Direct3D 11";
+"lng_settings_angle_backend_d3d11on12" = "D3D11on12";
+"lng_settings_angle_backend_opengl" = "OpenGL";
+"lng_settings_angle_backend_disabled" = "Disabled";
 "lng_settings_sensitive_title" = "Sensitive content";
 "lng_settings_sensitive_disable_filtering" = "Disable filtering";
 "lng_settings_sensitive_about" = "Display sensitive media in public channels on all your Telegram devices.";
+"lng_settings_security_bots" = "Bots and websites";
+"lng_settings_clear_payment_info" = "Clear Payment and Shipping Info";
+
+"lng_clear_payment_info_title" = "Clear payment info";
+"lng_clear_payment_info_sure" = "Are you sure you want to clear your payment and shipping info?";
+"lng_clear_payment_info_shipping" = "Shipping info";
+"lng_clear_payment_info_payment" = "Payment info";
+"lng_clear_payment_info_clear" = "Clear";
+"lng_clear_payment_info_confirm" = "Delete your shipping info and instruct all payment providers to remove your saved credit cards? Note that Telegram never stores your credit card data.";
 
 "lng_settings_auto_night_mode" = "Auto-Night mode";
 "lng_settings_auto_night_enabled" = "Match the system settings";
@@ -486,6 +505,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 "lng_background_text1" = "Ah, you kids today with techno music! You should enjoy the classics, like Hasselhoff!";
 "lng_background_text2" = "I can't even take you seriously right now.";
 "lng_background_bad_link" = "This background link appears to be invalid.";
+"lng_background_gradient_unsupported" = "Telegram Desktop doesn't support gradient backgrounds yet.";
 "lng_background_apply" = "Apply";
 "lng_background_share" = "Share";
 "lng_background_link_copied" = "Link copied to clipboard";
@@ -995,6 +1015,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 "lng_report_group_title" = "Report group";
 "lng_report_bot_title" = "Report bot";
 "lng_report_message_title" = "Report message";
+"lng_report_please_select_messages" = "Please select messages to report.";
 "lng_report_select_messages" = "Select messages";
 "lng_report_messages_none" = "Select Messages";
 "lng_report_messages_count#one" = "Report {count} Message";
@@ -1097,9 +1118,12 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 "lng_action_invite_user_chat" = "the voice chat";
 "lng_action_invite_users_and_one" = "{accumulated}, {user}";
 "lng_action_invite_users_and_last" = "{accumulated} and {user}";
-"lng_action_group_call_started" = "{from} started {chat}";
-"lng_action_group_call_started_chat" = "a voice chat";
+"lng_action_group_call_started_group" = "{from} started a voice chat";
+"lng_action_group_call_started_channel" = "Voice chat started";
+"lng_action_group_call_scheduled_group" = "{from} scheduled a voice chat for {date}";
+"lng_action_group_call_scheduled_channel" = "Voice chat scheduled for {date}";
 "lng_action_group_call_finished" = "Voice chat finished ({duration})";
+"lng_action_group_call_finished_group" = "{from} ended the voice chat ({duration})";
 "lng_action_add_user" = "{from} added {user}";
 "lng_action_add_users_many" = "{from} added {users}";
 "lng_action_add_users_and_one" = "{accumulated}, {user}";
@@ -1356,6 +1380,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 "lng_switch_stickers" = "Stickers";
 "lng_switch_emoji" = "Emoji";
 "lng_switch_gifs" = "GIFs";
+"lng_switch_masks" = "Masks";
 "lng_stickers_featured_add" = "Add";
 "lng_gifs_search" = "Search GIFs";
 "lng_gifs_no_saved" = "You have no saved GIFs yet.";
@@ -1366,11 +1391,14 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 "lng_box_remove" = "Remove";
 
 "lng_stickers_installed_tab" = "Stickers";
+"lng_stickers_masks_tab" = "Masks";
 "lng_stickers_featured_tab" = "Trending";
 "lng_stickers_archived_tab" = "Archived";
 "lng_stickers_remove_pack" = "Remove «{sticker_pack}»?";
 "lng_stickers_add_pack" = "Add stickers";
+"lng_stickers_add_masks" = "Add masks";
 "lng_stickers_share_pack" = "Share Stickers";
+"lng_stickers_share_masks" = "Share Masks";
 "lng_stickers_not_found" = "Sticker pack not found.";
 "lng_stickers_packs_archived" = "Some of your unused stickers have been archived to make room for the sets you've activated.";
 "lng_stickers_copied" = "Sticker pack link copied to clipboard.";
@@ -1379,7 +1407,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 "lng_stickers_return" = "Undo";
 "lng_stickers_count#one" = "{count} sticker";
 "lng_stickers_count#other" = "{count} stickers";
-"lng_stickers_masks_pack" = "This is a pack of mask stickers. You can use them in the photo editor on our mobile apps.";
+"lng_masks_count#one" = "{count} mask";
+"lng_masks_count#other" = "{count} masks";
 "lng_stickers_attached_sets" = "Sets of attached stickers";
 "lng_stickers_group_set" = "Group sticker set";
 "lng_stickers_remove_group_set" = "Remove group sticker set?";
@@ -1388,6 +1417,11 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 "lng_stickers_search_sets" = "Search sticker sets";
 "lng_stickers_nothing_found" = "No stickers found";
 "lng_stickers_remove_pack_confirm" = "Remove";
+"lng_stickers_archive_pack" = "Archive Stickers";
+"lng_stickers_has_been_archived" = "Sticker pack has been archived.";
+"lng_masks_archive_pack" = "Archive Masks";
+"lng_masks_has_been_archived" = "Mask pack has been archived.";
+"lng_masks_installed" = "Mask pack has been installed.";
 
 "lng_in_dlg_photo" = "Photo";
 "lng_in_dlg_album" = "Album";
@@ -1854,11 +1888,68 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 "lng_theme_editor_menu_show" = "Show palette file";
 
 "lng_payments_not_supported" = "Sorry, Telegram Desktop doesn't support payments yet. Please use one of our mobile apps to do this.";
+"lng_payments_webview_no_card" = "Unfortunately, you can't add a new card with current system configuration.";
+"lng_payments_webview_no_use" = "Unfortunately, you can't use payments with current system configuration.";
+"lng_payments_webview_install_edge" = "Please install {link}.";
+"lng_payments_webview_install_webkit" = "Please install WebKitGTK 4 (webkit2gtk-4.0) using your package manager.";
+"lng_payments_webview_switch_mutter" = "Qt's window embedding doesn't work well with Mutter window manager. Please switch to another window manager or desktop environment.";
+"lng_payments_webview_switch_wayland" = "There is no way to embed WebView window on Wayland. Please switch to X11.";
+"lng_payments_sure_close" = "Are you sure you want to close this payment form? The changes you made will be lost.";
 "lng_payments_receipt_label" = "Receipt";
 "lng_payments_receipt_label_test" = "Test receipt";
 "lng_payments_invoice_label" = "Invoice";
 "lng_payments_invoice_label_test" = "Test invoice";
 "lng_payments_receipt_button" = "Receipt";
+"lng_payments_success" = "You paid {amount} for {title}.";
+
+"lng_payments_checkout_title" = "Checkout";
+"lng_payments_receipt_title" = "Receipt";
+"lng_payments_total_label" = "Total";
+"lng_payments_date_label" = "Paid";
+"lng_payments_pay_amount" = "Pay {amount}";
+"lng_payments_payment_method" = "Payment Method";
+"lng_payments_new_card" = "New Card...";
+"lng_payments_shipping_address" = "Shipping Address";
+"lng_payments_address_street1" = "Address 1";
+"lng_payments_address_street2" = "Address 2";
+"lng_payments_address_city" = "City";
+"lng_payments_address_state" = "State";
+"lng_payments_address_country" = "Country";
+"lng_payments_address_postcode" = "Postcode";
+
+"lng_payments_shipping_method" = "Shipping Method";
+"lng_payments_info_name" = "Name";
+"lng_payments_info_email" = "Email";
+"lng_payments_info_phone" = "Phone";
+"lng_payments_to_provider_phone_email" = "Phone and Email will be passed to {provider} as billing info.";
+"lng_payments_to_provider_email" = "Email will be passed to {provider} as billing info.";
+"lng_payments_to_provider_phone" = "Phone will be passed to {provider} as billing info.";
+"lng_payments_processed_by" = "Processed by {provider}";
+"lng_payments_warning_title" = "Warning";
+"lng_payments_warning_body" = "Neither Telegram, nor {bot1} will have access to your credit card information. Credit card details will be handled only by the payment system, {provider}.\n\nPayments will go directly to the developer of {bot2}. Telegram cannot provide any guarantees, so proceed at your own risk. In case of problems, please contact the developer of {bot3} or your bank.";
+"lng_payments_shipping_address_title" = "Shipping Information";
+"lng_payments_card_title" = "New Card";
+"lng_payments_card_number" = "Card Number";
+"lng_payments_card_cvc" = "CVC";
+"lng_payments_card_expire_date" = "MM / YY";
+"lng_payments_card_holder" = "Cardholder name";
+"lng_payments_billing_address" = "Billing Information";
+"lng_payments_billing_country" = "Country";
+"lng_payments_billing_zip_code" = "Zip Code";
+"lng_payments_save_information" = "Save Information for future use";
+"lng_payments_need_password" = "You can save your payment information for future use. Please turn on Two-Step Verification to enable this.";
+"lng_payments_password_title" = "Payment Confirmation";
+"lng_payments_password_description" = "Your card {card} is on file. To pay with this card, please enter your 2-Step-Verification password.";
+"lng_payments_password_submit" = "Pay";
+"lng_payments_tips_label" = "Tip (Optional)";
+"lng_payments_tips_box_title" = "Add Tip";
+"lng_payments_tips_max" = "Max possible tip amount: {amount}";
+
+"lng_payments_shipping_not_available" = "Shipping to the selected country is not available.";
+"lng_payments_card_declined" = "Your card was declined.";
+"lng_payments_payment_failed" = "Payment failed. Your card has not been billed.";
+"lng_payments_precheckout_failed" = "The bot couldn't process your payment. Your card has not been billed.";
+"lng_payments_already_paid" = "You have already paid for this item.";
 
 "lng_call_status_incoming" = "is calling you...";
 "lng_call_status_connecting" = "connecting...";
@@ -1925,8 +2016,16 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 "lng_group_call_inactive" = "listening";
 "lng_group_call_raised_hand_status" = "wants to speak";
 "lng_group_call_settings" = "Settings";
+"lng_group_call_share_button" = "Share";
+"lng_group_call_video" = "Video";
+"lng_group_call_screen_share_start" = "Share Screen";
+"lng_group_call_screen_share_stop" = "Stop Sharing";
+"lng_group_call_screen_title" = "Screen {index}";
+"lng_group_call_screen_share_audio" = "Share System Audio";
+"lng_group_call_unmute_small" = "Unmute";
+"lng_group_call_more" = "More";
 "lng_group_call_unmute" = "Unmute";
-"lng_group_call_unmute_sub" = "or hold spacebar to talk";
+"lng_group_call_unmute_sub" = "Hold space bar to temporarily unmute.";
 "lng_group_call_you_are_live" = "You are Live";
 "lng_group_call_force_muted" = "Muted by admin";
 "lng_group_call_force_muted_sub" = "You are in Listen Only mode";
@@ -1937,10 +2036,25 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 "lng_group_call_leave" = "Leave";
 "lng_group_call_leave_title" = "Leave voice chat";
 "lng_group_call_leave_sure" = "Are you sure you want to leave this voice chat?";
+"lng_group_call_close" = "Close";
+"lng_group_call_close_sure" = "Voice chat is scheduled. You can abort it or just close this panel.";
+"lng_group_call_also_cancel" = "Abort voice chat";
 "lng_group_call_leave_to_other_sure" = "Do you want to leave your active voice chat and join a voice chat in this group?";
 "lng_group_call_create_sure" = "Do you really want to start a voice chat in this group?";
 "lng_group_call_create_sure_channel" = "Are you sure you want to start a voice chat in this channel as your personal account?";
 "lng_group_call_join_sure_personal" = "Are you sure you want to join this voice chat as your personal account?";
+"lng_group_call_muted_no_camera" = "You can't turn on video while you're muted by admin.";
+"lng_group_call_muted_no_screen" = "You can't share your screen while you're muted by admin.";
+"lng_group_call_chat_no_camera" = "You can't turn on video in this chat.";
+"lng_group_call_chat_no_screen" = "You can't share your screen in this chat.";
+"lng_group_call_failed_screen" = "An error occured. Screencast has stopped.";
+"lng_group_call_failed_camera" = "Could not enable camera. Perhaps another app is using the camera already. Try closing other apps.";
+"lng_group_call_tooltip_screen" = "Share screen";
+"lng_group_call_tooltip_camera" = "Your camera is off. Click here to enable camera.";
+"lng_group_call_tooltip_microphone" = "You are on mute. Click here to speak.";
+"lng_group_call_tooltip_camera_off" = "Disable camera";
+"lng_group_call_tooltip_force_muted" = "Muted by admin. Click if you want to speak.";
+"lng_group_call_tooltip_raised_hand" = "You asked to speak. We let the speakers know.";
 "lng_group_call_also_end" = "End voice chat";
 "lng_group_call_settings_title" = "Settings";
 "lng_group_call_invite" = "Invite Member";
@@ -1963,10 +2077,15 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 "lng_group_call_ptt_delay_s" = "{amount}s";
 "lng_group_call_ptt_delay" = "Push to Talk release delay: {delay}";
 "lng_group_call_share" = "Share Invite Link";
+"lng_group_call_noise_suppression" = "Enable Noise Suppression";
+"lng_group_call_limit#one" = "Video is only available\nfor the first {count} member";
+"lng_group_call_limit#other" = "Video is only available\nfor the first {count} members";
+"lng_group_call_video_paused" = "Video is paused";
 "lng_group_call_share_speaker" = "Users with this link can speak";
 "lng_group_call_copy_speaker_link" = "Copy Speaker Link";
 "lng_group_call_copy_listener_link" = "Copy Listener Link";
 "lng_group_call_end" = "End Voice Chat";
+"lng_group_call_cancel" = "Abort Voice Chat";
 "lng_group_call_join" = "Join";
 "lng_group_call_join_confirm" = "Do you want to join the voice chat {chat}?";
 "lng_group_call_invite_done_user" = "You invited {user} to the voice chat.";
@@ -1982,6 +2101,10 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 "lng_group_call_context_remove_hand" = "Cancel request to speak";
 "lng_group_call_context_mute_for_me" = "Mute for me";
 "lng_group_call_context_unmute_for_me" = "Unmute for me";
+"lng_group_call_context_pin_camera" = "Pin video";
+"lng_group_call_context_unpin_camera" = "Unpin video";
+"lng_group_call_context_pin_screen" = "Pin screencast";
+"lng_group_call_context_unpin_screen" = "Unpin screencast";
 "lng_group_call_context_remove" = "Remove";
 "lng_group_call_remove_channel" = "Remove {channel} from the voice chat?";
 "lng_group_call_duration_days#one" = "{count} day";
@@ -1995,12 +2118,35 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 "lng_group_call_mac_access" = "Telegram Desktop does not have access to system wide keyboard input required for Push to Talk.";
 "lng_group_call_mac_input" = "Please allow **Input Monitoring** for Telegram in Privacy Settings.";
 "lng_group_call_mac_accessibility" = "Please allow **Accessibility** for Telegram in Privacy Settings.\n\nApp restart may be required.";
+"lng_group_call_mac_screencast_access" = "Telegram Desktop does not have access to screen recording required for Screen Sharing.";
+"lng_group_call_mac_recording" = "Please allow **Screen Recording** for Telegram in Privacy Settings.";
 "lng_group_call_mac_settings" = "Open Settings";
 
 "lng_group_call_start_as_header" = "Start Voice Chat as...";
 "lng_group_call_join_as_header" = "Join Voice Chat as...";
 "lng_group_call_display_as_header" = "Display me as...";
 "lng_group_call_join_as_about" = "Choose whether you want to be displayed as your personal account or as your channel.";
+"lng_group_call_or_schedule" = "You can also {link}.";
+"lng_group_call_schedule" = "schedule a voice chat";
+"lng_group_call_schedule_title" = "Schedule Voice Chat";
+"lng_group_call_schedule_notified_group" = "The members of the group will be notified that the voice chat will start in {duration}.";
+"lng_group_call_schedule_notified_channel" = "The subscribers of the channel will be notified that the voice chat will start in {duration}.";
+"lng_group_call_scheduled_status" = "Scheduled";
+"lng_group_call_scheduled_title" = "Scheduled Voice Chat";
+"lng_group_call_starts_short" = "Starts {when}";
+"lng_group_call_starts" = "Voice Chat starts {when}";
+"lng_group_call_starts_today" = "today at {time}";
+"lng_group_call_starts_tomorrow" = "tomorrow at {time}";
+"lng_group_call_starts_date" = "{date} at {time}";
+"lng_group_call_starts_in" = "Starts in";
+"lng_group_call_late_by" = "Late by";
+"lng_group_call_starts_short_today" = "Today, {time}";
+"lng_group_call_starts_short_tomorrow" = "Tomorrow, {time}";
+"lng_group_call_starts_short_date" = "{date}, {time}";
+"lng_group_call_start_now" = "Start Now";
+"lng_group_call_start_now_sure" = "Are you sure you want to start the voice chat now?";
+"lng_group_call_set_reminder" = "Set Reminder";
+"lng_group_call_cancel_reminder" = "Cancel Reminder";
 "lng_group_call_join_as_personal" = "personal account";
 "lng_group_call_edit_title" = "Edit voice chat title";
 "lng_group_call_switch_done" = "Members of this voice chat will now see you as **{user}**";
@@ -2010,6 +2156,15 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 "lng_group_call_recording_started" = "Voice chat recording started.";
 "lng_group_call_recording_stopped" = "Voice chat recording stopped.";
 "lng_group_call_recording_saved" = "Audio saved to Saved Messages.";
+"lng_group_call_pinned_camera_me" = "Your video is pinned.";
+"lng_group_call_pinned_screen_me" = "Your screencast is pinned.";
+"lng_group_call_pinned_camera" = "{user}'s video is pinned.";
+"lng_group_call_pinned_screen" = "{user}'s screencast is pinned.";
+"lng_group_call_unpinned_camera_me" = "Your video is unpinned.";
+"lng_group_call_unpinned_screen_me" = "Your screencast is unpinned.";
+"lng_group_call_unpinned_camera" = "{user}'s video is unpinned.";
+"lng_group_call_unpinned_screen" = "{user}'s screencast is unpinned.";
+"lng_group_call_sure_screencast" = "{user} is screensharing. This action will make your screencast pinned for all participants.";
 "lng_group_call_recording_start_sure" = "Do you want to start recording this chat and save the result into an audio file?\n\nOther members will see the chat is being recorded.";
 "lng_group_call_recording_stop_sure" = "Do you want to stop recording this chat?";
 "lng_group_call_recording_start_field" = "Recording Title";
@@ -2622,6 +2777,10 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 "lng_filters_remove_sure" = "This will remove the folder, your chats will not be deleted.";
 "lng_filters_remove_yes" = "Remove";
 
+"lng_photo_editor_menu_delete" = "Delete";
+"lng_photo_editor_menu_flip" = "Flip";
+"lng_photo_editor_menu_duplicate" = "Duplicate";
+
 // Wnd specific
 
 "lng_wnd_choose_program_menu" = "Choose Default Program...";
@@ -2675,6 +2834,12 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 "lng_mac_menu_new_channel" = "New Channel";
 "lng_mac_menu_show" = "Show Telegram";
 "lng_mac_menu_emoji_and_symbols" = "Emoji & Symbols";
+
+"lng_mac_menu_player_pause" = "Pause";
+"lng_mac_menu_player_resume" = "Resume";
+"lng_mac_menu_player_next" = "Next";
+"lng_mac_menu_player_previous" = "Previous";
+"lng_mac_menu_player_stop" = "Stop";
 
 "lng_mac_touchbar_favorite_stickers" = "Favorite stickers";
 

@@ -20,19 +20,19 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "main/main_account.h" // Account::configUpdated.
 #include "apiwrap.h"
 #include "core/application.h"
+#include "core/core_settings.h"
 #include "lang/lang_instance.h"
 #include "lang/lang_cloud_manager.h"
 #include "base/unixtime.h"
 #include "base/call_delayed.h"
 #include "base/timer.h"
-#include "facades.h" // Proxies list.
+#include "base/network_reachability.h"
 
 namespace MTP {
 namespace {
 
 constexpr auto kConfigBecomesOldIn = 2 * 60 * crl::time(1000);
 constexpr auto kConfigBecomesOldForBlockedIn = 8 * crl::time(1000);
-constexpr auto kCheckKeyEach = 60 * crl::time(1000);
 
 using namespace details;
 
@@ -216,6 +216,7 @@ private:
 	const not_null<Instance*> _instance;
 	const Instance::Mode _mode = Instance::Mode::Normal;
 	const std::unique_ptr<Config> _config;
+	const std::shared_ptr<base::NetworkReachability> _networkReachability;
 
 	std::unique_ptr<QThread> _mainSessionThread;
 	std::unique_ptr<QThread> _otherSessionsThread;
@@ -263,6 +264,8 @@ private:
 	QReadWriteLock _requestMapLock;
 
 	std::deque<std::pair<mtpRequestId, crl::time>> _delayedRequests;
+	base::flat_map<mtpRequestId, mtpRequestId> _dependentRequests;
+	mutable QMutex _dependentRequestsLock;
 
 	std::map<mtpRequestId, int> _requestsDelays;
 
@@ -276,6 +279,8 @@ private:
 	Fn<void(ShiftedDcId shiftedDcId)> _sessionResetHandler;
 
 	base::Timer _checkDelayedTimer;
+
+	Core::SettingsProxy &_proxySettings;
 
 	rpl::lifetime _lifetime;
 
@@ -296,7 +301,9 @@ Instance::Private::Private(
 : Sender(instance)
 , _instance(instance)
 , _mode(mode)
-, _config(std::move(fields.config)) {
+, _config(std::move(fields.config))
+, _networkReachability(base::NetworkReachability::Instance())
+, _proxySettings(Core::App().settings().proxy()) {
 	Expects(_config != nullptr);
 
 	const auto idealThreadPoolSize = QThread::idealThreadCount();
@@ -305,6 +312,11 @@ Instance::Private::Private(
 	details::unpaused(
 	) | rpl::start_with_next([=] {
 		unpaused();
+	}, _lifetime);
+
+	_networkReachability->availableChanges(
+	) | rpl::start_with_next([=](bool available) {
+		restart();
 	}, _lifetime);
 
 	_deviceModel = std::move(fields.deviceModel);
@@ -330,6 +342,13 @@ Instance::Private::Private(
 		_mainDcId = fields.mainDcId;
 		_mainDcIdForced = true;
 	}
+
+	_proxySettings.connectionTypeChanges(
+	) | rpl::start_with_next([=] {
+		if (_configLoader) {
+			_configLoader->setProxyEnabled(_proxySettings.isEnabled());
+		}
+	}, _lifetime);
 }
 
 void Instance::Private::start() {
@@ -389,11 +408,12 @@ void Instance::Private::applyDomainIps(
 		}
 		return true;
 	};
-	for (auto &proxy : Global::RefProxiesList()) {
+	for (auto &proxy : _proxySettings.list()) {
 		applyToProxy(proxy);
 	}
-	if (applyToProxy(Global::RefSelectedProxy())
-		&& (Global::ProxySettings() == ProxyData::Settings::Enabled)) {
+	auto selected = _proxySettings.selected();
+	if (applyToProxy(selected) && _proxySettings.isEnabled()) {
+		_proxySettings.setSelected(selected);
 		for (const auto &[shiftedDcId, session] : _sessions) {
 			session->refreshOptions();
 		}
@@ -419,11 +439,13 @@ void Instance::Private::setGoodProxyDomain(
 		}
 		return true;
 	};
-	for (auto &proxy : Global::RefProxiesList()) {
+	for (auto &proxy : _proxySettings.list()) {
 		applyToProxy(proxy);
 	}
-	if (applyToProxy(Global::RefSelectedProxy())
-		&& (Global::ProxySettings() == ProxyData::Settings::Enabled)) {
+
+	auto selected = _proxySettings.selected();
+	if (applyToProxy(selected) && _proxySettings.isEnabled()) {
+		_proxySettings.setSelected(selected);
 		Core::App().refreshGlobalProxy();
 	}
 }
@@ -465,7 +487,8 @@ void Instance::Private::requestConfig() {
 		[=](const MTPConfig &result) { configLoadDone(result); },
 		[=](const Error &error, const Response &) {
 			return configLoadFail(error);
-		});
+		},
+		_proxySettings.isEnabled());
 	_configLoader->load();
 }
 
@@ -989,9 +1012,50 @@ void Instance::Private::unregisterRequest(mtpRequestId requestId) {
 		QWriteLocker locker(&_requestMapLock);
 		_requestMap.erase(requestId);
 	}
+	{
+		QMutexLocker locker(&_requestByDcLock);
+		_requestsByDc.erase(requestId);
+	}
+	{
+		auto toRemove = base::flat_set<mtpRequestId>();
+		auto toResend = base::flat_set<mtpRequestId>();
 
-	QMutexLocker locker(&_requestByDcLock);
-	_requestsByDc.erase(requestId);
+		toRemove.emplace(requestId);
+
+		QMutexLocker locker(&_dependentRequestsLock);
+
+		auto handling = 0;
+		do {
+			handling = toResend.size();
+			for (const auto [resendingId, afterId] : _dependentRequests) {
+				if (toRemove.contains(afterId)) {
+					toRemove.emplace(resendingId);
+					toResend.emplace(resendingId);
+				}
+			}
+		} while (handling != toResend.size());
+
+		for (const auto removingId : toRemove) {
+			_dependentRequests.remove(removingId);
+		}
+		locker.unlock();
+
+		for (const auto resendingId : toResend) {
+			if (const auto shiftedDcId = queryRequestByDc(resendingId)) {
+				SerializedRequest request;
+				{
+					QReadLocker locker(&_requestMapLock);
+					auto it = _requestMap.find(resendingId);
+					if (it == _requestMap.cend()) {
+						LOG(("MTP Error: could not find dependent request %1").arg(resendingId));
+						return;
+					}
+					request = it->second;
+				}
+				getSession(qAbs(*shiftedDcId))->sendPrepared(request);
+			}
+		}
+	}
 }
 
 void Instance::Private::storeRequest(
@@ -1254,16 +1318,13 @@ bool Instance::Private::onErrorDefault(
 	const auto requestId = response.requestId;
 	const auto &type = error.type();
 	const auto code = error.code();
-	if (!IsFloodError(error) && type != qstr("AUTH_KEY_UNREGISTERED")) {
-		int breakpoint = 0;
-	}
 	auto badGuestDc = (code == 400) && (type == qsl("FILE_ID_INVALID"));
-	QRegularExpressionMatch m;
-	if ((m = QRegularExpression("^(FILE|PHONE|NETWORK|USER)_MIGRATE_(\\d+)$").match(type)).hasMatch()) {
+	QRegularExpressionMatch m1, m2;
+	if ((m1 = QRegularExpression("^(FILE|PHONE|NETWORK|USER)_MIGRATE_(\\d+)$").match(type)).hasMatch()) {
 		if (!requestId) return false;
 
 		auto dcWithShift = ShiftedDcId(0);
-		auto newdcWithShift = ShiftedDcId(m.captured(2).toInt());
+		auto newdcWithShift = ShiftedDcId(m1.captured(2).toInt());
 		if (const auto shiftedDcId = queryRequestByDc(requestId)) {
 			dcWithShift = *shiftedDcId;
 		} else {
@@ -1321,7 +1382,50 @@ bool Instance::Private::onErrorDefault(
 			(dcWithShift < 0) ? -newdcWithShift : newdcWithShift);
 		session->sendPrepared(request);
 		return true;
-	} else if (code < 0 || code >= 500 || (m = QRegularExpression("^FLOOD_WAIT_(\\d+)$").match(type)).hasMatch()) {
+	} else if (type == qstr("MSG_WAIT_TIMEOUT") || type == qstr("MSG_WAIT_FAILED")) {
+		SerializedRequest request;
+		{
+			QReadLocker locker(&_requestMapLock);
+			auto it = _requestMap.find(requestId);
+			if (it == _requestMap.cend()) {
+				LOG(("MTP Error: could not find MSG_WAIT_* request %1").arg(requestId));
+				return false;
+			}
+			request = it->second;
+		}
+		if (!request->after) {
+			LOG(("MTP Error: MSG_WAIT_* for not dependent request %1").arg(requestId));
+			return false;
+		}
+		auto dcWithShift = ShiftedDcId(0);
+		if (const auto shiftedDcId = queryRequestByDc(requestId)) {
+			dcWithShift = *shiftedDcId;
+			if (const auto afterDcId = queryRequestByDc(request->after->requestId)) {
+				if (*shiftedDcId != *afterDcId) {
+					request->after = SerializedRequest();
+				}
+			} else {
+				request->after = SerializedRequest();
+			}
+		} else {
+			LOG(("MTP Error: could not find MSG_WAIT_* request %1 by dc").arg(requestId));
+		}
+		if (!dcWithShift) {
+			return false;
+		}
+
+		if (!request->after) {
+			getSession(qAbs(dcWithShift))->sendPrepared(request);
+		} else {
+			QMutexLocker locker(&_dependentRequestsLock);
+			_dependentRequests.emplace(requestId, request->after->requestId);
+		}
+		return true;
+	} else if (code < 0
+		|| code >= 500
+		|| (m1 = QRegularExpression("^FLOOD_WAIT_(\\d+)$").match(type)).hasMatch()
+		|| ((m2 = QRegularExpression("^SLOWMODE_WAIT_(\\d+)$").match(type)).hasMatch()
+			&& m2.captured(1).toInt() < 3)) {
 		if (!requestId) return false;
 
 		int32 secs = 1;
@@ -1332,9 +1436,11 @@ bool Instance::Private::onErrorDefault(
 			} else {
 				_requestsDelays.emplace(requestId, secs);
 			}
-		} else {
-			secs = m.captured(1).toInt();
+		} else if (m1.hasMatch()) {
+			secs = m1.captured(1).toInt();
 //			if (secs >= 60) return false;
+		} else if (m2.hasMatch()) {
+			secs = m2.captured(1).toInt();
 		}
 		auto sendAt = crl::now() + secs * 1000 + 10;
 		auto it = _delayedRequests.begin(), e = _delayedRequests.end();
@@ -1411,66 +1517,6 @@ bool Instance::Private::onErrorDefault(
 		return true;
 	} else if (type == qstr("CONNECTION_LANG_CODE_INVALID")) {
 		Lang::CurrentCloudManager().resetToDefault();
-	} else if (type == qstr("MSG_WAIT_FAILED")) {
-		SerializedRequest request;
-		{
-			QReadLocker locker(&_requestMapLock);
-			auto it = _requestMap.find(requestId);
-			if (it == _requestMap.cend()) {
-				LOG(("MTP Error: could not find request %1").arg(requestId));
-				return false;
-			}
-			request = it->second;
-		}
-		if (!request->after) {
-			LOG(("MTP Error: wait failed for not dependent request %1").arg(requestId));
-			return false;
-		}
-		auto dcWithShift = ShiftedDcId(0);
-		if (const auto shiftedDcId = queryRequestByDc(requestId)) {
-			if (const auto afterDcId = queryRequestByDc(request->after->requestId)) {
-				dcWithShift = *shiftedDcId;
-				if (*shiftedDcId != *afterDcId) {
-					request->after = SerializedRequest();
-				}
-			} else {
-				LOG(("MTP Error: could not find dependent request %1 by dc").arg(request->after->requestId));
-			}
-		} else {
-			LOG(("MTP Error: could not find request %1 by dc").arg(requestId));
-		}
-		if (!dcWithShift) return false;
-
-		if (!request->after) {
-			const auto session = getSession(qAbs(dcWithShift));
-			request->needsLayer = true;
-			session->sendPrepared(request);
-		} else {
-			auto newdc = BareDcId(qAbs(dcWithShift));
-			auto &waiters(_authWaiters[newdc]);
-			if (base::contains(waiters, request->after->requestId)) {
-				if (!base::contains(waiters, requestId)) {
-					waiters.push_back(requestId);
-				}
-				if (_badGuestDcRequests.find(request->after->requestId) != _badGuestDcRequests.cend()) {
-					if (_badGuestDcRequests.find(requestId) == _badGuestDcRequests.cend()) {
-						_badGuestDcRequests.insert(requestId);
-					}
-				}
-			} else {
-				auto i = _delayedRequests.begin(), e = _delayedRequests.end();
-				for (; i != e; ++i) {
-					if (i->first == requestId) return true;
-					if (i->first == request->after->requestId) break;
-				}
-				if (i != e) {
-					_delayedRequests.insert(i, std::make_pair(requestId, i->second));
-				}
-
-				checkDelayedRequests();
-			}
-		}
-		return true;
 	}
 	if (badGuestDc) _badGuestDcRequests.erase(requestId);
 	return false;

@@ -18,8 +18,7 @@ namespace Platform {
 namespace internal {
 
 void GdkHelperLoad(QLibrary &lib);
-bool GdkHelperLoaded();
-void XSetTransientForHint(GdkWindow *window, quintptr winId);
+void GdkSetTransientFor(GdkWindow *window, const QString &parent);
 
 } // namespace internal
 } // namespace Platform

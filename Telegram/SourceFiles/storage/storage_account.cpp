@@ -76,6 +76,7 @@ enum { // Local Storage Keys
 	lskExportSettings = 0x13, // no data
 	lskBackgroundOld = 0x14, // no data
 	lskSelfSerialized = 0x15, // serialized self
+	lskMasksKeys = 0x16, // no data
 };
 
 [[nodiscard]] FileKey ComputeDataNameKey(const QString &dataName) {
@@ -184,6 +185,9 @@ base::flat_set<QString> Account::collectGoodNames() const {
 		_recentHashtagsAndBotsKey,
 		_exportSettingsKey,
 		_trustedBotsKey,
+		_installedMasksKey,
+		_recentMasksKey,
+		_archivedMasksKey,
 	};
 	auto result = base::flat_set<QString>{
 		"map0",
@@ -264,6 +268,7 @@ Account::ReadMapResult Account::readMapWith(
 	quint64 locationsKey = 0, reportSpamStatusesKey = 0, trustedBotsKey = 0;
 	quint64 recentStickersKeyOld = 0;
 	quint64 installedStickersKey = 0, featuredStickersKey = 0, recentStickersKey = 0, favedStickersKey = 0, archivedStickersKey = 0;
+	quint64 installedMasksKey = 0, recentMasksKey = 0, archivedMasksKey = 0;
 	quint64 savedGifsKey = 0;
 	quint64 legacyBackgroundKeyDay = 0, legacyBackgroundKeyNight = 0;
 	quint64 userSettingsKey = 0, recentHashtagsAndBotsKey = 0, exportSettingsKey = 0;
@@ -276,10 +281,11 @@ Account::ReadMapResult Account::readMapWith(
 			map.stream >> count;
 			for (quint32 i = 0; i < count; ++i) {
 				FileKey key;
-				quint64 p;
-				map.stream >> key >> p;
-				draftsMap.emplace(p, key);
-				draftsNotReadMap.emplace(p, true);
+				quint64 peerIdSerialized;
+				map.stream >> key >> peerIdSerialized;
+				const auto peerId = DeserializePeerId(peerIdSerialized);
+				draftsMap.emplace(peerId, key);
+				draftsNotReadMap.emplace(peerId, true);
 			}
 		} break;
 		case lskSelfSerialized: {
@@ -290,9 +296,10 @@ Account::ReadMapResult Account::readMapWith(
 			map.stream >> count;
 			for (quint32 i = 0; i < count; ++i) {
 				FileKey key;
-				quint64 p;
-				map.stream >> key >> p;
-				draftCursorsMap.emplace(p, key);
+				quint64 peerIdSerialized;
+				map.stream >> key >> peerIdSerialized;
+				const auto peerId = DeserializePeerId(peerIdSerialized);
+				draftCursorsMap.emplace(peerId, key);
 			}
 		} break;
 		case lskLegacyImages:
@@ -358,6 +365,12 @@ Account::ReadMapResult Account::readMapWith(
 		case lskExportSettings: {
 			map.stream >> exportSettingsKey;
 		} break;
+		case lskMasksKeys: {
+			map.stream
+				>> installedMasksKey
+				>> recentMasksKey
+				>> archivedMasksKey;
+		} break;
 		default:
 			LOG(("App Error: unknown key type in encrypted map: %1").arg(keyType));
 			return ReadMapResult::Failed;
@@ -382,6 +395,9 @@ Account::ReadMapResult Account::readMapWith(
 	_favedStickersKey = favedStickersKey;
 	_archivedStickersKey = archivedStickersKey;
 	_savedGifsKey = savedGifsKey;
+	_installedMasksKey = installedMasksKey;
+	_recentMasksKey = recentMasksKey;
+	_archivedMasksKey = archivedMasksKey;
 	_legacyBackgroundKeyDay = legacyBackgroundKeyDay;
 	_legacyBackgroundKeyNight = legacyBackgroundKeyNight;
 	_settingsKey = userSettingsKey;
@@ -486,6 +502,9 @@ void Account::writeMap() {
 	if (_settingsKey) mapSize += sizeof(quint32) + sizeof(quint64);
 	if (_recentHashtagsAndBotsKey) mapSize += sizeof(quint32) + sizeof(quint64);
 	if (_exportSettingsKey) mapSize += sizeof(quint32) + sizeof(quint64);
+	if (_installedMasksKey || _recentMasksKey || _archivedMasksKey) {
+		mapSize += sizeof(quint32) + 3 * sizeof(quint64);
+	}
 
 	EncryptedDescriptor mapData(mapSize);
 	if (!self.isEmpty()) {
@@ -494,13 +513,13 @@ void Account::writeMap() {
 	if (!_draftsMap.empty()) {
 		mapData.stream << quint32(lskDraft) << quint32(_draftsMap.size());
 		for (const auto &[key, value] : _draftsMap) {
-			mapData.stream << quint64(value) << quint64(key);
+			mapData.stream << quint64(value) << SerializePeerId(key);
 		}
 	}
 	if (!_draftCursorsMap.empty()) {
 		mapData.stream << quint32(lskDraftPosition) << quint32(_draftCursorsMap.size());
 		for (const auto &[key, value] : _draftCursorsMap) {
-			mapData.stream << quint64(value) << quint64(key);
+			mapData.stream << quint64(value) << SerializePeerId(key);
 		}
 	}
 	if (_locationsKey) {
@@ -531,6 +550,13 @@ void Account::writeMap() {
 	if (_exportSettingsKey) {
 		mapData.stream << quint32(lskExportSettings) << quint64(_exportSettingsKey);
 	}
+	if (_installedMasksKey || _recentMasksKey || _archivedMasksKey) {
+		mapData.stream << quint32(lskMasksKeys);
+		mapData.stream
+			<< quint64(_installedMasksKey)
+			<< quint64(_recentMasksKey)
+			<< quint64(_archivedMasksKey);
+	}
 	map.writeEncrypted(mapData, _localKey);
 
 	_mapChanged = false;
@@ -549,6 +575,9 @@ void Account::reset() {
 	_favedStickersKey = 0;
 	_archivedStickersKey = 0;
 	_savedGifsKey = 0;
+	_installedMasksKey = 0;
+	_recentMasksKey = 0;
+	_archivedMasksKey = 0;
 	_legacyBackgroundKeyDay = _legacyBackgroundKeyNight = 0;
 	_settingsKey = _recentHashtagsAndBotsKey = _exportSettingsKey = 0;
 	_oldMapVersion = 0;
@@ -575,6 +604,8 @@ void Account::reset() {
 		QDir(LegacyTempDirectory()).removeRecursively();
 		QDir(temp).removeRecursively();
 	});
+
+	Local::sync();
 }
 
 void Account::writeLocations() {
@@ -732,13 +763,6 @@ void Account::writeSessionSettings(Main::SessionSettings *stored) {
 		writeMapQueued();
 	}
 
-	auto recentEmojiPreloadData = cRecentEmojiPreload();
-	if (recentEmojiPreloadData.isEmpty()) {
-		recentEmojiPreloadData.reserve(GetRecentEmoji().size());
-		for (auto &item : GetRecentEmoji()) {
-			recentEmojiPreloadData.push_back(qMakePair(item.first->id(), item.second));
-		}
-	}
 	auto userDataInstance = stored
 		? stored
 		: _owner->getSessionSettings();
@@ -757,13 +781,6 @@ void Account::writeSessionSettings(Main::SessionSettings *stored) {
 
 	uint32 size = 24 * (sizeof(quint32) + sizeof(qint32));
 	size += sizeof(quint32);
-
-	size += sizeof(quint32) + sizeof(qint32);
-	for (auto &item : recentEmojiPreloadData) {
-		size += Serialize::stringSize(item.first) + sizeof(item.second);
-	}
-
-	size += sizeof(quint32) + sizeof(qint32) + cEmojiVariants().size() * (sizeof(uint32) + sizeof(uint64));
 	size += sizeof(quint32) + sizeof(qint32) + recentStickers.size() * (sizeof(uint64) + sizeof(ushort));
 	size += sizeof(quint32) + 3 * sizeof(qint32);
 	size += sizeof(quint32) + 2 * sizeof(qint32);
@@ -778,8 +795,6 @@ void Account::writeSessionSettings(Main::SessionSettings *stored) {
 	if (!userData.isEmpty()) {
 		data.stream << quint32(dbiSessionSettings) << userData;
 	}
-	data.stream << quint32(dbiRecentEmoji) << recentEmojiPreloadData;
-	data.stream << quint32(dbiEmojiVariants) << cEmojiVariants();
 	data.stream << quint32(dbiRecentStickers) << recentStickers;
 
 	FileWriteDescriptor file(_settingsKey, _basePath);
@@ -1036,7 +1051,7 @@ void Account::writeDrafts(
 	EncryptedDescriptor data(size);
 	data.stream
 		<< quint64(kMultiDraftTag)
-		<< quint64(peerId)
+		<< SerializePeerId(peerId)
 		<< quint32(count);
 
 	const auto writeCallback = [&](
@@ -1102,7 +1117,7 @@ void Account::writeDraftCursors(
 	EncryptedDescriptor data(size);
 	data.stream
 		<< quint64(kMultiDraftTag)
-		<< quint64(peerId)
+		<< SerializePeerId(peerId)
 		<< quint32(count);
 
 	const auto writeCallback = [&](
@@ -1155,9 +1170,10 @@ void Account::readDraftCursors(PeerId peerId, Data::HistoryDrafts &map) {
 		readDraftCursorsLegacy(peerId, draft, tag, map);
 		return;
 	}
-	quint64 draftPeer = 0;
+	quint64 draftPeerSerialized = 0;
 	quint32 count = 0;
-	draft.stream >> draftPeer >> count;
+	draft.stream >> draftPeerSerialized >> count;
+	const auto draftPeer = DeserializePeerId(draftPeerSerialized);
 	if (!count || count > 1000 || draftPeer != peerId) {
 		clearDraftCursors(peerId);
 		return;
@@ -1174,15 +1190,16 @@ void Account::readDraftCursors(PeerId peerId, Data::HistoryDrafts &map) {
 void Account::readDraftCursorsLegacy(
 		PeerId peerId,
 		details::FileReadDescriptor &draft,
-		quint64 draftPeer,
+		quint64 draftPeerSerialized,
 		Data::HistoryDrafts &map) {
 	qint32 localPosition = 0, localAnchor = 0, localScroll = QFIXED_MAX;
 	qint32 editPosition = 0, editAnchor = 0, editScroll = QFIXED_MAX;
-	draft.stream >> draftPeer >> localPosition >> localAnchor >> localScroll;
+	draft.stream >> localPosition >> localAnchor >> localScroll;
 	if (!draft.stream.atEnd()) {
 		draft.stream >> editPosition >> editAnchor >> editScroll;
 	}
 
+	const auto draftPeer = DeserializePeerId(draftPeerSerialized);
 	if (draftPeer != peerId) {
 		clearDraftCursors(peerId);
 		return;
@@ -1237,8 +1254,9 @@ void Account::readDraftsWithCursors(not_null<History*> history) {
 		return;
 	}
 	quint32 count = 0;
-	quint64 draftPeer = 0;
-	draft.stream >> draftPeer >> count;
+	quint64 draftPeerSerialized = 0;
+	draft.stream >> draftPeerSerialized >> count;
+	const auto draftPeer = DeserializePeerId(draftPeerSerialized);
 	if (!count || count > 1000 || draftPeer != peerId) {
 		ClearKey(j->second, _basePath);
 		_draftsMap.erase(j);
@@ -1287,7 +1305,7 @@ void Account::readDraftsWithCursors(not_null<History*> history) {
 void Account::readDraftsWithCursorsLegacy(
 		not_null<History*> history,
 		details::FileReadDescriptor &draft,
-		quint64 draftPeer) {
+		quint64 draftPeerSerialized) {
 	TextWithTags msgData, editData;
 	QByteArray msgTagsSerialized, editTagsSerialized;
 	qint32 msgReplyTo = 0, msgPreviewCancelled = 0, editMsgId = 0, editPreviewCancelled = 0;
@@ -1309,6 +1327,7 @@ void Account::readDraftsWithCursorsLegacy(
 		}
 	}
 	const auto peerId = history->peer->id;
+	const auto draftPeer = DeserializePeerId(draftPeerSerialized);
 	if (draftPeer != peerId) {
 		const auto j = _draftsMap.find(peerId);
 		if (j != _draftsMap.cend()) {
@@ -1492,6 +1511,7 @@ Cache::Database::Settings Account::cacheBigFileSettings() const {
 void Account::writeStickerSet(
 		QDataStream &stream,
 		const Data::StickersSet &set) {
+	using SetFlag = Data::StickersSetFlag;
 	const auto writeInfo = [&](int count) {
 		stream
 			<< quint64(set.id)
@@ -1504,7 +1524,7 @@ void Account::writeStickerSet(
 			<< qint32(set.installDate);
 		Serialize::writeImageLocation(stream, set.thumbnailLocation());
 	};
-	if (set.flags & MTPDstickerSet_ClientFlag::f_not_loaded) {
+	if (set.flags & SetFlag::NotLoaded) {
 		writeInfo(-set.count);
 		return;
 	} else if (set.stickers.isEmpty()) {
@@ -1545,6 +1565,8 @@ void Account::writeStickerSets(
 		FileKey &stickersKey,
 		CheckSet checkSet,
 		const Data::StickersSetsOrder &order) {
+	using SetFlag = Data::StickersSetFlag;
+
 	const auto &sets = _owner->session().data().stickers().sets();
 	if (sets.empty()) {
 		if (stickersKey) {
@@ -1574,7 +1596,7 @@ void Account::writeStickerSets(
 			+ Serialize::stringSize(raw->shortName)
 			+ sizeof(qint32) * 4
 			+ Serialize::imageLocationSize(raw->thumbnailLocation());
-		if (raw->flags & MTPDstickerSet_ClientFlag::f_not_loaded) {
+		if (raw->flags & SetFlag::NotLoaded) {
 			continue;
 		}
 
@@ -1632,7 +1654,9 @@ void Account::writeStickerSets(
 void Account::readStickerSets(
 		FileKey &stickersKey,
 		Data::StickersSetsOrder *outOrder,
-		MTPDstickerSet::Flags readingFlags) {
+		Data::StickersSetFlags readingFlags) {
+	using SetFlag = Data::StickersSetFlag;
+
 	FileReadDescriptor stickers;
 	if (!ReadEncryptedFile(stickers, stickersKey, _basePath, _localKey)) {
 		ClearKey(stickersKey, _basePath);
@@ -1665,14 +1689,12 @@ void Account::readStickerSets(
 		return failed();
 	}
 	for (auto i = 0; i != count; ++i) {
-		using LocationType = StorageFileLocation::Type;
-
 		quint64 setId = 0, setAccess = 0;
 		QString setTitle, setShortName;
 		qint32 scnt = 0;
 		qint32 setInstallDate = 0;
 		qint32 setHash = 0;
-		MTPDstickerSet::Flags setFlags = 0;
+		Data::StickersSetFlags setFlags = 0;
 		qint32 setFlagsValue = 0;
 		ImageLocation setThumbnail;
 
@@ -1691,27 +1713,53 @@ void Account::readStickerSets(
 		if (!thumbnail || !CheckStreamStatus(stickers.stream)) {
 			return failed();
 		} else if (thumbnail->valid() && thumbnail->isLegacy()) {
-			setThumbnail = thumbnail->convertToModern(
-				LocationType::StickerSetThumb,
-				setId,
-				setAccess);
+			// No thumb_version information in legacy location.
+			return failed();
 		} else {
 			setThumbnail = *thumbnail;
 		}
 
-		setFlags = MTPDstickerSet::Flags::from_raw(setFlagsValue);
+		if (stickers.version >= 2008007) {
+			setFlags = Data::StickersSetFlags::from_raw(setFlagsValue);
+		} else {
+			using Saved = MTPDstickerSet::Flag;
+			using Flag = SetFlag;
+			struct Conversion {
+				Saved saved;
+				Flag flag;
+			};
+			const auto conversions = {
+				Conversion{ Saved::f_archived, Flag::Archived },
+				Conversion{ Saved::f_installed_date, Flag::Installed },
+				Conversion{ Saved::f_masks, Flag::Masks },
+				Conversion{ Saved::f_official, Flag::Official },
+				Conversion{ Saved(1U << 30), Flag::NotLoaded },
+				Conversion{ Saved(1U << 29), Flag::Featured },
+				Conversion{ Saved(1U << 28), Flag::Unread },
+				Conversion{ Saved(1U << 27), Flag::Special },
+			};
+			auto flagsSet = Flag() | 0;
+			for (const auto &conversion : conversions) {
+				if (setFlagsValue & int(conversion.saved)) {
+					flagsSet |= conversion.flag;
+				}
+			}
+			setFlags = flagsSet;
+		}
+
 		if (setId == Data::Stickers::DefaultSetId) {
 			setTitle = tr::lng_stickers_default_set(tr::now);
-			setFlags |= MTPDstickerSet::Flag::f_official | MTPDstickerSet_ClientFlag::f_special;
+			setFlags |= SetFlag::Official | SetFlag::Special;
 		} else if (setId == Data::Stickers::CustomSetId) {
 			setTitle = qsl("Custom stickers");
-			setFlags |= MTPDstickerSet_ClientFlag::f_special;
-		} else if (setId == Data::Stickers::CloudRecentSetId) {
+			setFlags |= SetFlag::Special;
+		} else if ((setId == Data::Stickers::CloudRecentSetId)
+				|| (setId == Data::Stickers::CloudRecentAttachedSetId)) {
 			setTitle = tr::lng_recent_stickers(tr::now);
-			setFlags |= MTPDstickerSet_ClientFlag::f_special;
+			setFlags |= SetFlag::Special;
 		} else if (setId == Data::Stickers::FavedSetId) {
 			setTitle = Lang::Hard::FavedSetTitle();
-			setFlags |= MTPDstickerSet_ClientFlag::f_special;
+			setFlags |= SetFlag::Special;
 		} else if (!setId) {
 			continue;
 		}
@@ -1719,7 +1767,7 @@ void Account::readStickerSets(
 		auto it = sets.find(setId);
 		if (it == sets.cend()) {
 			// We will set this flags from order lists when reading those stickers.
-			setFlags &= ~(MTPDstickerSet::Flag::f_installed_date | MTPDstickerSet_ClientFlag::f_featured);
+			setFlags &= ~(SetFlag::Installed | SetFlag::Featured);
 			it = sets.emplace(setId, std::make_unique<Data::StickersSet>(
 				&_owner->session().data(),
 				setId,
@@ -1728,13 +1776,13 @@ void Account::readStickerSets(
 				setShortName,
 				0,
 				setHash,
-				MTPDstickerSet::Flags(setFlags),
+				setFlags,
 				setInstallDate)).first;
 			it->second->setThumbnail(
 				ImageWithLocation{ .location = setThumbnail });
 		}
 		const auto set = it->second.get();
-		auto inputSet = MTP_inputStickerSetID(MTP_long(set->id), MTP_long(set->access));
+		const auto inputSet = set->identifier();
 		const auto fillStickers = set->stickers.isEmpty();
 
 		if (scnt < 0) { // disabled not loaded set
@@ -1766,8 +1814,8 @@ void Account::readStickerSets(
 			read.emplace(document->id);
 			if (fillStickers) {
 				set->stickers.push_back(document);
-				if (!(set->flags & MTPDstickerSet_ClientFlag::f_special)) {
-					if (document->sticker()->set.type() != mtpc_inputStickerSetID) {
+				if (!(set->flags & SetFlag::Special)) {
+					if (!document->sticker()->set.id) {
 						document->sticker()->set = inputSet;
 					}
 				}
@@ -1781,7 +1829,9 @@ void Account::readStickerSets(
 			if (datesCount != scnt) {
 				return failed();
 			}
-			const auto fillDates = (set->id == Data::Stickers::CloudRecentSetId)
+			const auto fillDates =
+				((set->id == Data::Stickers::CloudRecentSetId)
+					|| (set->id == Data::Stickers::CloudRecentAttachedSetId))
 				&& (set->stickers.size() == datesCount);
 			if (fillDates) {
 				set->dates.clear();
@@ -1853,7 +1903,7 @@ void Account::readStickerSets(
 			if (it != sets.cend()) {
 				const auto set = it->second.get();
 				set->flags |= readingFlags;
-				if ((readingFlags == MTPDstickerSet::Flag::f_installed_date)
+				if ((readingFlags == SetFlag::Installed)
 					&& !set->installDate) {
 					set->installDate = kDefaultStickerInstallDate;
 				}
@@ -1863,16 +1913,25 @@ void Account::readStickerSets(
 }
 
 void Account::writeInstalledStickers() {
+	using SetFlag = Data::StickersSetFlag;
+
 	writeStickerSets(_installedStickersKey, [](const Data::StickersSet &set) {
-		if (set.id == Data::Stickers::CloudRecentSetId || set.id == Data::Stickers::FavedSetId) { // separate files for them
+		if (set.id == Data::Stickers::CloudRecentSetId
+			|| set.id == Data::Stickers::FavedSetId
+			|| set.id == Data::Stickers::CloudRecentAttachedSetId) {
+			// separate files for them
 			return StickerSetCheckResult::Skip;
-		} else if (set.flags & MTPDstickerSet_ClientFlag::f_special) {
+		} else if (set.flags & SetFlag::Special) {
 			if (set.stickers.isEmpty()) { // all other special are "installed"
 				return StickerSetCheckResult::Skip;
 			}
-		} else if (!(set.flags & MTPDstickerSet::Flag::f_installed_date) || (set.flags & MTPDstickerSet::Flag::f_archived)) {
+		} else if (!(set.flags & SetFlag::Installed)
+			|| (set.flags & SetFlag::Archived)) {
 			return StickerSetCheckResult::Skip;
-		} else if (set.flags & MTPDstickerSet_ClientFlag::f_not_loaded) { // waiting to receive
+		} else if (set.flags & SetFlag::Masks) {
+			return StickerSetCheckResult::Skip;
+		} else if (set.flags & SetFlag::NotLoaded) {
+			// waiting to receive
 			return StickerSetCheckResult::Abort;
 		} else if (set.stickers.isEmpty()) {
 			return StickerSetCheckResult::Skip;
@@ -1882,15 +1941,19 @@ void Account::writeInstalledStickers() {
 }
 
 void Account::writeFeaturedStickers() {
+	using SetFlag = Data::StickersSetFlag;
+
 	writeStickerSets(_featuredStickersKey, [](const Data::StickersSet &set) {
 		if (set.id == Data::Stickers::CloudRecentSetId
-			|| set.id == Data::Stickers::FavedSetId) { // separate files for them
+			|| set.id == Data::Stickers::FavedSetId
+			|| set.id == Data::Stickers::CloudRecentAttachedSetId) {
+			// separate files for them
 			return StickerSetCheckResult::Skip;
-		} else if (set.flags & MTPDstickerSet_ClientFlag::f_special) {
+		} else if (set.flags & SetFlag::Special) {
 			return StickerSetCheckResult::Skip;
-		} else if (!(set.flags & MTPDstickerSet_ClientFlag::f_featured)) {
+		} else if (!(set.flags & SetFlag::Featured)) {
 			return StickerSetCheckResult::Skip;
-		} else if (set.flags & MTPDstickerSet_ClientFlag::f_not_loaded) { // waiting to receive
+		} else if (set.flags & SetFlag::NotLoaded) { // waiting to receive
 			return StickerSetCheckResult::Abort;
 		} else if (set.stickers.isEmpty()) {
 			return StickerSetCheckResult::Skip;
@@ -1901,7 +1964,8 @@ void Account::writeFeaturedStickers() {
 
 void Account::writeRecentStickers() {
 	writeStickerSets(_recentStickersKey, [](const Data::StickersSet &set) {
-		if (set.id != Data::Stickers::CloudRecentSetId || set.stickers.isEmpty()) {
+		if (set.id != Data::Stickers::CloudRecentSetId
+			|| set.stickers.isEmpty()) {
 			return StickerSetCheckResult::Skip;
 		}
 		return StickerSetCheckResult::Write;
@@ -1918,15 +1982,58 @@ void Account::writeFavedStickers() {
 }
 
 void Account::writeArchivedStickers() {
+	using SetFlag = Data::StickersSetFlag;
+
 	writeStickerSets(_archivedStickersKey, [](const Data::StickersSet &set) {
-		if (!(set.flags & MTPDstickerSet::Flag::f_archived) || set.stickers.isEmpty()) {
+		if (set.flags & SetFlag::Masks) {
+			return StickerSetCheckResult::Skip;
+		}
+		if (!(set.flags & SetFlag::Archived)
+			|| set.stickers.isEmpty()) {
 			return StickerSetCheckResult::Skip;
 		}
 		return StickerSetCheckResult::Write;
 	}, _owner->session().data().stickers().archivedSetsOrder());
 }
 
+void Account::writeArchivedMasks() {
+	using SetFlag = Data::StickersSetFlag;
+
+	writeStickerSets(_archivedStickersKey, [](const Data::StickersSet &set) {
+		if (!(set.flags & SetFlag::Masks)) {
+			return StickerSetCheckResult::Skip;
+		}
+		if (!(set.flags & SetFlag::Archived) || set.stickers.isEmpty()) {
+			return StickerSetCheckResult::Skip;
+		}
+		return StickerSetCheckResult::Write;
+	}, _owner->session().data().stickers().archivedMaskSetsOrder());
+}
+
+void Account::writeInstalledMasks() {
+	using SetFlag = Data::StickersSetFlag;
+
+	writeStickerSets(_installedMasksKey, [](const Data::StickersSet &set) {
+		if (!(set.flags & SetFlag::Masks) || set.stickers.isEmpty()) {
+			return StickerSetCheckResult::Skip;
+		}
+		return StickerSetCheckResult::Write;
+	}, _owner->session().data().stickers().maskSetsOrder());
+}
+
+void Account::writeRecentMasks() {
+	writeStickerSets(_recentMasksKey, [](const Data::StickersSet &set) {
+		if (set.id != Data::Stickers::CloudRecentAttachedSetId
+			|| set.stickers.isEmpty()) {
+			return StickerSetCheckResult::Skip;
+		}
+		return StickerSetCheckResult::Write;
+	}, Data::StickersSetsOrder());
+}
+
 void Account::importOldRecentStickers() {
+	using SetFlag = Data::StickersSetFlag;
+
 	if (!_recentStickersKeyOld) {
 		return;
 	}
@@ -1958,9 +2065,7 @@ void Account::importOldRecentStickers() {
 			QString(),
 			0, // count
 			0, // hash
-			(MTPDstickerSet::Flag::f_official
-				| MTPDstickerSet::Flag::f_installed_date
-				| MTPDstickerSet_ClientFlag::f_special),
+			(SetFlag::Official | SetFlag::Installed | SetFlag::Special),
 			kDefaultStickerInstallDate)).first->second.get();
 	const auto custom = sets.emplace(
 		Data::Stickers::CustomSetId,
@@ -1972,8 +2077,7 @@ void Account::importOldRecentStickers() {
 			QString(),
 			0, // count
 			0, // hash
-			(MTPDstickerSet::Flag::f_installed_date
-				| MTPDstickerSet_ClientFlag::f_special),
+			(SetFlag::Installed | SetFlag::Special),
 			kDefaultStickerInstallDate)).first->second.get();
 
 	QMap<uint64, bool> read;
@@ -2007,7 +2111,7 @@ void Account::importOldRecentStickers() {
 			date,
 			attributes,
 			mime,
-			QByteArray(),
+			InlineImageLocation(),
 			ImageWithLocation(),
 			ImageWithLocation(),
 			dc,
@@ -2055,14 +2159,14 @@ void Account::readInstalledStickers() {
 	readStickerSets(
 		_installedStickersKey,
 		&_owner->session().data().stickers().setsOrderRef(),
-		MTPDstickerSet::Flag::f_installed_date);
+		Data::StickersSetFlag::Installed);
 }
 
 void Account::readFeaturedStickers() {
 	readStickerSets(
 		_featuredStickersKey,
 		&_owner->session().data().stickers().featuredSetsOrderRef(),
-		MTPDstickerSet::Flags() | MTPDstickerSet_ClientFlag::f_featured);
+		Data::StickersSetFlag::Featured);
 
 	const auto &sets = _owner->session().data().stickers().sets();
 	const auto &order = _owner->session().data().stickers().featuredSetsOrder();
@@ -2070,7 +2174,7 @@ void Account::readFeaturedStickers() {
 	for (const auto setId : order) {
 		auto it = sets.find(setId);
 		if (it != sets.cend()
-			&& (it->second->flags & MTPDstickerSet_ClientFlag::f_unread)) {
+			&& (it->second->flags & Data::StickersSetFlag::Unread)) {
 			++unreadCount;
 		}
 	}
@@ -2081,16 +2185,41 @@ void Account::readRecentStickers() {
 	readStickerSets(_recentStickersKey);
 }
 
+void Account::readRecentMasks() {
+	readStickerSets(_recentMasksKey);
+}
+
 void Account::readFavedStickers() {
 	readStickerSets(_favedStickersKey);
 }
 
 void Account::readArchivedStickers() {
+	// TODO: refactor to support for multiple accounts.
 	static bool archivedStickersRead = false;
 	if (!archivedStickersRead) {
-		readStickerSets(_archivedStickersKey, &_owner->session().data().stickers().archivedSetsOrderRef());
+		readStickerSets(
+			_archivedStickersKey,
+			&_owner->session().data().stickers().archivedSetsOrderRef());
 		archivedStickersRead = true;
 	}
+}
+
+void Account::readArchivedMasks() {
+	// TODO: refactor to support for multiple accounts.
+	static bool archivedMasksRead = false;
+	if (!archivedMasksRead) {
+		readStickerSets(
+			_archivedMasksKey,
+			&_owner->session().data().stickers().archivedMaskSetsOrderRef());
+		archivedMasksRead = true;
+	}
+}
+
+void Account::readInstalledMasks() {
+	readStickerSets(
+		_installedMasksKey,
+		&_owner->session().data().stickers().maskSetsOrderRef(),
+		Data::StickersSetFlag::Installed);
 }
 
 void Account::writeSavedGifs() {
@@ -2509,8 +2638,12 @@ void Account::writeTrustedBots() {
 	quint32 size = sizeof(qint32) + _trustedBots.size() * sizeof(quint64);
 	EncryptedDescriptor data(size);
 	data.stream << qint32(_trustedBots.size());
-	for_const (auto botId, _trustedBots) {
-		data.stream << quint64(botId);
+	for (const auto &[peerId, mask] : _trustedBots) {
+		// value: 8 bit mask, 56 bit bot peer_id.
+		auto value = SerializePeerId(peerId);
+		Assert((value >> 56) == 0);
+		value |= (quint64(mask) << 56);
+		data.stream << value;
 	}
 
 	FileWriteDescriptor file(_trustedBotsKey, _basePath);
@@ -2531,25 +2664,62 @@ void Account::readTrustedBots() {
 	qint32 size = 0;
 	trusted.stream >> size;
 	for (int i = 0; i < size; ++i) {
-		quint64 botId = 0;
-		trusted.stream >> botId;
-		_trustedBots.insert(botId);
+		auto value = quint64();
+		trusted.stream >> value;
+		const auto mask = base::flags<BotTrustFlag>::from_raw(
+			uchar(value >> 56));
+		const auto peerIdSerialized = value & ~(0xFFULL << 56);
+		const auto peerId = DeserializePeerId(peerIdSerialized);
+		_trustedBots.emplace(peerId, mask);
 	}
 }
 
-void Account::markBotTrusted(not_null<UserData*> bot) {
-	if (!isBotTrusted(bot)) {
-		_trustedBots.insert(bot->id);
-		writeTrustedBots();
+void Account::markBotTrustedOpenGame(PeerId botId) {
+	if (isBotTrustedOpenGame(botId)) {
+		return;
 	}
+	const auto i = _trustedBots.find(botId);
+	if (i == end(_trustedBots)) {
+		_trustedBots.emplace(botId, BotTrustFlag());
+	} else {
+		i->second &= ~BotTrustFlag::NoOpenGame;
+	}
+	writeTrustedBots();
 }
 
-bool Account::isBotTrusted(not_null<UserData*> bot) {
+bool Account::isBotTrustedOpenGame(PeerId botId) {
 	if (!_trustedBotsRead) {
 		readTrustedBots();
 		_trustedBotsRead = true;
 	}
-	return _trustedBots.contains(bot->id);
+	const auto i = _trustedBots.find(botId);
+	return (i != end(_trustedBots))
+		&& ((i->second & BotTrustFlag::NoOpenGame) == 0);
+}
+
+void Account::markBotTrustedPayment(PeerId botId) {
+	if (isBotTrustedPayment(botId)) {
+		return;
+	}
+	const auto i = _trustedBots.find(botId);
+	if (i == end(_trustedBots)) {
+		_trustedBots.emplace(
+			botId,
+			BotTrustFlag::NoOpenGame | BotTrustFlag::Payment);
+	} else {
+		i->second |= BotTrustFlag::Payment;
+	}
+	writeTrustedBots();
+}
+
+bool Account::isBotTrustedPayment(PeerId botId) {
+	if (!_trustedBotsRead) {
+		readTrustedBots();
+		_trustedBotsRead = true;
+	}
+	const auto i = _trustedBots.find(botId);
+	return (i != end(_trustedBots))
+		&& ((i->second & BotTrustFlag::Payment) != 0);
 }
 
 bool Account::encrypt(

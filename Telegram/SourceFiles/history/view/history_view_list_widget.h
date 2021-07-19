@@ -234,6 +234,14 @@ public:
 	void elementShowPollResults(
 		not_null<PollData*> poll,
 		FullMsgId context) override;
+	void elementOpenPhoto(
+		not_null<PhotoData*> photo,
+		FullMsgId context) override;
+	void elementOpenDocument(
+		not_null<DocumentData*> document,
+		FullMsgId context,
+		bool showInMediaView = false) override;
+	void elementCancelUpload(const FullMsgId &context) override;
 	void elementShowTooltip(
 		const TextWithEntities &text,
 		Fn<void()> hiddenCallback) override;
@@ -244,6 +252,8 @@ public:
 		const QString &command,
 		const FullMsgId &context) override;
 	void elementHandleViaClick(not_null<UserData*> bot) override;
+	bool elementIsChatWide() override;
+	not_null<Ui::PathShiftGradient*> elementPathShiftGradient() override;
 
 	~ListWidget();
 
@@ -500,6 +510,8 @@ private:
 		not_null<PeerData*>,
 		std::shared_ptr<Data::CloudImageView>> _userpics, _userpicsCache;
 
+	const std::unique_ptr<Ui::PathShiftGradient> _pathGradient;
+
 	int _minHeight = 0;
 	int _visibleTop = 0;
 	int _visibleBottom = 0;
@@ -545,6 +557,8 @@ private:
 	// Was some text selected in current drag action.
 	bool _wasSelectedText = false;
 	Qt::CursorShape _cursor = style::cur_default;
+
+	bool _isChatWide = false;
 
 	base::unique_qptr<Ui::PopupMenu> _menu;
 

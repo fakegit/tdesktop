@@ -27,7 +27,6 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "passport/passport_encryption.h"
 #include "passport/passport_panel_edit_contact.h"
 #include "settings/settings_privacy_security.h"
-#include "facades.h"
 #include "styles/style_layers.h"
 #include "styles/style_passport.h"
 #include "styles/style_boxes.h"
@@ -119,7 +118,12 @@ PasscodeBox::PasscodeBox(
 , _turningOff(turningOff)
 , _about(st::boxWidth - st::boxPadding.left() * 1.5)
 , _oldPasscode(this, st::defaultInputField, tr::lng_passcode_enter_old())
-, _newPasscode(this, st::defaultInputField, Global::LocalPasscode() ? tr::lng_passcode_enter_new() : tr::lng_passcode_enter_first())
+, _newPasscode(
+	this,
+	st::defaultInputField,
+	session->domain().local().hasLocalPasscode()
+		? tr::lng_passcode_enter_new()
+		: tr::lng_passcode_enter_first())
 , _reenterPasscode(this, st::defaultInputField, tr::lng_passcode_confirm_new())
 , _passwordHint(this, st::defaultInputField, tr::lng_cloud_password_hint())
 , _recoverEmail(this, st::defaultInputField, tr::lng_cloud_password_email())
@@ -164,7 +168,9 @@ rpl::producer<> PasscodeBox::clearUnconfirmedPassword() const {
 }
 
 bool PasscodeBox::currentlyHave() const {
-	return _cloudPwd ? (!!_cloudFields.curRequest) : Global::LocalPasscode();
+	return _cloudPwd
+		? (!!_cloudFields.curRequest)
+		: _session->domain().local().hasLocalPasscode();
 }
 
 bool PasscodeBox::onlyCheckCurrent() const {
@@ -361,7 +367,11 @@ void PasscodeBox::closeReplacedBy() {
 }
 
 void PasscodeBox::setPasswordFail(const MTP::Error &error) {
-	if (MTP::IsFloodError(error)) {
+	setPasswordFail(error.type());
+}
+
+void PasscodeBox::setPasswordFail(const QString &type) {
+	if (MTP::IsFloodError(type)) {
 		closeReplacedBy();
 		_setRequest = 0;
 
@@ -378,20 +388,19 @@ void PasscodeBox::setPasswordFail(const MTP::Error &error) {
 
 	closeReplacedBy();
 	_setRequest = 0;
-	const auto &err = error.type();
-	if (err == qstr("PASSWORD_HASH_INVALID")
-		|| err == qstr("SRP_PASSWORD_CHANGED")) {
+	if (type == qstr("PASSWORD_HASH_INVALID")
+		|| type == qstr("SRP_PASSWORD_CHANGED")) {
 		if (_oldPasscode->isHidden()) {
 			_passwordReloadNeeded.fire({});
 			closeBox();
 		} else {
 			badOldPasscode();
 		}
-	} else if (err == qstr("SRP_ID_INVALID")) {
+	} else if (type == qstr("SRP_ID_INVALID")) {
 		handleSrpIdInvalid();
-	//} else if (err == qstr("NEW_PASSWORD_BAD")) {
-	//} else if (err == qstr("NEW_SALT_INVALID")) {
-	} else if (err == qstr("EMAIL_INVALID")) {
+	//} else if (type == qstr("NEW_PASSWORD_BAD")) {
+	//} else if (type == qstr("NEW_SALT_INVALID")) {
+	} else if (type == qstr("EMAIL_INVALID")) {
 		_emailError = tr::lng_cloud_password_bad_email(tr::now);
 		_recoverEmail->setFocus();
 		_recoverEmail->showError();
@@ -517,7 +526,7 @@ void PasscodeBox::save(bool force) {
 			return;
 		}
 
-		if (Core::App().domain().local().checkPasscode(old.toUtf8())) {
+		if (_session->domain().local().checkPasscode(old.toUtf8())) {
 			cSetPasscodeBadTries(0);
 			if (_turningOff) pwd = conf = QString();
 		} else {
@@ -585,7 +594,7 @@ void PasscodeBox::save(bool force) {
 		closeReplacedBy();
 		const auto weak = Ui::MakeWeak(this);
 		cSetPasscodeBadTries(0);
-		Core::App().domain().local().setPasscode(pwd.toUtf8());
+		_session->domain().local().setPasscode(pwd.toUtf8());
 		Core::App().localPasscodeChanged();
 		if (weak) {
 			closeBox();
@@ -682,12 +691,15 @@ void PasscodeBox::serverError() {
 }
 
 bool PasscodeBox::handleCustomCheckError(const MTP::Error &error) {
-	const auto &type = error.type();
-	if (MTP::IsFloodError(error)
+	return handleCustomCheckError(error.type());
+}
+
+bool PasscodeBox::handleCustomCheckError(const QString &type) {
+	if (MTP::IsFloodError(type)
 		|| type == qstr("PASSWORD_HASH_INVALID")
 		|| type == qstr("SRP_PASSWORD_CHANGED")
 		|| type == qstr("SRP_ID_INVALID")) {
-		setPasswordFail(error);
+		setPasswordFail(type);
 		return true;
 	}
 	return false;
@@ -1050,7 +1062,9 @@ void RecoverBox::submit() {
 
 	const auto send = crl::guard(this, [=] {
 		_submitRequest = _api.request(MTPauth_RecoverPassword(
-			MTP_string(code)
+			MTP_flags(0),
+			MTP_string(code),
+			MTPaccount_PasswordInputSettings()
 		)).done([=](const MTPauth_Authorization &result) {
 			codeSubmitDone(result);
 		}).fail([=](const MTP::Error &error) {

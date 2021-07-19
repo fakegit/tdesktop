@@ -98,7 +98,7 @@ void LoadAndApplyThumbnail(
 	};
 
 	document->updateThumbnails(
-		QByteArray(),
+		InlineImageLocation(),
 		imageWithLocation,
 		ImageWithLocation{ .location = ImageLocation() });
 
@@ -111,7 +111,9 @@ void LoadThumbnailFromExternal(not_null<DocumentData*> document) {
 	const auto songData = document->song();
 	if (!songData
 		|| songData->performer.isEmpty()
-		|| songData->title.isEmpty()) {
+		|| songData->title.isEmpty()
+		// Ignore cover for voice chat records.
+		|| document->hasMimeType(qstr("audio/ogg"))) {
 		return;
 	}
 

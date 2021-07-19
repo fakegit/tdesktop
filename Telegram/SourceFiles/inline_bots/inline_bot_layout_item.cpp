@@ -166,7 +166,7 @@ Image *ItemBase::getResultThumb(Data::FileOrigin origin) const {
 QPixmap ItemBase::getResultContactAvatar(int width, int height) const {
 	if (_result->_type == Result::Type::Contact) {
 		auto result = Ui::EmptyUserpic(
-			Data::PeerUserpicColor(qHash(_result->_id)),
+			Data::PeerUserpicColor(FakeChatId(BareId(qHash(_result->_id)))),
 			_result->getLayoutTitle()
 		).generate(width);
 		if (result.height() != height * cIntRetinaFactor()) {
@@ -198,11 +198,10 @@ ClickHandlerPtr ItemBase::getResultPreviewHandler() const {
 			_result->_content_url,
 			false);
 	} else if (const auto document = _result->_document
-		&& _result->_document->createMediaView()->canBePlayed()) {
-		return std::make_shared<DocumentOpenClickHandler>(
-			_result->_document);
+		; document->createMediaView()->canBePlayed()) {
+		return std::make_shared<OpenFileClickHandler>();
 	} else if (_result->_photo) {
-		return std::make_shared<PhotoOpenClickHandler>(_result->_photo);
+		return std::make_shared<OpenFileClickHandler>();
 	}
 	return ClickHandlerPtr();
 }

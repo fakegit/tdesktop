@@ -9,13 +9,13 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 #include "ui/image/image_prepare.h"
 
+class QPainterPath;
+
 namespace Images {
 
 [[nodiscard]] QByteArray ExpandInlineBytes(const QByteArray &bytes);
 [[nodiscard]] QImage FromInlineBytes(const QByteArray &bytes);
-
-[[nodiscard]] QSize GetSizeForDocument(
-	const QVector<MTPDocumentAttribute> &attributes);
+[[nodiscard]] QPainterPath PathFromInlineBytes(const QByteArray &bytes);
 
 } // namespace Images
 

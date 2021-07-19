@@ -19,6 +19,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "ui/widgets/buttons.h"
 #include "ui/effects/ripple_animation.h"
 #include "ui/text/format_values.h"
+#include "ui/text/format_song_document_name.h"
 #include "lang/lang_keys.h"
 #include "media/audio/media_audio.h"
 #include "media/view/media_view_playback_progress.h"
@@ -205,6 +206,11 @@ void Widget::setCloseCallback(Fn<void()> callback) {
 	_close->setClickedCallback([this] { stopAndClose(); });
 }
 
+void Widget::setShowItemCallback(
+		Fn<void(not_null<const HistoryItem*>)> callback) {
+	_showItemCallback = std::move(callback);
+}
+
 void Widget::stopAndClose() {
 	_voiceIsActive = false;
 	if (_type == AudioMsgId::Type::Voice) {
@@ -265,10 +271,6 @@ void Widget::handleSeekProgress(float64 progress) {
 void Widget::handleSeekFinished(float64 progress) {
 	if (!_lastDurationMs) return;
 
-	const auto positionMs = std::clamp(
-		static_cast<crl::time>(progress * _lastDurationMs),
-		crl::time(0),
-		_lastDurationMs);
 	_seekPositionMs = -1;
 
 	instance()->finishSeeking(_type, progress);
@@ -310,15 +312,16 @@ void Widget::mousePressEvent(QMouseEvent *e) {
 
 void Widget::mouseReleaseEvent(QMouseEvent *e) {
 	if (auto downLabels = base::take(_labelsDown)) {
-		if (_labelsOver == downLabels) {
-			if (_type == AudioMsgId::Type::Voice) {
-				const auto current = instance()->current(_type);
-				const auto document = current.audio();
-				const auto context = current.contextId();
-				if (document && context) {
-					if (const auto item = document->owner().message(context)) {
-						Ui::showPeerHistoryAtItem(item);
-					}
+		if (_labelsOver != downLabels) {
+			return;
+		}
+		if (_type == AudioMsgId::Type::Voice) {
+			const auto current = instance()->current(_type);
+			const auto document = current.audio();
+			const auto context = current.contextId();
+			if (document && context && _showItemCallback) {
+				if (const auto item = document->owner().message(context)) {
+					_showItemCallback(item);
 				}
 			}
 		}
@@ -457,7 +460,6 @@ void Widget::handleSongUpdate(const TrackState &state) {
 		_playbackProgress->updateState(state);
 	}
 
-	auto stopped = IsStoppedOrStopping(state.state);
 	auto showPause = ShowPauseIcon(state.state);
 	if (instance()->isSeeking(_type)) {
 		showPause = true;
@@ -476,12 +478,11 @@ void Widget::handleSongUpdate(const TrackState &state) {
 }
 
 void Widget::updateTimeText(const TrackState &state) {
-	qint64 position = 0, length = 0, display = 0;
+	qint64 display = 0;
 	const auto frequency = state.frequency;
 	const auto document = state.id.audio();
 	if (!IsStoppedOrStopping(state.state)) {
-		display = position = state.position;
-		length = state.length;
+		display = state.position;
 	} else if (state.length) {
 		display = state.length;
 	} else if (const auto song = document->song()) {
@@ -565,26 +566,8 @@ void Widget::handleSongChange() {
 			textWithEntities.text = tr::lng_media_audio(tr::now);
 		}
 	} else {
-		const auto song = document->song();
-		if (!song || song->performer.isEmpty()) {
-			textWithEntities.text = (!song || song->title.isEmpty())
-				? (document->filename().isEmpty()
-					? qsl("Unknown Track")
-					: document->filename())
-				: song->title;
-		} else {
-			auto title = song->title.isEmpty()
-				? qsl("Unknown Track")
-				: TextUtilities::Clean(song->title);
-			auto dash = QString::fromUtf8(" \xe2\x80\x93 ");
-			textWithEntities.text = song->performer + dash + title;
-			textWithEntities.entities.append({
-				EntityType::Semibold,
-				0,
-				song->performer.size(),
-				QString()
-			});
-		}
+		textWithEntities = Ui::Text::FormatSongNameFor(document)
+			.textWithEntities(true);
 	}
 	_nameLabel->setMarkedText(textWithEntities);
 

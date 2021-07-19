@@ -66,7 +66,7 @@ namespace {
 
 constexpr auto kMinDiffIntensity = 0.25;
 
-[[nodicard]] float64 IntensityOfColor(QColor color) {
+[[nodiscard]] float64 IntensityOfColor(QColor color) {
 	return (0.299 * color.red()
 			+ 0.587 * color.green()
 			+ 0.114 * color.blue()) / 255.0;
@@ -131,16 +131,14 @@ void ShowCallsBox(not_null<Window::SessionController*> window) {
 			return true;
 		});
 	};
-	Ui::show(Box<PeerListBox>(std::move(controller), initBox));
+	window->show(Box<PeerListBox>(std::move(controller), initBox));
 }
 
 } // namespace
 
 namespace Window {
 
-class MainMenu::AccountButton final
-	: public Ui::RippleButton
-	, public base::Subscriber {
+class MainMenu::AccountButton final : public Ui::RippleButton {
 public:
 	AccountButton(QWidget *parent, not_null<Main::Account*> account);
 
@@ -209,12 +207,10 @@ MainMenu::AccountButton::AccountButton(
 		+ _st.itemPadding.bottom();
 	resize(width(), height);
 
-	subscribe(Window::Theme::Background(), [=](
-			const Window::Theme::BackgroundUpdate &update) {
-		if (update.paletteChanged()) {
-			_userpicKey = {};
-		}
-	});
+	style::PaletteChanged(
+	) | rpl::start_with_next([=] {
+		_userpicKey = {};
+	}, lifetime());
 
 	rpl::single(
 		rpl::empty_value()
@@ -397,7 +393,6 @@ void MainMenu::ToggleAccountsButton::paintEvent(QPaintEvent *e) {
 	const auto left = x - size;
 	const auto right = x + size;
 	const auto bottom = y + size2;
-	const auto top = y - size2;
 	constexpr auto kPointCount = 6;
 	std::array<QPointF, kPointCount> points = { {
 		{ left - stroke, bottom - stroke },
@@ -617,7 +612,11 @@ MainMenu::MainMenu(
 	_telegram->setLinksTrusted();
 	_version->setRichText(textcmdLink(1, tr::lng_settings_current_version(tr::now, lt_version, currentVersionText())) + QChar(' ') + QChar(8211) + QChar(' ') + textcmdLink(2, tr::lng_menu_about(tr::now)));
 	_version->setLink(1, std::make_shared<UrlClickHandler>(Core::App().changelogLink()));
-	_version->setLink(2, std::make_shared<LambdaClickHandler>([] { Ui::show(Box<AboutBox>()); }));
+	_version->setLink(
+		2,
+		std::make_shared<LambdaClickHandler>([=] {
+			controller->show(Box<AboutBox>());
+		}));
 
 	_controller->session().downloaderTaskFinished(
 	) | rpl::start_with_next([=] {
@@ -636,8 +635,10 @@ MainMenu::MainMenu(
 		refreshMenu();
 	}, lifetime());
 
-	subscribe(Window::Theme::Background(), [this](const Window::Theme::BackgroundUpdate &update) {
-		if (update.type == Window::Theme::BackgroundUpdate::Type::ApplyingTheme) {
+	using Window::Theme::BackgroundUpdate;
+	Window::Theme::Background()->updates(
+	) | rpl::start_with_next([=](const BackgroundUpdate &update) {
+		if (update.type == BackgroundUpdate::Type::ApplyingTheme) {
 			if (const auto action = *_nightThemeAction) {
 				const auto nightMode = Window::Theme::IsNightMode();
 				if (action->isChecked() != nightMode) {
@@ -646,10 +647,10 @@ MainMenu::MainMenu(
 				}
 			}
 		}
-		if (update.type == Window::Theme::BackgroundUpdate::Type::New) {
+		if (update.type == BackgroundUpdate::Type::New) {
 			refreshBackground();
 		}
-	});
+	}, lifetime());
 	updatePhone();
 	initResetScaleButton();
 }
@@ -903,7 +904,7 @@ void MainMenu::refreshMenu() {
 			controller->showNewChannel();
 		}, &st::mainMenuNewChannel, &st::mainMenuNewChannelOver);
 		_menu->addAction(tr::lng_menu_contacts(tr::now), [=] {
-			Ui::show(PrepareContactsBox(controller));
+			controller->show(PrepareContactsBox(controller));
 		}, &st::mainMenuContacts, &st::mainMenuContactsOver);
 		if (_controller->session().serverConfig().phoneCallsEnabled.current()) {
 			_menu->addAction(tr::lng_menu_calls(tr::now), [=] {
@@ -938,7 +939,7 @@ void MainMenu::refreshMenu() {
 
 	auto nightCallback = [=] {
 		if (Window::Theme::Background()->editingTheme()) {
-			Ui::show(Box<InformBox>(
+			controller->show(Box<InformBox>(
 				tr::lng_theme_editor_cant_change_theme(tr::now)));
 			return;
 		}

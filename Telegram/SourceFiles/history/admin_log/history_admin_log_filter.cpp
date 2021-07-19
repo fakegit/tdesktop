@@ -32,7 +32,6 @@ public:
 		return _check->checked();
 	}
 	rpl::producer<bool> checkedChanges() const;
-	rpl::producer<bool> checkedValue() const;
 
 	enum class NotifyAboutChange {
 		Notify,
@@ -41,8 +40,6 @@ public:
 	void setChecked(
 		bool checked,
 		NotifyAboutChange notify = NotifyAboutChange::Notify);
-
-	void finishAnimating();
 
 	QMargins getMargins() const override {
 		return _st.margin;
@@ -90,10 +87,6 @@ rpl::producer<bool> UserCheckbox::checkedChanges() const {
 	return _checkedChanges.events();
 }
 
-rpl::producer<bool> UserCheckbox::checkedValue() const {
-	return _checkedChanges.events_starting_with(checked());
-}
-
 void UserCheckbox::setChecked(bool checked, NotifyAboutChange notify) {
 	if (_check->checked() != checked) {
 		_check->setChecked(checked, anim::type::normal);
@@ -131,10 +124,6 @@ void UserCheckbox::paintEvent(QPaintEvent *e) {
 	p.setFont(st::contactsStatusFont);
 	p.setPen(_statusOnline ? st::contactsStatusFgOnline : st::contactsStatusFg);
 	p.drawTextLeft(statusLeft, statusTop, width(), _statusText);
-}
-
-void UserCheckbox::finishAnimating() {
-	_check->finishAnimating();
 }
 
 int UserCheckbox::resizeGetHeight(int newWidth) {
@@ -282,8 +271,8 @@ void FilterBox::Inner::createActionsCheckboxes(const FilterValue &filter) {
 	addFlag(Flag::f_edit, tr::lng_admin_log_filter_messages_edited(tr::now));
 	if (isGroup) {
 		addFlag(Flag::f_pinned, tr::lng_admin_log_filter_messages_pinned(tr::now));
-		addFlag(Flag::f_group_call, tr::lng_admin_log_filter_voice_chats(tr::now));
 	}
+	addFlag(Flag::f_group_call, tr::lng_admin_log_filter_voice_chats(tr::now));
 	addFlag(Flag::f_invites, tr::lng_admin_log_filter_invite_links(tr::now));
 	addFlag(Flag::f_leave, tr::lng_admin_log_filter_members_removed(tr::now));
 }

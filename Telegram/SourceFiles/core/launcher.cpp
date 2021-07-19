@@ -12,11 +12,12 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "base/platform/base_platform_info.h"
 #include "base/platform/base_platform_file_utilities.h"
 #include "ui/main_queue_processor.h"
-#include "ui/ui_utility.h"
 #include "core/crash_reports.h"
 #include "core/update_checker.h"
 #include "core/sandbox.h"
 #include "base/concurrent_timer.h"
+
+#include <QtCore/QLoggingCategory>
 
 namespace Core {
 namespace {
@@ -97,6 +98,9 @@ void ComputeDebugMode() {
 	}
 	if (cDebugMode()) {
 		Logs::SetDebugEnabled(true);
+	}
+	if (Logs::DebugEnabled()) {
+		QLoggingCategory::setFilterRules("qt.qpa.gl.debug=true");
 	}
 }
 
@@ -279,19 +283,7 @@ void Launcher::init() {
 	_arguments = readArguments(_argc, _argv);
 
 	prepareSettings();
-
-	static QtMessageHandler originalMessageHandler = nullptr;
-	originalMessageHandler = qInstallMessageHandler([](
-		QtMsgType type,
-		const QMessageLogContext &context,
-		const QString &msg) {
-		if (originalMessageHandler) {
-			originalMessageHandler(type, context, msg);
-		}
-		if (Logs::DebugEnabled() || !Logs::started()) {
-			LOG((msg));
-		}
-	});
+	initQtMessageLogging();
 
 	QApplication::setApplicationName(qsl("TelegramDesktop"));
 
@@ -341,7 +333,6 @@ int Launcher::exec() {
 
 	// Must be started before Sandbox is created.
 	Platform::start();
-	Ui::DisableCustomScaling();
 
 	auto result = executeApplication();
 
@@ -428,6 +419,24 @@ void Launcher::prepareSettings() {
 	}
 
 	processArguments();
+}
+
+void Launcher::initQtMessageLogging() {
+	static QtMessageHandler OriginalMessageHandler = nullptr;
+	OriginalMessageHandler = qInstallMessageHandler([](
+			QtMsgType type,
+			const QMessageLogContext &context,
+			const QString &msg) {
+		if (OriginalMessageHandler) {
+			OriginalMessageHandler(type, context, msg);
+		}
+		if (Logs::DebugEnabled() || !Logs::started()) {
+			if (!Logs::WritingEntry()) {
+				// Sometimes Qt logs something inside our own logging.
+				LOG((msg));
+			}
+		}
+	});
 }
 
 uint64 Launcher::installationTag() const {

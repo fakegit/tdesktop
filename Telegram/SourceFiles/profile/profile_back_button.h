@@ -15,12 +15,13 @@ class Session;
 
 namespace Profile {
 
-class BackButton final : public Ui::AbstractButton, private base::Subscriber {
+class BackButton final : public Ui::AbstractButton {
 public:
 	BackButton(
 		QWidget *parent,
 		not_null<Main::Session*> session,
-		const QString &text);
+		const QString &text,
+		rpl::producer<bool> oneColumnValue);
 
 	void setText(const QString &text);
 
@@ -31,8 +32,6 @@ protected:
 	void onStateChanged(State was, StateChangeSource source) override;
 
 private:
-	void updateAdaptiveLayout();
-
 	const not_null<Main::Session*> _session;
 
 	rpl::lifetime _unreadBadgeLifetime;

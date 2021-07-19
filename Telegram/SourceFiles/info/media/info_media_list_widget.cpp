@@ -13,11 +13,12 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "data/data_photo.h"
 #include "data/data_document.h"
 #include "data/data_session.h"
+#include "data/data_file_click_handler.h"
 #include "data/data_file_origin.h"
 #include "history/history_item.h"
 #include "history/history.h"
 #include "history/view/history_view_cursor_state.h"
-#include "window/themes/window_theme.h"
+#include "history/view/history_view_service_message.h"
 #include "window/window_session_controller.h"
 #include "window/window_peer_menu.h"
 #include "ui/widgets/popup_menu.h"
@@ -46,6 +47,7 @@ namespace Info {
 namespace Media {
 namespace {
 
+constexpr auto kFloatingHeaderAlpha = 0.9;
 constexpr auto kPreloadedScreensCount = 4;
 constexpr auto kPreloadIfLessThanScreens = 2;
 constexpr auto kPreloadedScreensCountFull
@@ -66,6 +68,21 @@ UniversalMsgId GetUniversalId(not_null<const BaseLayout*> layout) {
 	return GetUniversalId(layout->getItem()->fullId());
 }
 
+bool HasFloatingHeader(Type type) {
+	switch (type) {
+	case Type::Photo:
+	case Type::Video:
+	case Type::RoundFile:
+	case Type::RoundVoiceFile:
+	case Type::MusicFile:
+		return false;
+	case Type::File:
+	case Type::Link:
+		return true;
+	}
+	Unexpected("Type in HasFloatingHeader()");
+}
+
 } // namespace
 
 struct ListWidget::Context {
@@ -77,7 +94,9 @@ struct ListWidget::Context {
 
 class ListWidget::Section {
 public:
-	Section(Type type) : _type(type) {
+	Section(Type type)
+	: _type(type)
+	, _hasFloatingHeader(HasFloatingHeader(type)) {
 	}
 
 	bool addItem(not_null<BaseLayout*> item);
@@ -122,6 +141,8 @@ public:
 		QRect clip,
 		int outerWidth) const;
 
+	void paintFloatingHeader(Painter &p, int visibleTop, int outerWidth);
+
 	static int MinItemHeight(Type type, int width);
 
 private:
@@ -150,6 +171,7 @@ private:
 	void refreshHeight();
 
 	Type _type = Type::Photo;
+	bool _hasFloatingHeader = false;
 	Ui::Text::String _header;
 	Items _items;
 	int _itemsLeft = 0;
@@ -378,7 +400,6 @@ void ListWidget::Section::paint(
 		const Context &context,
 		QRect clip,
 		int outerWidth) const {
-	auto baseIndex = 0;
 	auto header = headerHeight();
 	if (QRect(0, 0, outerWidth, header).intersects(clip)) {
 		p.setPen(st::infoMediaHeaderFg);
@@ -389,17 +410,6 @@ void ListWidget::Section::paint(
 			outerWidth - 2 * st::infoMediaHeaderPosition.x(),
 			outerWidth);
 	}
-	auto top = header + _itemsTop;
-	auto fromcol = floorclamp(
-		clip.x() - _itemsLeft,
-		_itemWidth,
-		0,
-		_itemsInRow);
-	auto tillcol = ceilclamp(
-		clip.x() + clip.width() - _itemsLeft,
-		_itemWidth,
-		0,
-		_itemsInRow);
 	auto localContext = context.layoutContext;
 	localContext.isAfterDate = (header > 0);
 
@@ -422,6 +432,37 @@ void ListWidget::Section::paint(
 			p.translate(-rect.topLeft());
 		}
 	}
+}
+
+void ListWidget::Section::paintFloatingHeader(
+		Painter &p,
+		int visibleTop,
+		int outerWidth) {
+	if (!_hasFloatingHeader) {
+		return;
+	}
+	const auto headerTop = st::infoMediaHeaderPosition.y() / 2;
+	if (visibleTop <= (_top + headerTop)) {
+		return;
+	}
+	const auto header = headerHeight();
+	const auto headerLeft = st::infoMediaHeaderPosition.x();
+	const auto floatingTop = std::min(
+		visibleTop,
+		bottom() - header + headerTop);
+	p.save();
+	p.resetTransform();
+	p.setOpacity(kFloatingHeaderAlpha);
+	p.fillRect(QRect(0, floatingTop, outerWidth, header), st::boxBg);
+	p.setOpacity(1.0);
+	p.setPen(st::infoMediaHeaderFg);
+	_header.drawLeftElided(
+		p,
+		headerLeft,
+		floatingTop + headerTop,
+		outerWidth - 2 * headerLeft,
+		outerWidth);
+	p.restore();
 }
 
 TextSelection ListWidget::Section::itemSelection(
@@ -568,7 +609,12 @@ ListWidget::ListWidget(
 , _peer(_controller->key().peer())
 , _migrated(_controller->migrated())
 , _type(_controller->section().mediaType())
-, _slice(sliceKey(_universalAroundId)) {
+, _slice(sliceKey(_universalAroundId))
+, _dateBadge(DateBadge{
+	.check = SingleQueuedInvokation([=] { scrollDateCheck(); }),
+	.hideTimer = base::Timer([=] { scrollDateHide(); }),
+	.goodType = (_type == Type::Photo || _type == Type::Video),
+}) {
 	setMouseTracking(true);
 	start();
 }
@@ -579,12 +625,9 @@ Main::Session &ListWidget::session() const {
 
 void ListWidget::start() {
 	_controller->setSearchEnabledByContent(false);
-	ObservableViewer(
-		*Window::Theme::Background()
-	) | rpl::start_with_next([this](const auto &update) {
-		if (update.paletteChanged()) {
-			invalidatePaletteCache();
-		}
+	style::PaletteChanged(
+	) | rpl::start_with_next([=] {
+		invalidatePaletteCache();
 	}, lifetime());
 
 	session().downloaderTaskFinished(
@@ -659,7 +702,6 @@ void ListWidget::itemRemoved(not_null<const HistoryItem*> item) {
 	auto sectionIt = findSectionByItem(id);
 	if (sectionIt != _sections.end()) {
 		if (sectionIt->removeItem(id)) {
-			auto top = sectionIt->top();
 			if (sectionIt->empty()) {
 				_sections.erase(sectionIt);
 			}
@@ -690,11 +732,9 @@ void ListWidget::itemRemoved(not_null<const HistoryItem*> item) {
 FullMsgId ListWidget::computeFullId(
 		UniversalMsgId universalId) const {
 	Expects(universalId != 0);
-	auto peerChannel = [&] {
-		return _peer->isChannel() ? _peer->bareId() : NoChannel;
-	};
+
 	return (universalId > 0)
-		? FullMsgId(peerChannel(), universalId)
+		? FullMsgId(peerToChannel(_peer->id), universalId)
 		: FullMsgId(NoChannel, ServerMaxMsgId + universalId);
 }
 
@@ -799,8 +839,8 @@ bool ListWidget::isMyItem(not_null<const HistoryItem*> item) const {
 }
 
 bool ListWidget::isPossiblyMyId(FullMsgId fullId) const {
-	return (fullId.channel != 0)
-		? (_peer->isChannel() && _peer->bareId() == fullId.channel)
+	return fullId.channel
+		? (_peer->isChannel() && peerToChannel(_peer->id) == fullId.channel)
 		: (!_peer->isChannel() || _migrated);
 }
 
@@ -831,6 +871,16 @@ void ListWidget::unregisterHeavyItem(not_null<const BaseLayout*> item) {
 	}
 }
 
+void ListWidget::openPhoto(not_null<PhotoData*> photo, FullMsgId id) {
+	_controller->parentController()->openPhoto(photo, id);
+}
+
+void ListWidget::openDocument(
+		not_null<DocumentData*> document,
+		FullMsgId id) {
+	_controller->parentController()->openDocument(document, id);
+}
+
 SparseIdsMergedSlice::Key ListWidget::sliceKey(
 		UniversalMsgId universalId) const {
 	using Key = SparseIdsMergedSlice::Key;
@@ -846,7 +896,7 @@ SparseIdsMergedSlice::Key ListWidget::sliceKey(
 
 void ListWidget::refreshViewer() {
 	_viewerLifetime.destroy();
-	auto idForViewer = sliceKey(_universalAroundId).universalId;
+	const auto idForViewer = sliceKey(_universalAroundId).universalId;
 	_controller->mediaSource(
 		idForViewer,
 		_idsLimit,
@@ -1072,6 +1122,55 @@ void ListWidget::visibleTopBottomUpdated(
 
 	checkMoveToOtherViewer();
 	clearHeavyItems();
+
+	if (_dateBadge.goodType) {
+		updateDateBadgeFor(_visibleTop);
+		if (!_visibleTop) {
+			if (_dateBadge.shown) {
+				scrollDateHide();
+			} else {
+				update(_dateBadge.rect);
+			}
+		} else {
+			_dateBadge.check.call();
+		}
+	}
+}
+
+void ListWidget::updateDateBadgeFor(int top) {
+	if (_sections.empty()) {
+		return;
+	}
+	const auto layout = findItemByPoint({ st::infoMediaSkip, top }).layout;
+	const auto rectHeight = st::msgServiceMargin.top()
+		+ st::msgServicePadding.top()
+		+ st::msgServiceFont->height
+		+ st::msgServicePadding.bottom();
+
+	_dateBadge.text = ItemDateText(layout->getItem(), false);
+	_dateBadge.rect = QRect(0, top, width(), rectHeight);
+}
+
+void ListWidget::scrollDateCheck() {
+	if (!_dateBadge.shown) {
+		toggleScrollDateShown();
+	}
+	_dateBadge.hideTimer.callOnce(st::infoScrollDateHideTimeout);
+}
+
+void ListWidget::scrollDateHide() {
+	if (_dateBadge.shown) {
+		toggleScrollDateShown();
+	}
+}
+
+void ListWidget::toggleScrollDateShown() {
+	_dateBadge.shown = !_dateBadge.shown;
+	_dateBadge.opacity.start(
+		[=] { update(_dateBadge.rect); },
+		_dateBadge.shown ? 0. : 1.,
+		_dateBadge.shown ? 1. : 0.,
+		st::infoDateFadeDuration);
 }
 
 void ListWidget::checkMoveToOtherViewer() {
@@ -1219,6 +1318,25 @@ void ListWidget::paintEvent(QPaintEvent *e) {
 		it->paint(p, context, clip.translated(0, -top), outerWidth);
 		p.translate(0, -top);
 	}
+	if (fromSectionIt != _sections.end()) {
+		fromSectionIt->paintFloatingHeader(p, _visibleTop, outerWidth);
+	}
+
+	if (_dateBadge.goodType && clip.intersects(_dateBadge.rect)) {
+		const auto scrollDateOpacity =
+			_dateBadge.opacity.value(_dateBadge.shown ? 1. : 0.);
+		if (scrollDateOpacity > 0.) {
+			p.setOpacity(scrollDateOpacity);
+			HistoryView::ServiceMessagePainter::paintDate(
+				p,
+				_dateBadge.text,
+				_visibleTop,
+				outerWidth,
+				false,
+				st::roundedBg,
+				st::roundedFg);
+		}
+	}
 }
 
 void ListWidget::mousePressEvent(QMouseEvent *e) {
@@ -1311,7 +1429,7 @@ void ListWidget::showContextMenu(
 		tr::lng_context_to_msg(tr::now),
 		[=] {
 			if (const auto item = owner->message(itemFullId)) {
-				Ui::showPeerHistoryAtItem(item);
+				_controller->parentController()->showPeerHistoryAtItem(item);
 			}
 		});
 
@@ -1717,7 +1835,6 @@ void ListWidget::mouseActionUpdate(const QPoint &globalPosition) {
 		point - geometry.topLeft(),
 		inside
 	};
-	auto item = layout ? layout->getItem() : nullptr;
 	if (_overLayout != layout) {
 		repaintItem(_overLayout);
 		_overLayout = layout;
@@ -1837,7 +1954,6 @@ void ListWidget::updateDragSelection() {
 	}
 	for (auto &layoutItem : _layouts) {
 		auto &&universalId = layoutItem.first;
-		auto &&layout = layoutItem.second;
 		if (universalId <= fromId && universalId > tillId) {
 			changeItemSelection(
 				_dragSelected,

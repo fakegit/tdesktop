@@ -18,13 +18,16 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "history/view/media/history_view_media_common.h"
 #include "ui/image/image.h"
 #include "ui/text/format_values.h"
+#include "ui/text/format_song_document_name.h"
 #include "ui/cached_round_corners.h"
 #include "ui/ui_utility.h"
 #include "layout.h" // FullSelection
 #include "data/data_session.h"
 #include "data/data_document.h"
 #include "data/data_document_media.h"
+#include "data/data_document_resolver.h"
 #include "data/data_media_types.h"
+#include "data/data_file_click_handler.h"
 #include "data/data_file_origin.h"
 #include "styles/style_chat.h"
 
@@ -149,7 +152,6 @@ Document::Document(
 	not_null<DocumentData*> document)
 : File(parent, realParent)
 , _data(document) {
-	const auto item = parent->data();
 	auto caption = createCaption();
 
 	createComponents(!caption.isEmpty());
@@ -215,18 +217,21 @@ void Document::createComponents(bool caption) {
 			_realParent->fullId());
 		thumbed->_linkcancell = std::make_shared<DocumentCancelClickHandler>(
 			_data,
+			crl::guard(this, [=](FullMsgId id) {
+				_parent->delegate()->elementCancelUpload(id);
+			}),
 			_realParent->fullId());
 	}
 	if (const auto voice = Get<HistoryDocumentVoice>()) {
 		voice->_seekl = std::make_shared<VoiceSeekClickHandler>(
 			_data,
-			_realParent->fullId());
+			[](FullMsgId) {});
 	}
 }
 
 void Document::fillNamedFromData(HistoryDocumentNamed *named) {
 	const auto nameString = named->_name = CleanTagSymbols(
-		_data->composeNameString());
+		Ui::Text::FormatSongNameFor(_data).string());
 	named->_namew = st::semiboldFont->width(nameString);
 }
 
@@ -697,7 +702,6 @@ TextState Document::textState(
 		StateRequest request,
 		LayoutMode mode) const {
 	const auto width = layout.width();
-	const auto height = layout.height();
 
 	auto result = TextState(_parent);
 
@@ -708,7 +712,7 @@ TextState Document::textState(
 	ensureDataMediaCreated();
 	bool loaded = dataLoaded();
 
-	bool showPause = updateStatusText();
+	updateStatusText();
 
 	const auto topMinus = isBubbleTop() ? 0 : st::msgFileTopMinus;
 	const auto thumbed = Get<HistoryDocumentThumbed>();
@@ -718,7 +722,6 @@ TextState Document::textState(
 	const auto nameleft = st.padding.left() + st.thumbSize + st.padding.right();
 	const auto nametop = st.nameTop - topMinus;
 	const auto nameright = st.padding.left();
-	const auto statustop = st.statusTop - topMinus;
 	const auto linktop = st.linkTop - topMinus;
 	const auto bottom = st.padding.top() + st.thumbSize + st.padding.bottom() - topMinus;
 	const auto rthumb = style::rtlrect(st.padding.left(), st.padding.top() - topMinus, st.thumbSize, st.thumbSize, width);
@@ -835,7 +838,6 @@ bool Document::hasTextForCopy() const {
 
 TextForMimeData Document::selectedText(TextSelection selection) const {
 	if (const auto captioned = Get<HistoryDocumentCaptioned>()) {
-		const auto &caption = captioned->_caption;
 		return captioned->_caption.toTextForMimeData(selection);
 	}
 	return TextForMimeData();

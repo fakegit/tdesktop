@@ -10,6 +10,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "data/data_document.h"
 #include "data/data_session.h"
 #include "data/data_streaming.h"
+#include "data/data_file_click_handler.h"
 #include "media/audio/media_audio.h"
 #include "media/audio/media_audio_capture.h"
 #include "media/streaming/media_streaming_instance.h"
@@ -268,7 +269,8 @@ bool Instance::validPlaylist(not_null<Data*> data) {
 		using Key = SliceKey;
 		const auto inSameDomain = [](const Key &a, const Key &b) {
 			return (a.peerId == b.peerId)
-				&& (a.migratedPeerId == b.migratedPeerId);
+				&& (a.migratedPeerId == b.migratedPeerId)
+				&& (a.scheduled == b.scheduled);
 		};
 		const auto countDistanceInData = [&](const Key &a, const Key &b) {
 			return [&](const SparseIdsMergedSlice &data) {
@@ -299,7 +301,11 @@ void Instance::validatePlaylist(not_null<Data*> data) {
 	data->playlistLifetime.destroy();
 	if (const auto key = playlistKey(data)) {
 		data->playlistRequestedKey = key;
-		SharedMediaMergedViewer(
+
+		const auto sharedMediaViewer = key->scheduled
+			? SharedScheduledMediaViewer
+			: SharedMediaMergedViewer;
+		sharedMediaViewer(
 			&data->history->session(),
 			SharedMediaMergedKey(*key, data->overview),
 			kIdsLimit,
@@ -320,7 +326,11 @@ auto Instance::playlistKey(not_null<Data*> data) const
 -> std::optional<SliceKey> {
 	const auto contextId = data->current.contextId();
 	const auto history = data->history;
-	if (!contextId || !history || !IsServerMsgId(contextId.msg)) {
+	if (!contextId || !history) {
+		return {};
+	}
+	const auto item = data->history->owner().message(contextId);
+	if (!item || (!IsServerMsgId(contextId.msg) && !item->isScheduled())) {
 		return {};
 	}
 
@@ -330,7 +340,8 @@ auto Instance::playlistKey(not_null<Data*> data) const
 	return SliceKey(
 		data->history->peer->id,
 		data->migrated ? data->migrated->peer->id : 0,
-		universalId);
+		universalId,
+		item->isScheduled());
 }
 
 HistoryItem *Instance::itemByIndex(not_null<Data*> data, int index) {
@@ -409,6 +420,16 @@ rpl::producer<> Media::Player::Instance::startsPlay(
 	) | rpl::filter([=](auto t) {
 		return t == type;
 	}) | rpl::to_empty;
+}
+
+auto Media::Player::Instance::seekingChanges(AudioMsgId::Type type) const
+-> rpl::producer<Media::Player::Instance::Seeking> {
+	return _seekingChanges.events(
+	) | rpl::filter([=](SeekingChanges data) {
+		return data.type == type;
+	}) | rpl::map([](SeekingChanges data) {
+		return data.seeking;
+	});
 }
 
 not_null<Instance*> instance() {
@@ -607,7 +628,6 @@ void Instance::playPauseCancelClicked(AudioMsgId::Type type) {
 		return;
 	}
 	const auto state = getState(type);
-	const auto stopped = IsStoppedOrStopping(state.state);
 	const auto showPause = ShowPauseIcon(state.state);
 	const auto audio = state.id.audio();
 	if (audio && audio->loading() && !data->streamed) {
@@ -625,6 +645,7 @@ void Instance::startSeeking(AudioMsgId::Type type) {
 	}
 	pause(type);
 	emitUpdate(type);
+	_seekingChanges.fire({ .seeking = Seeking::Start, .type = type });
 }
 
 void Instance::finishSeeking(AudioMsgId::Type type, float64 progress) {
@@ -643,6 +664,7 @@ void Instance::finishSeeking(AudioMsgId::Type type, float64 progress) {
 		}
 	}
 	cancelSeeking(type);
+	_seekingChanges.fire({ .seeking = Seeking::Finish, .type = type });
 }
 
 void Instance::cancelSeeking(AudioMsgId::Type type) {
@@ -650,6 +672,7 @@ void Instance::cancelSeeking(AudioMsgId::Type type) {
 		data->seeking = AudioMsgId();
 	}
 	emitUpdate(type);
+	_seekingChanges.fire({ .seeking = Seeking::Cancel, .type = type });
 }
 
 void Instance::updateVoicePlaybackSpeed() {

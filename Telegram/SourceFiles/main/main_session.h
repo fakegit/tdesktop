@@ -59,9 +59,7 @@ class Account;
 class Domain;
 class SessionSettings;
 
-class Session final
-	: public base::has_weak_ptr
-	, private base::Subscriber {
+class Session final : public base::has_weak_ptr {
 public:
 	Session(
 		not_null<Account*> account,
@@ -145,6 +143,9 @@ public:
 	[[nodiscard]] QString createInternalLink(const QString &query) const;
 	[[nodiscard]] QString createInternalLinkFull(const QString &query) const;
 
+	void setTmpPassword(const QByteArray &password, TimeId validUntil);
+	[[nodiscard]] QByteArray validTmpPassword() const;
+
 	// Can be called only right before ~Session.
 	void finishLogout();
 
@@ -189,6 +190,9 @@ private:
 
 	base::flat_set<not_null<Window::SessionController*>> _windows;
 	base::Timer _saveSettingsTimer;
+
+	QByteArray _tmpPassword;
+	TimeId _tmpPasswordValidUntil = 0;
 
 	rpl::lifetime _lifetime;
 

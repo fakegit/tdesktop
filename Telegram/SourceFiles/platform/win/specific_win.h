@@ -16,9 +16,6 @@ class LocationPoint;
 
 namespace Platform {
 
-inline void SetWatchingMediaKeys(bool watching) {
-}
-
 inline void IgnoreApplicationActivationRightNow() {
 }
 
@@ -46,8 +43,6 @@ inline void finish() {
 
 inline void psCheckLocalSocket(const QString &) {
 }
-
-void psWriteDump();
 
 void psActivateProcess(uint64 pid = 0);
 QString psAppDataPath();

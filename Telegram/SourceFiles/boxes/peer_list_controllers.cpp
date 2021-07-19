@@ -344,7 +344,7 @@ std::unique_ptr<PeerListRow> ChatsListBoxController::createSearchRow(not_null<Pe
 }
 
 bool ChatsListBoxController::appendRow(not_null<History*> history) {
-	if (auto row = delegate()->peerListFindRow(history->peer->id)) {
+	if (auto row = delegate()->peerListFindRow(history->peer->id.value)) {
 		updateRowHook(static_cast<Row*>(row));
 		return false;
 	}
@@ -426,7 +426,7 @@ void ContactsBoxController::rowClicked(not_null<PeerListRow*> row) {
 }
 
 bool ContactsBoxController::appendRow(not_null<UserData*> user) {
-	if (auto row = delegate()->peerListFindRow(user->id)) {
+	if (auto row = delegate()->peerListFindRow(user->id.value)) {
 		updateRowHook(row);
 		return false;
 	}
@@ -516,7 +516,7 @@ bool AddBotToGroupBoxController::needToCreateRow(
 		not_null<PeerData*> peer) const {
 	if (sharingBotGame()) {
 		if (!peer->canWrite()
-			|| peer->amRestricted(ChatRestriction::f_send_games)) {
+			|| peer->amRestricted(ChatRestriction::SendGames)) {
 			return false;
 		}
 		return true;

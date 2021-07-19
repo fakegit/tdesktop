@@ -53,6 +53,7 @@ enum class ChangeType {
 	MaxCount,
 	Corner,
 	DemoIsShown,
+	DemoIsHidden,
 };
 
 } // namespace Notifications
@@ -71,7 +72,7 @@ namespace Notifications {
 
 class Manager;
 
-class System final : private base::Subscriber {
+class System final {
 public:
 	System();
 	~System();
@@ -92,8 +93,11 @@ public:
 	void clearAllFast();
 	void updateAll();
 
-	base::Observable<ChangeType> &settingsChanged() {
-		return _settingsChanged;
+	[[nodiscard]] rpl::producer<ChangeType> settingsChanged() const;
+	void notifySettingsChanged(ChangeType type);
+
+	[[nodiscard]] rpl::lifetime &lifetime() {
+		return _lifetime;
 	}
 
 private:
@@ -132,13 +136,15 @@ private:
 
 	std::unique_ptr<Manager> _manager;
 
-	base::Observable<ChangeType> _settingsChanged;
+	rpl::event_stream<ChangeType> _settingsChanged;
 
 	std::unique_ptr<Media::Audio::Track> _soundTrack;
 
 	int _lastForwardedCount = 0;
 	uint64 _lastHistorySessionId = 0;
 	FullMsgId _lastHistoryItemId;
+
+	rpl::lifetime _lifetime;
 
 };
 
@@ -193,14 +199,24 @@ public:
 		bool hideMessageText = false;
 		bool hideReplyButton = false;
 	};
-	[[nodiscard]] static DisplayOptions GetNotificationOptions(
-		HistoryItem *item);
+	[[nodiscard]] DisplayOptions getNotificationOptions(
+		HistoryItem *item) const;
 
 	[[nodiscard]] QString addTargetAccountName(
 		const QString &title,
 		not_null<Main::Session*> session);
 
 	[[nodiscard]] virtual ManagerType type() const = 0;
+
+	[[nodiscard]] bool skipAudio() const {
+		return doSkipAudio();
+	}
+	[[nodiscard]] bool skipToast() const {
+		return doSkipToast();
+	}
+	[[nodiscard]] bool skipFlashBounce() const {
+		return doSkipFlashBounce();
+	}
 
 	virtual ~Manager() = default;
 
@@ -218,6 +234,12 @@ protected:
 	virtual void doClearFromItem(not_null<HistoryItem*> item) = 0;
 	virtual void doClearFromHistory(not_null<History*> history) = 0;
 	virtual void doClearFromSession(not_null<Main::Session*> session) = 0;
+	virtual bool doSkipAudio() const = 0;
+	virtual bool doSkipToast() const = 0;
+	virtual bool doSkipFlashBounce() const = 0;
+	[[nodiscard]] virtual bool forceHideDetails() const {
+		return false;
+	}
 	virtual void onBeforeNotificationActivated(NotificationId id) {
 	}
 	virtual void onAfterNotificationActivated(
@@ -256,6 +278,8 @@ protected:
 		not_null<HistoryItem*> item,
 		int forwardedCount) override;
 
+	bool forceHideDetails() const override;
+
 	virtual void doShowNativeNotification(
 		not_null<PeerData*> peer,
 		std::shared_ptr<Data::CloudImageView> &userpicView,
@@ -292,6 +316,15 @@ protected:
 	void doClearFromHistory(not_null<History*> history) override {
 	}
 	void doClearFromSession(not_null<Main::Session*> session) override {
+	}
+	bool doSkipAudio() const override {
+		return false;
+	}
+	bool doSkipToast() const override {
+		return false;
+	}
+	bool doSkipFlashBounce() const override {
+		return false;
 	}
 
 };

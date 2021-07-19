@@ -158,10 +158,7 @@ private:
 	// remove msgs with such ids from sessionData->haveSent, add to sessionData->wereAcked
 	void requestsAcked(const QVector<MTPlong> &ids, bool byResponse = false);
 
-	void resend(
-		mtpMsgId msgId,
-		crl::time msCanWait = 0,
-		bool forceContainer = false);
+	void resend(mtpMsgId msgId, crl::time msCanWait = 0);
 	void resendAll();
 	void clearSpecialMsgId(mtpMsgId msgId);
 
@@ -218,6 +215,7 @@ private:
 	mtpMsgId _pingMsgId = 0;
 	base::Timer _pingSender;
 	base::Timer _checkSentRequestsTimer;
+	base::Timer _clearOldContainersTimer;
 
 	std::shared_ptr<SessionData> _sessionData;
 	std::unique_ptr<SessionOptions> _options;

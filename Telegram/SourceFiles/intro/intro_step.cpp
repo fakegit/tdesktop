@@ -26,13 +26,12 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "ui/widgets/labels.h"
 #include "ui/wrap/fade_wrap.h"
 #include "ui/effects/slide_animation.h"
+#include "ui/ui_utility.h"
 #include "data/data_user.h"
 #include "data/data_auto_download.h"
 #include "data/data_session.h"
 #include "data/data_chat_filters.h"
 #include "window/window_controller.h"
-#include "window/themes/window_theme.h"
-#include "app.h"
 #include "styles/style_intro.h"
 #include "styles/style_window.h"
 
@@ -75,15 +74,13 @@ Step::Step(
 			? st::introCoverDescription
 			: st::introDescription)) {
 	hide();
-	subscribe(Window::Theme::Background(), [this](
-			const Window::Theme::BackgroundUpdate &update) {
-		if (update.paletteChanged()) {
-			if (!_coverMask.isNull()) {
-				_coverMask = QPixmap();
-				prepareCoverMask();
-			}
+	style::PaletteChanged(
+	) | rpl::start_with_next([=] {
+		if (!_coverMask.isNull()) {
+			_coverMask = QPixmap();
+			prepareCoverMask();
 		}
-	});
+	}, lifetime());
 
 	_errorText.value(
 	) | rpl::start_with_next([=](const QString &text) {
@@ -153,10 +150,11 @@ void Step::finish(const MTPUser &user, QImage &&photo) {
 		const auto raw = existing.get();
 		if (const auto session = raw->maybeSession()) {
 			if (raw->mtp().environment() == _account->mtp().environment()
-				&& user.c_user().vid().v == session->userId()) {
+				&& UserId(user.c_user().vid()) == session->userId()) {
 				_account->logOut();
 				crl::on_main(raw, [=] {
 					Core::App().domain().activate(raw);
+					Local::sync();
 				});
 				return;
 			}
@@ -203,6 +201,7 @@ void Step::createSession(
 	if (session.supportMode()) {
 		PrepareSupportMode(&session);
 	}
+	Local::sync();
 }
 
 void Step::paintEvent(QPaintEvent *e) {
@@ -363,7 +362,7 @@ void Step::prepareCoverMask() {
 		}
 		maskInts += maskIntsPerLineAdded;
 	}
-	_coverMask = App::pixmapFromImageInPlace(std::move(mask));
+	_coverMask = Ui::PixmapFromImage(std::move(mask));
 }
 
 void Step::paintCover(Painter &p, int top) {

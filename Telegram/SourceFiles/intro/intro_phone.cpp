@@ -46,23 +46,38 @@ PhoneWidget::PhoneWidget(
 , _code(this, st::introCountryCode)
 , _phone(this, st::introPhone)
 , _checkRequestTimer([=] { checkRequest(); }) {
-	connect(_phone, SIGNAL(voidBackspace(QKeyEvent*)), _code, SLOT(startErasing(QKeyEvent*)));
-	connect(_country, SIGNAL(codeChanged(const QString &)), _code, SLOT(codeSelected(const QString &)));
-	connect(_code, SIGNAL(codeChanged(const QString &)), _country, SLOT(onChooseCode(const QString &)));
-	connect(_code, SIGNAL(codeChanged(const QString &)), _phone, SLOT(onChooseCode(const QString &)));
-	connect(_country, SIGNAL(codeChanged(const QString &)), _phone, SLOT(onChooseCode(const QString &)));
-	connect(_code, SIGNAL(addedToNumber(const QString &)), _phone, SLOT(addedToNumber(const QString &)));
+	_phone->frontBackspaceEvent(
+	) | rpl::start_with_next([=](not_null<QKeyEvent*> e) {
+		_code->startErasing(e);
+	}, _code->lifetime());
+
+	connect(_country, &CountryInput::codeChanged, [=](const QString &code) {
+		_code->codeSelected(code);
+		_phone->chooseCode(code);
+	});
+	_code->codeChanged(
+	) | rpl::start_with_next([=](const QString &code) {
+		_country->onChooseCode(code);
+		_phone->chooseCode(code);
+	}, _code->lifetime());
+	_code->addedToNumber(
+	) | rpl::start_with_next([=](const QString &added) {
+		_phone->addedToNumber(added);
+	}, _phone->lifetime());
 	connect(_phone, &Ui::PhonePartInput::changed, [=] { phoneChanged(); });
 	connect(_code, &Ui::CountryCodeInput::changed, [=] { phoneChanged(); });
 
 	setTitleText(tr::lng_phone_title());
 	setDescriptionText(tr::lng_phone_desc());
-	subscribe(getData()->updated, [=] { countryChanged(); });
+	getData()->updated.events(
+	) | rpl::start_with_next([=] {
+		countryChanged();
+	}, lifetime());
 	setErrorCentered(true);
 	setupQrLogin();
 
-	if (!_country->onChooseCountry(getData()->country)) {
-		_country->onChooseCountry(qsl("US"));
+	if (!_country->chooseCountry(getData()->country)) {
+		_country->chooseCountry(qsl("US"));
 	}
 	_changed = false;
 }
@@ -251,7 +266,7 @@ QString PhoneWidget::fullNumber() const {
 }
 
 void PhoneWidget::selectCountry(const QString &country) {
-	_country->onChooseCountry(country);
+	_country->chooseCountry(country);
 }
 
 void PhoneWidget::setInnerFocus() {

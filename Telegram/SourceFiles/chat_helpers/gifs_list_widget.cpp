@@ -188,12 +188,13 @@ GifsListWidget::GifsListWidget(
 		update();
 	}, lifetime());
 
-	subscribe(controller->gifPauseLevelChanged(), [=] {
+	controller->gifPauseLevelChanged(
+	) | rpl::start_with_next([=] {
 		if (!controller->isGifPausedAtLeastFor(
 				Window::GifPauseReason::SavedGifs)) {
 			update();
 		}
-	});
+	}, lifetime());
 }
 
 rpl::producer<TabbedSelector::FileChosen> GifsListWidget::fileChosen() const {
@@ -918,7 +919,7 @@ bool GifsListWidget::refreshInlineRows(int32 *added) {
 
 int32 GifsListWidget::showInlineRows(bool newResults) {
 	auto added = 0;
-	auto clear = !refreshInlineRows(&added);
+	refreshInlineRows(&added);
 	if (newResults) {
 		scrollTo(0);
 	}
@@ -1032,7 +1033,6 @@ void GifsListWidget::updateSelected() {
 	int row = -1, col = -1, sel = -1;
 	ClickHandlerPtr lnk;
 	ClickHandlerHost *lnkhost = nullptr;
-	HistoryView::CursorState cursor = HistoryView::CursorState::None;
 	if (sy >= 0) {
 		row = 0;
 		for (int rows = _rows.size(); row < rows; ++row) {
@@ -1061,7 +1061,6 @@ void GifsListWidget::updateSelected() {
 				QPoint(sx, sy),
 				HistoryView::StateRequest());
 			lnk = result.link;
-			cursor = result.cursor;
 			lnkhost = inlineItems[col];
 		} else {
 			row = col = -1;

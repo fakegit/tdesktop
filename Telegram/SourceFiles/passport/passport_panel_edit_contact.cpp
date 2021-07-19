@@ -8,7 +8,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "passport/passport_panel_edit_contact.h"
 
 #include "passport/passport_panel_controller.h"
-#include "passport/passport_panel_details_row.h"
+#include "passport/ui/passport_details_row.h"
 #include "ui/widgets/input_fields.h"
 #include "ui/widgets/labels.h"
 #include "ui/widgets/buttons.h"
@@ -102,7 +102,7 @@ void VerifyBox::setupControls(
 		0,
 		st::boxPadding.right(),
 		st::boxPadding.bottom());
-	const auto description = _content->add(
+	_content->add(
 		object_ptr<Ui::FlatLabel>(
 			_content,
 			text,
@@ -123,7 +123,7 @@ void VerifyBox::setupControls(
 				QString(),
 				st::passportVerifyErrorLabel)),
 		small);
-	const auto waiter = _content->add(
+	_content->add(
 		object_ptr<Ui::FlatLabel>(
 			_content,
 			std::move(call),
@@ -278,7 +278,8 @@ void PanelEditContact::setupControls(
 			wrap.data(),
 			fieldStyle,
 			std::move(fieldPlaceholder),
-			ExtractPhonePrefix(_controller->bot()->session().user()->phone()),
+			Ui::ExtractPhonePrefix(
+				_controller->bot()->session().user()->phone()),
 			data);
 	} else {
 		_field = Ui::CreateChild<Ui::MaskedInputField>(

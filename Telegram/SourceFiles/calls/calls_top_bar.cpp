@@ -22,7 +22,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "calls/calls_call.h"
 #include "calls/calls_instance.h"
 #include "calls/calls_signal_bars.h"
-#include "calls/calls_group_menu.h" // Group::LeaveBox.
+#include "calls/group/calls_group_call.h"
+#include "calls/group/calls_group_menu.h" // Group::LeaveBox.
 #include "history/view/history_view_group_call_tracker.h" // ContentByCall.
 #include "data/data_user.h"
 #include "data/data_group_call.h"
@@ -47,7 +48,6 @@ enum class BarState {
 
 namespace {
 
-constexpr auto kMaxUsersInBar = 3;
 constexpr auto kUpdateDebugTimeoutMs = crl::time(500);
 constexpr auto kSwitchStateDuration = 120;
 
@@ -57,8 +57,13 @@ constexpr auto kHideBlobsDuration = crl::time(500);
 constexpr auto kBlobLevelDuration = crl::time(250);
 constexpr auto kBlobUpdateInterval = crl::time(100);
 
-auto BarStateFromMuteState(MuteState state, GroupCall::InstanceState instanceState) {
-	return (instanceState == GroupCall::InstanceState::Disconnected)
+auto BarStateFromMuteState(
+		MuteState state,
+		GroupCall::InstanceState instanceState,
+		TimeId scheduledDate) {
+	return scheduledDate
+		? BarState::ForceMuted
+		: (instanceState == GroupCall::InstanceState::Disconnected)
 		? BarState::Connecting
 		: (state == MuteState::ForceMuted || state == MuteState::RaisedHand)
 		? BarState::ForceMuted
@@ -274,8 +279,7 @@ void TopBar::initControls() {
 		if (const auto call = _call.get()) {
 			call->setMuted(!call->muted());
 		} else if (const auto group = _groupCall.get()) {
-			if (group->muted() == MuteState::ForceMuted
-				|| group->muted() == MuteState::RaisedHand) {
+			if (group->mutedByAdmin()) {
 				Ui::Toast::Show(tr::lng_group_call_force_muted_sub(tr::now));
 			} else {
 				group->setMuted((group->muted() == MuteState::Muted)
@@ -293,19 +297,27 @@ void TopBar::initControls() {
 			_call
 				? mapToState(_call->muted())
 				: _groupCall->muted(),
-			GroupCall::InstanceState::Connected));
+			GroupCall::InstanceState::Connected,
+			_call ? TimeId(0) : _groupCall->scheduleDate()));
 	using namespace rpl::mappers;
 	auto muted = _call
 		? rpl::combine(
 			_call->mutedValue() | rpl::map(mapToState),
-			rpl::single(GroupCall::InstanceState::Connected)
+			rpl::single(GroupCall::InstanceState::Connected),
+			rpl::single(TimeId(0))
 		) | rpl::type_erased()
 		: rpl::combine(
 			(_groupCall->mutedValue()
 				| MapPushToTalkToActive()
 				| rpl::distinct_until_changed()
 				| rpl::type_erased()),
-			_groupCall->instanceStateValue()
+			_groupCall->instanceStateValue(),
+			rpl::single(
+				_groupCall->scheduleDate()
+			) | rpl::then(_groupCall->real(
+			) | rpl::map([](not_null<Data::GroupCall*> call) {
+				return call->scheduleDateValue();
+			}) | rpl::flatten_latest())
 		) | rpl::filter(_2 != GroupCall::InstanceState::TransitionToRtc);
 	std::move(
 		muted

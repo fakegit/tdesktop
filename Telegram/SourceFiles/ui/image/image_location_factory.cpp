@@ -13,6 +13,19 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include <QtCore/QBuffer>
 
 namespace Images {
+namespace {
+
+QSize GetSizeForDocument(const QVector<MTPDocumentAttribute> &attributes) {
+	for (const auto &attribute : attributes) {
+		if (attribute.type() == mtpc_documentAttributeImageSize) {
+			auto &size = attribute.c_documentAttributeImageSize();
+			return QSize(size.vw().v, size.vh().v);
+		}
+	}
+	return QSize();
+}
+
+} // namespace
 
 ImageWithLocation FromPhotoSize(
 		not_null<Main::Session*> session,
@@ -196,11 +209,10 @@ ImageWithLocation FromPhotoSize(
 		not_null<Main::Session*> session,
 		const MTPDstickerSet &set,
 		const MTPPhotoSize &size) {
-	if (!set.vthumb_dc_id()) {
+	if (!set.vthumb_dc_id() || !set.vthumb_version()) {
 		return ImageWithLocation();
 	}
 	return size.match([&](const MTPDphotoSize &data) {
-		const auto &location = data.vlocation().c_fileLocationToBeDeprecated();
 		return ImageWithLocation{
 			.location = ImageLocation(
 				DownloadLocation{ StorageFileLocation(
@@ -208,14 +220,12 @@ ImageWithLocation FromPhotoSize(
 					session->userId(),
 					MTP_inputStickerSetThumb(
 						MTP_inputStickerSetID(set.vid(), set.vaccess_hash()),
-						location.vvolume_id(),
-						location.vlocal_id())) },
+						MTP_int(set.vthumb_version()->v))) },
 				data.vw().v,
 				data.vh().v),
 			.bytesCount = data.vsize().v
 		};
 	}, [&](const MTPDphotoCachedSize &data) {
-		const auto &location = data.vlocation().c_fileLocationToBeDeprecated();
 		const auto bytes = qba(data.vbytes());
 		return ImageWithLocation{
 			.location = ImageLocation(
@@ -224,8 +234,7 @@ ImageWithLocation FromPhotoSize(
 					session->userId(),
 					MTP_inputStickerSetThumb(
 						MTP_inputStickerSetID(set.vid(), set.vaccess_hash()),
-						location.vvolume_id(),
-						location.vlocal_id())) },
+						MTP_int(set.vthumb_version()->v))) },
 				data.vw().v,
 				data.vh().v),
 			.bytes = bytes,
@@ -235,7 +244,6 @@ ImageWithLocation FromPhotoSize(
 		if (data.vsizes().v.isEmpty()) {
 			return ImageWithLocation();
 		}
-		const auto &location = data.vlocation().c_fileLocationToBeDeprecated();
 		return ImageWithLocation{
 			.location = ImageLocation(
 				DownloadLocation{ StorageFileLocation(
@@ -243,8 +251,7 @@ ImageWithLocation FromPhotoSize(
 					session->userId(),
 					MTP_inputStickerSetThumb(
 						MTP_inputStickerSetID(set.vid(), set.vaccess_hash()),
-						location.vvolume_id(),
-						location.vlocal_id())) },
+						MTP_int(set.vthumb_version()->v))) },
 				data.vw().v,
 				data.vh().v),
 			.bytesCount = data.vsizes().v.back().v

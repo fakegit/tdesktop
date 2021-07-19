@@ -29,6 +29,7 @@ class RoundButton;
 class FlatLabel;
 class RippleAnimation;
 class PopupMenu;
+class PathShiftGradient;
 } // namespace Ui
 
 namespace Window {
@@ -61,8 +62,7 @@ struct CacheEntry {
 class Inner
 	: public Ui::RpWidget
 	, public Ui::AbstractTooltipShower
-	, public Context
-	, private base::Subscriber {
+	, public Context {
 
 public:
 	Inner(QWidget *parent, not_null<Window::SessionController*> controller);
@@ -148,10 +148,14 @@ private:
 	void deleteUnusedInlineLayouts();
 
 	int validateExistingInlineRows(const Results &results);
-	void selectInlineResult(int row, int column);
-	void selectInlineResult(int row, int column, Api::SendOptions options);
+	void selectInlineResult(
+		int row,
+		int column,
+		Api::SendOptions options,
+		bool open);
 
 	not_null<Window::SessionController*> _controller;
+	const std::unique_ptr<Ui::PathShiftGradient> _pathGradient;
 
 	int _visibleTop = 0;
 	int _visibleBottom = 0;

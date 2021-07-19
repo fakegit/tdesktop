@@ -52,7 +52,8 @@ constexpr auto kSystemAlertDuration = crl::time(0);
 System::System()
 : _waitTimer([=] { showNext(); })
 , _waitForAllGroupedTimer([=] { showGrouped(); }) {
-	subscribe(settingsChanged(), [=](ChangeType type) {
+	settingsChanged(
+	) | rpl::start_with_next([=](ChangeType type) {
 		if (type == ChangeType::DesktopEnabled) {
 			clearAll();
 		} else if (type == ChangeType::ViewParams) {
@@ -61,7 +62,7 @@ System::System()
 			|| type == ChangeType::CountMessages) {
 			Core::App().domain().notifyUnreadBadgeChanged();
 		}
-	});
+	}, lifetime());
 }
 
 void System::createManager() {
@@ -138,6 +139,8 @@ System::SkipState System::skipNotification(
 }
 
 void System::schedule(not_null<HistoryItem*> item) {
+	Expects(_manager != nullptr);
+
 	const auto history = item->history();
 	const auto skip = skipNotification(item);
 	if (skip.value == SkipState::Skip) {
@@ -167,7 +170,7 @@ void System::schedule(not_null<HistoryItem*> item) {
 		_whenAlerts[history].emplace(when, notifyBy);
 	}
 	if (Core::App().settings().desktopNotify()
-		&& !Platform::Notifications::SkipToast()) {
+		&& !_manager->skipToast()) {
 		auto &whenMap = _whenMaps[history];
 		if (whenMap.find(item->id) == whenMap.end()) {
 			whenMap.emplace(item->id, when);
@@ -360,7 +363,6 @@ void System::showNext() {
 
 	auto ms = crl::now(), nextAlert = crl::time(0);
 	bool alert = false;
-	int32 now = base::unixtime::now();
 	for (auto i = _whenAlerts.begin(); i != _whenAlerts.end();) {
 		while (!i->second.empty() && i->second.begin()->first <= ms) {
 			const auto peer = i->first->peer;
@@ -391,7 +393,7 @@ void System::showNext() {
 	}
 	const auto &settings = Core::App().settings();
 	if (alert) {
-		if (settings.flashBounceNotify() && !Platform::Notifications::SkipFlashBounce()) {
+		if (settings.flashBounceNotify() && !_manager->skipFlashBounce()) {
 			if (const auto window = Core::App().activeWindow()) {
 				if (const auto handle = window->widget()->windowHandle()) {
 					handle->alert(kSystemAlertDuration);
@@ -399,7 +401,7 @@ void System::showNext() {
 				}
 			}
 		}
-		if (settings.soundNotify() && !Platform::Notifications::SkipAudio()) {
+		if (settings.soundNotify() && !_manager->skipAudio()) {
 			ensureSoundCreated();
 			_soundTrack->playOnce();
 			Media::Player::mixer()->suppressAll(_soundTrack->getLengthMs());
@@ -407,7 +409,7 @@ void System::showNext() {
 		}
 	}
 
-	if (_waiters.empty() || !settings.desktopNotify() || Platform::Notifications::SkipToast()) {
+	if (_waiters.empty() || !settings.desktopNotify() || _manager->skipToast()) {
 		if (nextAlert) {
 			_waitTimer.callOnce(nextAlert - ms);
 		}
@@ -576,14 +578,25 @@ void System::updateAll() {
 	}
 }
 
-Manager::DisplayOptions Manager::GetNotificationOptions(HistoryItem *item) {
+rpl::producer<ChangeType> System::settingsChanged() const {
+	return _settingsChanged.events();
+}
+
+void System::notifySettingsChanged(ChangeType type) {
+	return _settingsChanged.fire(std::move(type));
+}
+
+Manager::DisplayOptions Manager::getNotificationOptions(
+		HistoryItem *item) const {
 	const auto hideEverything = Core::App().passcodeLocked()
-		|| Global::ScreenIsLocked();
+		|| forceHideDetails();
 
 	const auto view = Core::App().settings().notifyView();
 	DisplayOptions result;
-	result.hideNameAndPhoto = hideEverything || (view > dbinvShowName);
-	result.hideMessageText = hideEverything || (view > dbinvShowPreview);
+	result.hideNameAndPhoto = hideEverything
+		|| (view > Core::Settings::NotifyView::ShowName);
+	result.hideMessageText = hideEverything
+		|| (view > Core::Settings::NotifyView::ShowPreview);
 	result.hideReplyButton = result.hideMessageText
 		|| !item
 		|| ((item->out() || item->history()->peer->isSelf())
@@ -696,7 +709,7 @@ void Manager::notificationReplied(
 void NativeManager::doShowNotification(
 		not_null<HistoryItem*> item,
 		int forwardedCount) {
-	const auto options = GetNotificationOptions(item);
+	const auto options = getNotificationOptions(item);
 
 	const auto peer = item->history()->peer;
 	const auto scheduled = !options.hideNameAndPhoto
@@ -730,6 +743,10 @@ void NativeManager::doShowNotification(
 		text,
 		options.hideNameAndPhoto,
 		options.hideReplyButton);
+}
+
+bool NativeManager::forceHideDetails() const {
+	return Core::App().screenIsLocked();
 }
 
 System::~System() = default;

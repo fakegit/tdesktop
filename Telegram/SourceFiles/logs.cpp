@@ -14,6 +14,17 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 namespace {
 
 std::atomic<int> ThreadCounter/* = 0*/;
+thread_local bool WritingEntryFlag/* = false*/;
+
+class WritingEntryScope final {
+public:
+	WritingEntryScope() {
+		WritingEntryFlag = true;
+	}
+	~WritingEntryScope() {
+		WritingEntryFlag = false;
+	}
+};
 
 } // namespace
 
@@ -73,6 +84,8 @@ public:
 
 	void closeMain() {
 		QMutexLocker lock(_logsMutex(LogDataMain));
+		WritingEntryScope scope;
+
 		const auto file = files[LogDataMain].get();
 		if (file && file->isOpen()) {
 			file->close();
@@ -85,7 +98,7 @@ public:
 
 	QString full() {
 		const auto file = files[LogDataMain].get();
-		if (!!file || !file->isOpen()) {
+		if (!file || !file->isOpen()) {
 			return QString();
 		}
 
@@ -98,6 +111,8 @@ public:
 
 	void write(LogDataType type, const QString &msg) {
 		QMutexLocker lock(_logsMutex(type));
+		WritingEntryScope scope;
+
 		if (type != LogDataMain) {
 			reopenDebug();
 		}
@@ -132,11 +147,11 @@ private:
 
 				auto to = std::make_unique<QFile>(_logsFilePath(type, postfix));
 				if (to->exists() && !to->remove()) {
-					LOG(("Could not delete '%1' file to start new logging!").arg(to->fileName()));
+					LOG(("Could not delete '%1' file to start new logging: %2").arg(to->fileName(), to->errorString()));
 					return false;
 				}
 				if (!QFile(files[type]->fileName()).copy(to->fileName())) { // don't close files[type] yet
-					LOG(("Could not copy '%1' to '%2' to start new logging!").arg(files[type]->fileName(), to->fileName()));
+					LOG(("Could not copy '%1' to '%2' to start new logging: %3").arg(files[type]->fileName(), to->fileName(), to->errorString()));
 					return false;
 				}
 				if (to->open(mode | QIODevice::Append)) {
@@ -158,7 +173,7 @@ private:
 
 					return true;
 				}
-				LOG(("Could not open '%1' file to start new logging!").arg(to->fileName()));
+				LOG(("Could not open '%1' file to start new logging: %2").arg(to->fileName(), to->errorString()));
 				return false;
 			} else {
 				bool found = false;
@@ -209,7 +224,7 @@ NEW LOGGING INSTANCE STARTED!!!\n\
 
 			return true;
 		} else if (type != LogDataMain) {
-			LOG(("Could not open debug log '%1'!").arg(files[type]->fileName()));
+			LOG(("Could not open debug log '%1': %2").arg(files[type]->fileName(), files[type]->errorString()));
 		}
 		return false;
 	}
@@ -323,9 +338,8 @@ bool DebugEnabled() {
 #endif
 }
 
-QString ProfilePrefix() {
-	const auto now = crl::profile();
-	return '[' + QString::number(now / 1000., 'f', 3) + "] ";
+bool WritingEntry() {
+	return WritingEntryFlag;
 }
 
 void start(not_null<Core::Launcher*> launcher) {
@@ -527,29 +541,21 @@ void writeMain(const QString &v) {
 	struct tm tm;
 	mylocaltime(&tm, &t);
 
-	QString msg(QString("[%1.%2.%3 %4:%5:%6] %7\n").arg(tm.tm_year + 1900).arg(tm.tm_mon + 1, 2, 10, QChar('0')).arg(tm.tm_mday, 2, 10, QChar('0')).arg(tm.tm_hour, 2, 10, QChar('0')).arg(tm.tm_min, 2, 10, QChar('0')).arg(tm.tm_sec, 2, 10, QChar('0')).arg(v));
+	const auto msg = QString("[%1.%2.%3 %4:%5:%6] %7\n"
+	).arg(tm.tm_year + 1900
+	).arg(tm.tm_mon + 1, 2, 10, QChar('0')
+	).arg(tm.tm_mday, 2, 10, QChar('0')
+	).arg(tm.tm_hour, 2, 10, QChar('0')
+	).arg(tm.tm_min, 2, 10, QChar('0')
+	).arg(tm.tm_sec, 2, 10, QChar('0')
+	).arg(v);
 	_logsWrite(LogDataMain, msg);
 
-	QString debugmsg(QString("%1 %2\n").arg(_logsEntryStart(), v));
-	_logsWrite(LogDataDebug, debugmsg);
+	writeDebug(v);
 }
 
-void writeDebug(const char *file, int32 line, const QString &v) {
-	const char *last = strstr(file, "/"), *found = 0;
-	while (last) {
-		found = last;
-		last = strstr(last + 1, "/");
-	}
-	last = strstr(file, "\\");
-	while (last) {
-		found = last;
-		last = strstr(last + 1, "\\");
-	}
-	if (found) {
-		file = found + 1;
-	}
-
-	QString msg(QString("%1 %2 (%3 : %4)\n").arg(_logsEntryStart(), v, file, QString::number(line)));
+void writeDebug(const QString &v) {
+	const auto msg = QString("%1 %2\n").arg(_logsEntryStart(), v);
 	_logsWrite(LogDataDebug, msg);
 
 #ifdef Q_OS_WIN
@@ -562,12 +568,15 @@ void writeDebug(const char *file, int32 line, const QString &v) {
 }
 
 void writeTcp(const QString &v) {
-	QString msg(QString("%1 %2\n").arg(_logsEntryStart(), v));
+	const auto msg = QString("%1 %2\n").arg(_logsEntryStart(), v);
 	_logsWrite(LogDataTcp, msg);
 }
 
 void writeMtp(int32 dc, const QString &v) {
-	QString msg(QString("%1 (dc:%2) %3\n").arg(_logsEntryStart()).arg(dc).arg(v));
+	const auto msg = QString("%1 (dc:%2) %3\n").arg(
+		_logsEntryStart(),
+		QString::number(dc),
+		v);
 	_logsWrite(LogDataMtp, msg);
 }
 

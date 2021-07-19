@@ -115,12 +115,12 @@ private:
 	const Rows::Row &rowBySelection(Selection selected) const;
 	std::unique_ptr<Ui::RippleAnimation> &rippleBySelection(
 		Selection selected);
-	const std::unique_ptr<Ui::RippleAnimation> &rippleBySelection(
+	[[maybe_unused]] const std::unique_ptr<Ui::RippleAnimation> &rippleBySelection(
 		Selection selected) const;
 	std::unique_ptr<Ui::RippleAnimation> &rippleBySelection(
 		not_null<Row*> row,
 		Selection selected);
-	const std::unique_ptr<Ui::RippleAnimation> &rippleBySelection(
+	[[maybe_unused]] const std::unique_ptr<Ui::RippleAnimation> &rippleBySelection(
 		not_null<const Row*> row,
 		Selection selected) const;
 	void addRipple(Selection selected, QPoint position);
@@ -216,7 +216,6 @@ std::pair<Languages, Languages> PrepareLists() {
 					Lang::GetInstance().nativeName()
 				};
 			};
-			const auto i = ranges::find(official, current, projId);
 			recent.insert(begin(recent), generate());
 		}
 	}
@@ -1166,15 +1165,19 @@ base::binary_guard LanguageBox::Show() {
 	if (manager.languageList().empty()) {
 		auto guard = std::make_shared<base::binary_guard>(
 			result.make_guard());
-		auto alive = std::make_shared<std::unique_ptr<base::Subscription>>(
-			std::make_unique<base::Subscription>());
-		**alive = manager.languageListChanged().add_subscription([=] {
+		auto lifetime = std::make_shared<rpl::lifetime>();
+		manager.languageListChanged(
+		) | rpl::take(
+			1
+		) | rpl::start_with_next([=]() mutable {
 			const auto show = guard->alive();
-			*alive = nullptr;
+			if (lifetime) {
+				base::take(lifetime)->destroy();
+			}
 			if (show) {
 				Ui::show(Box<LanguageBox>());
 			}
-		});
+		}, *lifetime);
 	} else {
 		Ui::show(Box<LanguageBox>());
 	}

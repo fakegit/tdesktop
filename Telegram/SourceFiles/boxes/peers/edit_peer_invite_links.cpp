@@ -33,7 +33,6 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 namespace {
 
-constexpr auto kPreloadPages = 2;
 constexpr auto kFullArcLength = 360 * 16;
 
 enum class Color {
@@ -533,7 +532,7 @@ void LinksController::rowClicked(not_null<PeerListRow*> row) {
 }
 
 void LinksController::rowActionClicked(not_null<PeerListRow*> row) {
-	delegate()->peerListShowRowMenu(row, nullptr);
+	delegate()->peerListShowRowMenu(row, true);
 }
 
 base::unique_qptr<Ui::PopupMenu> LinksController::rowContextMenu(
@@ -766,7 +765,7 @@ void AdminsController::prepare() {
 			owner.processUsers(data.vusers());
 			for (const auto &admin : data.vadmins().v) {
 				admin.match([&](const MTPDchatAdminWithInvites &data) {
-					const auto adminId = data.vadmin_id().v;
+					const auto adminId = data.vadmin_id();
 					if (const auto user = owner.userLoaded(adminId)) {
 						if (!user->isSelf()) {
 							appendRow(user, data.vinvites_count().v);

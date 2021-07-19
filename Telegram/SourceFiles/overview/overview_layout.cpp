@@ -9,6 +9,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 #include "overview/overview_layout_delegate.h"
 #include "data/data_document.h"
+#include "data/data_document_resolver.h"
 #include "data/data_session.h"
 #include "data/data_web_page.h"
 #include "data/data_media_types.h"
@@ -16,6 +17,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "data/data_file_origin.h"
 #include "data/data_photo_media.h"
 #include "data/data_document_media.h"
+#include "data/data_file_click_handler.h"
 #include "styles/style_overview.h"
 #include "styles/style_chat.h"
 #include "core/file_utilities.h"
@@ -38,10 +40,11 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "base/qt_adapters.h"
 #include "ui/effects/round_checkbox.h"
 #include "ui/image/image.h"
+#include "ui/text/format_song_document_name.h"
 #include "ui/text/format_values.h"
 #include "ui/text/text_options.h"
 #include "ui/cached_round_corners.h"
-#include "app.h"
+#include "ui/ui_utility.h"
 
 namespace Overview {
 namespace Layout {
@@ -55,38 +58,6 @@ TextParseOptions _documentNameOptions = {
 	0, // maxh
 	Qt::LayoutDirectionAuto, // dir
 };
-
-TextWithEntities ComposeNameWithEntities(DocumentData *document) {
-	TextWithEntities result;
-	const auto song = document->song();
-	if (!song || (song->title.isEmpty() && song->performer.isEmpty())) {
-		result.text = document->filename().isEmpty()
-			? qsl("Unknown File")
-			: document->filename();
-		result.entities.push_back({
-			EntityType::Semibold,
-			0,
-			result.text.size()
-		});
-	} else if (song->performer.isEmpty()) {
-		result.text = song->title;
-		result.entities.push_back({
-			EntityType::Semibold,
-			0,
-			result.text.size()
-		});
-	} else {
-		result.text = song->performer
-			+ QString::fromUtf8(" \xe2\x80\x93 ")
-			+ (song->title.isEmpty() ? qsl("Unknown Track") : song->title);
-		result.entities.push_back({
-			EntityType::Semibold,
-			0,
-			song->performer.size()
-		});
-	}
-	return result;
-}
 
 } // namespace
 
@@ -215,9 +186,17 @@ void RadialProgressItem::setDocumentLinks(
 		not_null<DocumentData*> document) {
 	const auto context = parent()->fullId();
 	setLinks(
-		std::make_shared<DocumentOpenClickHandler>(document, context),
+		std::make_shared<DocumentOpenClickHandler>(
+			document,
+			crl::guard(this, [=](FullMsgId id) {
+				delegate()->openDocument(document, id);
+			}),
+			context),
 		std::make_shared<DocumentSaveClickHandler>(document, context),
-		std::make_shared<DocumentCancelClickHandler>(document, context));
+		std::make_shared<DocumentCancelClickHandler>(
+			document,
+			nullptr,
+			context));
 }
 
 void RadialProgressItem::clickHandlerActiveChanged(
@@ -302,7 +281,10 @@ Photo::Photo(
 	not_null<PhotoData*> photo)
 : ItemBase(delegate, parent)
 , _data(photo)
-, _link(std::make_shared<PhotoOpenClickHandler>(photo, parent->fullId())) {
+, _link(std::make_shared<PhotoOpenClickHandler>(
+	photo,
+	crl::guard(this, [=](FullMsgId id) { delegate->openPhoto(photo, id); }),
+	parent->fullId())) {
 	if (_data->inlineThumbnailBytes().isEmpty()
 		&& (_data->hasExact(Data::PhotoSize::Small)
 			|| _data->hasExact(Data::PhotoSize::Thumbnail))) {
@@ -386,7 +368,7 @@ void Photo::setPixFrom(not_null<Image*> image) {
 		delegate()->unregisterHeavyItem(this);
 	}
 
-	_pix = App::pixmapFromImageInPlace(std::move(img));
+	_pix = Ui::PixmapFromImage(std::move(img));
 }
 
 void Photo::ensureDataMediaCreated() const {
@@ -477,7 +459,7 @@ void Video::paint(Painter &p, const QRect &clip, TextSelection selection, const 
 		}
 		img.setDevicePixelRatio(cRetinaFactor());
 
-		_pix = App::pixmapFromImageInPlace(std::move(img));
+		_pix = Ui::PixmapFromImage(std::move(img));
 		_pixBlurred = !(thumbnail || good);
 	}
 
@@ -594,7 +576,6 @@ TextState Video::getState(
 }
 
 void Video::updateStatusText() {
-	bool showPause = false;
 	int statusSize = 0;
 	if (_data->status == FileDownloadFailed || _data->status == FileUploadFailed) {
 		statusSize = Ui::FileStatusSizeFailed;
@@ -623,7 +604,12 @@ Voice::Voice(
 	const style::OverviewFileLayout &st)
 : RadialProgressItem(delegate, parent)
 , _data(voice)
-, _namel(std::make_shared<DocumentOpenClickHandler>(_data, parent->fullId()))
+, _namel(std::make_shared<DocumentOpenClickHandler>(
+	_data,
+	crl::guard(this, [=](FullMsgId id) {
+		delegate->openDocument(_data, id);
+	}),
+	parent->fullId()))
 , _st(st) {
 	AddComponents(Info::Bit());
 
@@ -930,12 +916,20 @@ Document::Document(
 : RadialProgressItem(delegate, parent)
 , _data(document)
 , _msgl(goToMessageClickHandler(parent))
-, _namel(std::make_shared<DocumentOpenClickHandler>(_data, parent->fullId()))
+, _namel(std::make_shared<DocumentOpenClickHandler>(
+	_data,
+	crl::guard(this, [=](FullMsgId id) {
+		delegate->openDocument(_data, id);
+	}),
+	parent->fullId()))
 , _st(st)
 , _date(langDateTime(base::unixtime::parse(_data->date)))
 , _datew(st::normalFont->width(_date))
 , _colorIndex(documentColorIndex(_data, _ext)) {
-	_name.setMarkedText(st::defaultTextStyle, ComposeNameWithEntities(_data), _documentNameOptions);
+	_name.setMarkedText(
+		st::defaultTextStyle,
+		Ui::Text::FormatSongNameFor(_data).textWithEntities(),
+		_documentNameOptions);
 
 	AddComponents(Info::Bit());
 
@@ -1090,7 +1084,6 @@ void Document::paint(Painter &p, const QRect &clip, TextSelection selection, con
 			if (wthumb) {
 				ensureDataMediaCreated();
 				const auto thumbnail = _dataMedia->thumbnail();
-				const auto thumbLoaded = (thumbnail != nullptr);
 				const auto blurred = _dataMedia->thumbnailInline();
 				if (thumbnail || blurred) {
 					if (_thumb.isNull() || (thumbnail && !_thumbLoaded)) {
@@ -1244,7 +1237,6 @@ TextState Document::getState(
 		StateRequest request) const {
 	ensureDataMediaCreated();
 	const auto loaded = dataLoaded();
-	const auto wthumb = withThumb();
 
 	if (_data->isSong()) {
 		const auto nameleft = _st.songPadding.left() + _st.songThumbSize + _st.songPadding.right();
@@ -1253,7 +1245,6 @@ TextState Document::getState(
 			_width - nameleft - nameright,
 			_name.maxWidth());
 		const auto nametop = _st.songNameTop;
-		const auto statustop = _st.songStatusTop;
 
 		if (const auto state = cornerDownloadTextState(point, request); state.link) {
 			return state;
@@ -1290,7 +1281,6 @@ TextState Document::getState(
 		const auto namewidth = std::min(
 			_width - nameleft - nameright,
 			_name.maxWidth());
-		const auto statustop = st::linksBorder + _st.fileStatusTop;
 		const auto datetop = st::linksBorder + _st.fileDateTop;
 
 		const auto rthumb = style::rtlrect(
@@ -1481,6 +1471,9 @@ Link::Link(
 		if (_page->document) {
 			_photol = std::make_shared<DocumentOpenClickHandler>(
 				_page->document,
+				crl::guard(this, [=](FullMsgId id) {
+					delegate->openDocument(_page->document, id);
+				}),
 				parent->fullId());
 		} else if (_page->photo) {
 			if (_page->type == WebPageType::Profile || _page->type == WebPageType::Video) {
@@ -1490,6 +1483,9 @@ Link::Link(
 				|| _page->siteName == qstr("Facebook")) {
 				_photol = std::make_shared<PhotoOpenClickHandler>(
 					_page->photo,
+					crl::guard(this, [=](FullMsgId id) {
+						delegate->openPhoto(_page->photo, id);
+					}),
 					parent->fullId());
 			} else {
 				_photol = createHandler(_page->url);

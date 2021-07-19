@@ -172,7 +172,8 @@ MenuSpeedItem::MenuSpeedItem(
 }
 
 float64 MenuSpeedItem::computeSpeed(float64 value) const {
-	return anim::interpolate(kMinSpeed, kMaxSpeed, value) / 100.;
+	return anim::interpolate(kMinSpeed, kMaxSpeed, std::clamp(value, 0., 1.))
+		/ 100.;
 }
 
 QString MenuSpeedItem::speedString(float64 value) const {
@@ -467,7 +468,7 @@ void PlaybackControls::updatePlayPauseResumeState(const Player::TrackState &stat
 }
 
 void PlaybackControls::updateTimeTexts(const Player::TrackState &state) {
-	qint64 position = 0, length = state.length;
+	qint64 position = 0;
 
 	if (Player::IsStoppedAtEnd(state.state)) {
 		position = state.length;

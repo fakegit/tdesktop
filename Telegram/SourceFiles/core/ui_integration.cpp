@@ -84,6 +84,14 @@ const auto kBadPrefix = u"http://"_q;
 	return true;
 }
 
+[[nodiscard]] QString OpenGLCheckFilePath() {
+	return cWorkingDir() + "tdata/opengl_crash_check";
+}
+
+[[nodiscard]] QString ANGLEBackendFilePath() {
+	return cWorkingDir() + "tdata/angle_backend";
+}
+
 } // namespace
 
 void UiIntegration::postponeCall(FnMut<void()> &&callable) {
@@ -98,12 +106,16 @@ void UiIntegration::unregisterLeaveSubscription(not_null<QWidget*> widget) {
 	Core::App().unregisterLeaveSubscription(widget);
 }
 
-void UiIntegration::writeLogEntry(const QString &entry) {
-	Logs::writeMain(entry);
-}
-
 QString UiIntegration::emojiCacheFolder() {
 	return cWorkingDir() + "tdata/emoji";
+}
+
+QString UiIntegration::openglCheckFilePath() {
+	return OpenGLCheckFilePath();
+}
+
+QString UiIntegration::angleBackendFilePath() {
+	return ANGLEBackendFilePath();
 }
 
 void UiIntegration::textActionsUpdated() {
@@ -116,10 +128,8 @@ void UiIntegration::activationFromTopPanel() {
 	Platform::IgnoreApplicationActivationRightNow();
 }
 
-void UiIntegration::startFontsBegin() {
-}
-
-void UiIntegration::startFontsEnd() {
+bool UiIntegration::screenIsLocked() {
+	return Core::App().screenIsLocked();
 }
 
 QString UiIntegration::timeFormat() {
@@ -232,7 +242,7 @@ rpl::producer<> UiIntegration::forcePopupMenuHideRequests() {
 QString UiIntegration::convertTagToMimeTag(const QString &tagId) {
 	if (TextUtilities::IsMentionLink(tagId)) {
 		if (const auto session = Core::App().activeAccount().maybeSession()) {
-			return tagId + ':' + QString::number(session->userId());
+			return tagId + ':' + QString::number(session->userId().bare);
 		}
 	}
 	return tagId;
@@ -244,11 +254,12 @@ const Ui::Emoji::One *UiIntegration::defaultEmojiVariant(
 		return emoji;
 	}
 	const auto nonColored = emoji->nonColoredId();
-	const auto it = cEmojiVariants().constFind(nonColored);
-	const auto result = (it != cEmojiVariants().cend())
-		? emoji->variant(it.value())
+	const auto &variants = Core::App().settings().emojiVariants();
+	const auto i = variants.find(nonColored);
+	const auto result = (i != end(variants))
+		? emoji->variant(i->second)
 		: emoji;
-	AddRecentEmoji(result);
+	Core::App().settings().incrementRecentEmoji(result);
 	return result;
 }
 
@@ -302,6 +313,10 @@ QString UiIntegration::phraseFormattingStrikeOut() {
 
 QString UiIntegration::phraseFormattingMonospace() {
 	return tr::lng_menu_formatting_monospace(tr::now);
+}
+
+bool OpenGLLastCheckFailed() {
+	return QFile::exists(OpenGLCheckFilePath());
 }
 
 } // namespace Core

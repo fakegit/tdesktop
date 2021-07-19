@@ -25,6 +25,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "data/data_user.h"
 #include "data/data_file_origin.h"
 #include "data/data_document.h"
+#include "data/data_file_click_handler.h"
 #include "main/main_session.h"
 #include "window/window_session_controller.h"
 #include "facades.h"
@@ -530,7 +531,6 @@ void ReplyKeyboard::updateMessageId() {
 void ReplyKeyboard::resize(int width, int height) {
 	_width = width;
 
-	auto markup = _item->Get<HistoryMessageReplyMarkup>();
 	auto y = 0.;
 	auto buttonHeight = _rows.empty()
 		? float64(_st->buttonHeight())
@@ -933,6 +933,7 @@ void HistoryMessageReplyMarkup::create(const MTPReplyMarkup &markup) {
 	case mtpc_replyKeyboardMarkup: {
 		auto &d = markup.c_replyKeyboardMarkup();
 		flags = d.vflags().v;
+		placeholder = d.vplaceholder() ? qs(*d.vplaceholder()) : QString();
 
 		createFromButtonRows(d.vrows().v);
 	} break;
@@ -940,6 +941,7 @@ void HistoryMessageReplyMarkup::create(const MTPReplyMarkup &markup) {
 	case mtpc_replyInlineMarkup: {
 		auto &d = markup.c_replyInlineMarkup();
 		flags = MTPDreplyKeyboardMarkup::Flags(0) | MTPDreplyKeyboardMarkup_ClientFlag::f_inline;
+		placeholder = QString();
 
 		createFromButtonRows(d.vrows().v);
 	} break;
@@ -947,11 +949,13 @@ void HistoryMessageReplyMarkup::create(const MTPReplyMarkup &markup) {
 	case mtpc_replyKeyboardHide: {
 		auto &d = markup.c_replyKeyboardHide();
 		flags = mtpCastFlags(d.vflags()) | MTPDreplyKeyboardMarkup_ClientFlag::f_zero;
+		placeholder = QString();
 	} break;
 
 	case mtpc_replyKeyboardForceReply: {
 		auto &d = markup.c_replyKeyboardForceReply();
 		flags = mtpCastFlags(d.vflags()) | MTPDreplyKeyboardMarkup_ClientFlag::f_force_reply;
+		placeholder = d.vplaceholder() ? qs(*d.vplaceholder()) : QString();
 	} break;
 	}
 }
@@ -959,6 +963,7 @@ void HistoryMessageReplyMarkup::create(const MTPReplyMarkup &markup) {
 void HistoryMessageReplyMarkup::create(
 		const HistoryMessageReplyMarkup &markup) {
 	flags = markup.flags;
+	placeholder = markup.placeholder;
 	inlineKeyboard = nullptr;
 
 	rows.clear();

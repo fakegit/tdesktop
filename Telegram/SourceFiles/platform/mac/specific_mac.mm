@@ -33,16 +33,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include <CoreFoundation/CFURL.h>
 #include <IOKit/IOKitLib.h>
 #include <IOKit/hidsystem/ev_keymap.h>
-#include <SPMediaKeyTap.h>
 #include <mach-o/dyld.h>
 #include <AVFoundation/AVFoundation.h>
-
-void psWriteDump() {
-#ifndef DESKTOP_APP_DISABLE_CRASH_REPORTS
-	double v = objc_appkitVersion();
-	CrashReports::dump() << "OS-Version: " << v;
-#endif // DESKTOP_APP_DISABLE_CRASH_REPORTS
-}
 
 void psActivateProcess(uint64 pid) {
 	if (!pid) {
@@ -113,9 +105,11 @@ std::optional<bool> IsDarkMode() {
 		: std::nullopt;
 }
 
-void RegisterCustomScheme(bool force) {
-	OSStatus result = LSSetDefaultHandlerForURLScheme(CFSTR("tg"), (CFStringRef)[[NSBundle mainBundle] bundleIdentifier]);
-	DEBUG_LOG(("App Info: set default handler for 'tg' scheme result: %1").arg(result));
+void WriteCrashDumpDetails() {
+#ifndef DESKTOP_APP_DISABLE_CRASH_REPORTS
+	double v = objc_appkitVersion();
+	CrashReports::dump() << "OS-Version: " << v;
+#endif // DESKTOP_APP_DISABLE_CRASH_REPORTS
 }
 
 // I do check for availability, just not in the exact way clang is content with
@@ -197,7 +191,6 @@ void IgnoreApplicationActivationRightNow() {
 } // namespace Platform
 
 void psNewVersion() {
-	Platform::RegisterCustomScheme();
 }
 
 void psAutoStart(bool start, bool silent) {

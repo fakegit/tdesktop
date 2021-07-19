@@ -62,7 +62,7 @@ enum class WidgetState {
 	Filtered,
 };
 
-class InnerWidget final : public Ui::RpWidget, private base::Subscriber {
+class InnerWidget final : public Ui::RpWidget {
 	Q_OBJECT
 
 public:
@@ -120,9 +120,7 @@ public:
 
 	void setLoadMoreCallback(Fn<void()> callback);
 	[[nodiscard]] rpl::producer<> listBottomReached() const;
-
-	base::Observable<PeerData*> searchFromUserChanged;
-
+	[[nodiscard]] rpl::producer<> cancelSearchFromUserRequests() const;
 	[[nodiscard]] rpl::producer<ChosenRow> chosenRow() const;
 	[[nodiscard]] rpl::producer<> updated() const;
 
