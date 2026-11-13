@@ -10,6 +10,9 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "platform/platform_specific.h"
 #include "core/crash_reports.h"
 #include "core/launcher.h"
+#include "core/update_channel.h"
+#include "core/version.h"
+#include "mtproto/facade.h"
 
 namespace {
 
@@ -31,7 +34,6 @@ public:
 enum LogDataType {
 	LogDataMain,
 	LogDataDebug,
-	LogDataTcp,
 	LogDataMtp,
 
 	LogDataCount
@@ -51,10 +53,9 @@ QMutex *_logsMutex(LogDataType type, bool clear = false) {
 QString _logsFilePath(LogDataType type, const QString &postfix = QString()) {
 	QString path(cWorkingDir());
 	switch (type) {
-	case LogDataMain: path += qstr("log") + postfix + qstr(".txt"); break;
-	case LogDataDebug: path += qstr("DebugLogs/log") + postfix + qstr(".txt"); break;
-	case LogDataTcp: path += qstr("DebugLogs/tcp") + postfix + qstr(".txt"); break;
-	case LogDataMtp: path += qstr("DebugLogs/mtp") + postfix + qstr(".txt"); break;
+	case LogDataMain: path += u"log"_q + postfix + u".txt"_q; break;
+	case LogDataDebug: path += u"DebugLogs/log"_q + postfix + u".txt"_q; break;
+	case LogDataMtp: path += u"DebugLogs/mtp"_q + postfix + u".txt"_q; break;
 	}
 	return path;
 }
@@ -79,7 +80,7 @@ public:
 	}
 
 	bool openMain() {
-		return reopen(LogDataMain, 0, qsl("start"));
+		return reopen(LogDataMain, 0, u"start"_q);
 	}
 
 	void closeMain() {
@@ -145,42 +146,54 @@ private:
 			if (postfix.isEmpty()) { // instance checked, need to move to log.txt
 				Assert(!files[type]->fileName().isEmpty()); // one of log_startXX.txt should've been opened already
 
-				auto to = std::make_unique<QFile>(_logsFilePath(type, postfix));
-				if (to->exists() && !to->remove()) {
-					LOG(("Could not delete '%1' file to start new logging: %2").arg(to->fileName(), to->errorString()));
+				const auto startName = files[type]->fileName();
+				const auto targetName = _logsFilePath(type, postfix);
+
+				auto target = QFile(targetName);
+				if (target.exists() && !target.remove()) {
+					LOG(("Could not delete '%1' file to start new logging: %2").arg(targetName, target.errorString()));
 					return false;
 				}
-				if (!QFile(files[type]->fileName()).copy(to->fileName())) { // don't close files[type] yet
-					LOG(("Could not copy '%1' to '%2' to start new logging: %3").arg(files[type]->fileName(), to->fileName(), to->errorString()));
-					return false;
-				}
-				if (to->open(mode | QIODevice::Append)) {
-					std::swap(files[type], to);
-					LOG(("Moved logging from '%1' to '%2'!").arg(to->fileName(), files[type]->fileName()));
-					to->remove();
 
-					LogsStartIndexChosen = -1;
+				files[type]->close();
 
-					QDir working(cWorkingDir()); // delete all other log_startXX.txt that we can
-					QStringList oldlogs = working.entryList(QStringList("log_start*.txt"), QDir::Files);
-					for (QStringList::const_iterator i = oldlogs.cbegin(), e = oldlogs.cend(); i != e; ++i) {
-						QString oldlog = cWorkingDir() + *i, oldlogend = i->mid(qstr("log_start").size());
-						if (oldlogend.size() == 1 + qstr(".txt").size() && oldlogend.at(0).isDigit() && oldlogend.midRef(1) == qstr(".txt")) {
-							bool removed = QFile(oldlog).remove();
-							LOG(("Old start log '%1' found, deleted: %2").arg(*i, Logs::b(removed)));
-						}
+				const auto reopenStart = [&](const QString &name) {
+					files[type]->setFileName(name);
+					return files[type]->open(mode | QIODevice::Append);
+				};
+
+				auto source = QFile(startName);
+				if (!source.rename(targetName)) {
+					if (reopenStart(startName)) {
+						LOG(("Could not rename '%1' to '%2' to start new logging: %3").arg(startName, targetName, source.errorString()));
 					}
-
-					return true;
+					return false;
 				}
-				LOG(("Could not open '%1' file to start new logging: %2").arg(to->fileName(), to->errorString()));
-				return false;
+				if (!reopenStart(targetName)) {
+					LOG(("Could not open '%1' file to start new logging: %2").arg(targetName, files[type]->errorString()));
+					return false;
+				}
+				LOG(("Moved logging from '%1' to '%2'!").arg(startName, files[type]->fileName()));
+
+				LogsStartIndexChosen = -1;
+
+				QDir working(cWorkingDir()); // delete all other log_startXX.txt that we can
+				QStringList oldlogs = working.entryList(QStringList("log_start*.txt"), QDir::Files);
+				for (QStringList::const_iterator i = oldlogs.cbegin(), e = oldlogs.cend(); i != e; ++i) {
+					QString oldlog = cWorkingDir() + *i, oldlogend = i->mid(u"log_start"_q.size());
+					if (oldlogend.size() == 1 + u".txt"_q.size() && oldlogend.at(0).isDigit() && base::StringViewMid(oldlogend, 1) == u".txt"_q) {
+						bool removed = QFile(oldlog).remove();
+						LOG(("Old start log '%1' found, deleted: %2").arg(*i, Logs::b(removed)));
+					}
+				}
+
+				return true;
 			} else {
 				bool found = false;
 				int32 oldest = -1; // find not existing log_startX.txt or pick the oldest one (by lastModified)
 				QDateTime oldestLastModified;
 				for (int32 i = 0; i < 10; ++i) {
-					QString trying = _logsFilePath(type, qsl("_start%1").arg(i));
+					QString trying = _logsFilePath(type, u"_start%1"_q.arg(i));
 					files[type]->setFileName(trying);
 					if (!files[type]->exists()) {
 						LogsStartIndexChosen = i;
@@ -194,7 +207,7 @@ private:
 					}
 				}
 				if (!found) {
-					files[type]->setFileName(_logsFilePath(type, qsl("_start%1").arg(oldest)));
+					files[type]->setFileName(_logsFilePath(type, u"_start%1"_q.arg(oldest)));
 					LogsStartIndexChosen = oldest;
 				}
 			}
@@ -208,7 +221,7 @@ private:
 					files[type]->close();
 				}
 			} else {
-				QDir().mkdir(cWorkingDir() + qstr("DebugLogs"));
+				QDir().mkdir(cWorkingDir() + u"DebugLogs"_q);
 			}
 		}
 		if (files[type]->open(mode)) {
@@ -244,7 +257,6 @@ NEW LOGGING INSTANCE STARTED!!!\n\
 		QString postfix = QString("_%4_%5").arg((part * switchEach) / 60, 2, 10, QChar('0')).arg((part * switchEach) % 60, 2, 10, QChar('0'));
 
 		reopen(LogDataDebug, dayIndex, postfix);
-		reopen(LogDataTcp, dayIndex, postfix);
 		reopen(LogDataMtp, dayIndex, postfix);
 	}
 
@@ -267,7 +279,7 @@ void _logsWrite(LogDataType type, const QString &msg) {
 		if (!LogsInMemory) {
 			LogsInMemory = new LogsInMemoryList;
 		}
-		LogsInMemory->push_back(qMakePair(type, msg));
+		LogsInMemory->push_back({ type, msg });
 	} else if (!LogsBeforeSingleInstanceChecked.isEmpty() && type == LogDataMain) {
 		LogsBeforeSingleInstanceChecked += msg;
 	}
@@ -278,7 +290,10 @@ namespace {
 
 bool DebugModeEnabled = false;
 
-void MoveOldDataFiles(const QString &wasDir) {
+[[maybe_unused]] void MoveOldDataFiles(const QString &wasDir) {
+	if (wasDir.isEmpty()) {
+		return;
+	}
 	QFile data(wasDir + "data"), dataConfig(wasDir + "data_config"), tdataConfig(wasDir + "tdata/config");
 	if (data.exists() && dataConfig.exists() && !QFileInfo::exists(cWorkingDir() + "data") && !QFileInfo::exists(cWorkingDir() + "data_config")) { // move to home dir
 		LOG(("Copying data to home dir '%1' from '%2'").arg(cWorkingDir(), wasDir));
@@ -331,127 +346,79 @@ void SetDebugEnabled(bool enabled) {
 }
 
 bool DebugEnabled() {
-#if defined _DEBUG
-	return true;
-#else
 	return DebugModeEnabled;
-#endif
 }
 
 bool WritingEntry() {
 	return WritingEntryFlag;
 }
 
-void start(not_null<Core::Launcher*> launcher) {
+void start() {
 	Assert(LogsData == nullptr);
 
-	if (!launcher->checkPortableVersionFolder()) {
+	auto &launcher = Core::Launcher::Instance();
+	if (!launcher.checkPortableVersionFolder()) {
 		return;
 	}
 
-	auto initialWorkingDir = QDir(cWorkingDir()).absolutePath() + '/';
-	auto moveOldDataFrom = QString();
-	auto workingDirChosen = false;
-
-	if (cAlphaVersion()) {
-		workingDirChosen = true;
-	} else {
-
-#ifdef Q_OS_UNIX
-
-		if (!cWorkingDir().isEmpty()) {
-			// This value must come from TelegramForcePortable
-			// or from the "-workdir" command line argument.
-			cForceWorkingDir(cWorkingDir());
-		} else {
-#if defined _DEBUG && !defined OS_MAC_STORE
-			cForceWorkingDir(cExeDir());
-#else // _DEBUG
-			cForceWorkingDir(psAppDataPath());
-#endif // !_DEBUG
-		}
-		workingDirChosen = true;
-
-#if !defined Q_OS_MAC && !defined _DEBUG // fix first version
-		moveOldDataFrom = initialWorkingDir;
-#endif // !Q_OS_MAC && !_DEBUG
-
-#elif defined Q_OS_WINRT // Q_OS_UNIX
-
-		cForceWorkingDir(psAppDataPath());
-		workingDirChosen = true;
-
-#elif defined OS_WIN_STORE // Q_OS_UNIX || Q_OS_WINRT
-
-#ifdef _DEBUG
-		cForceWorkingDir(cExeDir());
-#else // _DEBUG
-		cForceWorkingDir(psAppDataPath());
-#endif // !_DEBUG
-		workingDirChosen = true;
-
-#elif defined Q_OS_WIN
-
-		if (!cWorkingDir().isEmpty()) {
-			// This value must come from TelegramForcePortable
-			// or from the "-workdir" command line argument.
-			cForceWorkingDir(cWorkingDir());
-			workingDirChosen = true;
-		}
-
-#endif // Q_OS_UNIX || Q_OS_WINRT || OS_WIN_STORE
-
-	}
-
 	LogsData = new LogsDataFields();
-	if (!workingDirChosen) {
+	if (cWorkingDir().isEmpty()) {
+#if (!defined Q_OS_WIN && !defined _DEBUG) || defined Q_OS_WINRT || defined OS_WIN_STORE || defined OS_MAC_STORE
+		cForceWorkingDir(psAppDataPath());
+#else // (!Q_OS_WIN && !_DEBUG) || Q_OS_WINRT || OS_WIN_STORE || OS_MAC_STORE
 		cForceWorkingDir(cExeDir());
 		if (!LogsData->openMain()) {
 			cForceWorkingDir(psAppDataPath());
 		}
+#endif // (!Q_OS_WIN && !_DEBUG) || Q_OS_WINRT || OS_WIN_STORE || OS_MAC_STORE
 	}
 
-	cForceWorkingDir(QDir(cWorkingDir()).absolutePath() + '/');
+	if (launcher.validateCustomWorkingDir()) {
+		delete LogsData;
+		LogsData = new LogsDataFields();
+	}
 
 // WinRT build requires the working dir to stay the same for plugin loading.
 #ifndef Q_OS_WINRT
-	QDir().setCurrent(cWorkingDir());
+	QDir::setCurrent(cWorkingDir());
 #endif // !Q_OS_WINRT
 
-	QDir().mkpath(cWorkingDir() + qstr("tdata"));
+	QDir().mkpath(cWorkingDir() + u"tdata"_q);
 
-	launcher->workingFolderReady();
-	CrashReports::StartCatching(launcher);
+	launcher.workingFolderReady();
+	CrashReports::StartCatching();
 
 	if (!LogsData->openMain()) {
 		delete LogsData;
 		LogsData = nullptr;
 	}
 
-	LOG(("Launched version: %1, install beta: %2, alpha: %3, debug mode: %4"
+	const auto canary = Core::BuildIsCanary
+		? u", canary: #%1"_q.arg(Core::CanaryBuildCounter)
+		: QString();
+	LOG(("Launched version: %1, install beta: %2%3, debug mode: %4"
 		).arg(AppVersion
 		).arg(Logs::b(cInstallBetaVersion())
-		).arg(cAlphaVersion()
+		).arg(canary
 		).arg(Logs::b(DebugEnabled())));
 	LOG(("Executable dir: %1, name: %2").arg(cExeDir(), cExeName()));
-	LOG(("Initial working dir: %1").arg(initialWorkingDir));
+	LOG(("Initial working dir: %1").arg(launcher.initialWorkingDir()));
 	LOG(("Working dir: %1").arg(cWorkingDir()));
-	LOG(("Command line: %1").arg(launcher->argumentsString()));
+	LOG(("Command line: %1").arg(launcher.arguments().join(' ')));
 
 	if (!LogsData) {
 		LOG(("FATAL: Could not open '%1' for writing log!"
-			).arg(_logsFilePath(LogDataMain, qsl("_startXX"))));
+			).arg(_logsFilePath(LogDataMain, u"_startXX"_q)));
 		return;
 	}
 
 #ifdef Q_OS_WIN
 	if (cWorkingDir() == psAppDataPath()) { // fix old "Telegram Win (Unofficial)" version
-		moveOldDataFrom = psAppDataPathOld();
+		MoveOldDataFiles(psAppDataPathOld());
 	}
+#elif !defined Q_OS_MAC && !defined _DEBUG // fix first version
+	MoveOldDataFiles(launcher.initialWorkingDir());
 #endif
-	if (!moveOldDataFrom.isEmpty()) {
-		MoveOldDataFiles(moveOldDataFrom);
-	}
 
 	if (LogsInMemory) {
 		Assert(LogsInMemory != DeletedLogsInMemory);
@@ -516,19 +483,6 @@ bool instanceChecked() {
 	return true;
 }
 
-void multipleInstances() {
-	if (LogsInMemory) {
-		Assert(LogsInMemory != DeletedLogsInMemory);
-		delete LogsInMemory;
-	}
-	LogsInMemory = DeletedLogsInMemory;
-
-	if (Logs::DebugEnabled()) {
-		LOG(("WARNING: debug logs are not written in multiple instances mode!"));
-	}
-	LogsBeforeSingleInstanceChecked.clear();
-}
-
 void closeMain() {
 	LOG(("Explicitly closing main log and finishing crash handlers."));
 	if (LogsData) {
@@ -562,21 +516,53 @@ void writeDebug(const QString &v) {
 	//OutputDebugString(reinterpret_cast<const wchar_t *>(msg.utf16()));
 #elif defined Q_OS_MAC
 	//objc_outputDebugString(msg);
-#elif defined Q_OS_UNIX && defined _DEBUG
+#elif defined _DEBUG
 	//std::cout << msg.toUtf8().constData();
 #endif
 }
 
-void writeTcp(const QString &v) {
-	const auto msg = QString("%1 %2\n").arg(_logsEntryStart(), v);
-	_logsWrite(LogDataTcp, msg);
-}
-
 void writeMtp(int32 dc, const QString &v) {
-	const auto msg = QString("%1 (dc:%2) %3\n").arg(
-		_logsEntryStart(),
-		QString::number(dc),
-		v);
+	const auto expanded = [&] {
+		const auto bare = MTP::isTemporaryDcId(dc)
+			? MTP::getRealIdFromTemporaryDcId(dc)
+			: MTP::BareDcId(dc);
+		const auto base = (MTP::isTemporaryDcId(dc) ? "temporary_" : "")
+			+ QString::number(bare);
+		const auto shift = MTP::GetDcIdShift(dc);
+		if (shift == 0) {
+			return base + "_main";
+		} else if (shift == MTP::kExportDcShift) {
+			return base + "_export";
+		} else if (shift == MTP::kExportMediaDcShift) {
+			return base + "_export_download";
+		} else if (shift == MTP::kConfigDcShift) {
+			return base + "_config_enumeration";
+		} else if (shift == MTP::kLogoutDcShift) {
+			return base + "_logout_guest";
+		} else if (shift == MTP::kUpdaterDcShift) {
+			return base + "_download_update";
+		} else if (shift == MTP::kGroupCallStreamDcShift) {
+			return base + "_stream";
+		} else if (shift == MTP::kToncenterDcShift) {
+			return base + "_toncenter";
+		} else if (shift == MTP::kWalletShareDcShift) {
+			return base + "_wallet_share";
+		} else if (MTP::isDownloadDcId(dc)) {
+			const auto index = shift - MTP::kBaseDownloadDcShift;
+			return base + "_download" + QString::number(index);
+		} else if (MTP::isUploadDcId(dc)) {
+			const auto index = shift - MTP::kBaseUploadDcShift;
+			return base + "_upload" + QString::number(index);
+		} else if (shift >= MTP::kDestroyKeyStartDcShift) {
+			const auto index = shift - MTP::kDestroyKeyStartDcShift;
+			return base + "_key_destroyer" + QString::number(index);
+		}
+		return base + "_unknown" + QString::number(shift);
+	}();
+	const auto msg = _logsEntryStart()
+		+ u" (dc:%1) "_q.arg(expanded)
+		+ v
+		+ '\n';
 	_logsWrite(LogDataMtp, msg);
 }
 

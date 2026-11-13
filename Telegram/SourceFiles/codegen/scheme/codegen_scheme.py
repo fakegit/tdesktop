@@ -46,6 +46,7 @@ generate({
     'peerNotifySettings': 'inputPeerNotifySettings',
     'channelForbidden': 'channel',
     'dialogFolder': 'dialog',
+    'dialogCommunity': 'dialog',
   },
 
   'typeIdExceptions': [
@@ -90,6 +91,7 @@ generate({
     'bytes': 'string',
   },
   'builtinInclude': 'mtproto/core_types.h',
+  'optimizeSingleData': True,
 
   'dumpToText': {
     'include': 'mtproto/details/mtproto_dump_to_text.h',

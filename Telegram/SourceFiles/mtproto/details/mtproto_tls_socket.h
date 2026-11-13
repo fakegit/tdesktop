@@ -28,6 +28,7 @@ public:
 	void write(bytes::const_span prefix, bytes::const_span buffer) override;
 
 	int32 debugState() override;
+	QString debugPostfix() const override;
 
 private:
 	enum class State {
@@ -60,7 +61,7 @@ private:
 	QByteArray _incoming;
 	int _incomingGoodDataOffset = 0;
 	int _incomingGoodDataLimit = 0;
-	int16 _serverHelloLength = 0;
+	int _serverHelloLength = 0;
 
 };
 

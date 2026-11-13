@@ -25,6 +25,7 @@ class GroupCall;
 
 namespace Calls {
 class GroupCall;
+struct FingerprintBadgeState;
 } // namespace Calls
 
 namespace Calls::Group {
@@ -59,8 +60,14 @@ public:
 	[[nodiscard]] rpl::producer<> addMembersRequests() const {
 		return _addMemberRequests.events();
 	}
+	[[nodiscard]] rpl::producer<> shareLinkRequests() const {
+		return _shareLinkRequests.events();
+	}
 
 	[[nodiscard]] MembersRow *lookupRow(not_null<PeerData*> peer) const;
+	[[nodiscard]] not_null<MembersRow*> rtmpFakeRow(
+		not_null<PeerData*> peer) const;
+	[[nodiscard]] rpl::producer<not_null<MembersRow*>> rowRemoved() const;
 
 	void setMode(PanelMode mode);
 	[[nodiscard]] QRect getInnerGeometry() const;
@@ -86,10 +93,12 @@ private:
 	void peerListFinishSelectedRowsBunch() override;
 	void peerListSetDescription(
 		object_ptr<Ui::FlatLabel> description) override;
+	std::shared_ptr<Main::SessionShow> peerListUiShow() override;
 
 	void setupAddMember(not_null<GroupCall*> call);
 	void resizeToList();
 	void setupList();
+	void setupFingerprint();
 	void setupFakeRoundCorners();
 
 	void trackViewportGeometry();
@@ -100,13 +109,20 @@ private:
 	object_ptr<Ui::ScrollArea> _scroll;
 	std::unique_ptr<Controller> _listController;
 	not_null<Ui::VerticalLayout*> _layout;
+	Ui::RpWidget *_fingerprint = nullptr;
+	rpl::event_stream<> _fingerprintRepaints;
+	const FingerprintBadgeState *_fingerprintState = nullptr;
 	const not_null<Ui::RpWidget*> _videoWrap;
 	std::unique_ptr<Viewport> _viewport;
 	rpl::variable<Ui::RpWidget*> _addMemberButton = nullptr;
+	rpl::variable<Ui::RpWidget*> _shareLinkButton = nullptr;
 	RpWidget *_topSkip = nullptr;
 	RpWidget *_bottomSkip = nullptr;
 	ListWidget *_list = nullptr;
 	rpl::event_stream<> _addMemberRequests;
+	rpl::event_stream<> _shareLinkRequests;
+
+	mutable std::unique_ptr<MembersRow> _rtmpFakeRow;
 
 	rpl::variable<bool> _canInviteByLink;
 	rpl::variable<bool> _canAddMembers;

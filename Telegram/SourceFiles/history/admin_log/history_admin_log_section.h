@@ -10,12 +10,18 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "window/section_widget.h"
 #include "window/section_memento.h"
 #include "history/admin_log/history_admin_log_item.h"
+#include "history/admin_log/history_admin_log_filter_value.h"
+#include "ui/controls/swipe_handler_data.h"
+#include "ui/effects/animations.h"
 #include "mtproto/sender.h"
+#include "tgw/tgw_scroll.h"
 
 namespace Ui {
-class ScrollArea;
+class ElasticScroll;
 class PlainShadow;
 class FlatButton;
+class IconButton;
+class JumpDownButton;
 } // namespace Ui
 
 namespace Profile {
@@ -27,21 +33,6 @@ namespace AdminLog {
 class FixedBar;
 class InnerWidget;
 class SectionMemento;
-
-struct FilterValue {
-	// Empty "flags" means all events.
-	MTPDchannelAdminLogEventsFilter::Flags flags = 0;
-	std::vector<not_null<UserData*>> admins;
-	bool allUsers = true;
-};
-
-inline bool operator==(const FilterValue &a, const FilterValue &b) {
-	return (a.flags == b.flags && a.admins == b.admins && a.allUsers == b.allUsers);
-}
-
-inline bool operator!=(const FilterValue &a, const FilterValue &b) {
-	return !(a == b);
-}
 
 class Widget final : public Window::SectionWidget {
 public:
@@ -63,6 +54,8 @@ public:
 		not_null<Window::SectionMemento*> memento,
 		const Window::SectionShow &params) override;
 	std::shared_ptr<Window::SectionMemento> createMemento() override;
+	auto createIdentityMemento()
+		-> std::shared_ptr<Window::SectionMemento> override;
 
 	void setInternalState(const QRect &geometry, not_null<SectionMemento*> memento);
 
@@ -88,12 +81,27 @@ private:
 	void saveState(not_null<SectionMemento*> memento);
 	void restoreState(not_null<SectionMemento*> memento);
 	void setupShortcuts();
+	void setupSwipeReply();
+	void setupScrollDownButton();
+	void scrollDownClicked();
+	void scrollToAnimationCallback();
+	void updateScrollDownVisibility();
+	void updateScrollDownPosition();
+	void startScrollDownButtonAnimation(bool shown);
 
-	object_ptr<Ui::ScrollArea> _scroll;
+	object_ptr<Ui::ElasticScroll> _scroll;
 	QPointer<InnerWidget> _inner;
 	object_ptr<FixedBar> _fixedBar;
 	object_ptr<Ui::PlainShadow> _fixedBarShadow;
-	object_ptr<Ui::FlatButton> _whatIsThis;
+	object_ptr<Ui::FlatButton> _settingsFilter;
+	object_ptr<Ui::IconButton> _whatIsThis;
+	object_ptr<Ui::JumpDownButton> _scrollDown;
+	Ui::Animations::Simple _scrollDownShown;
+	Tgw::ScrollFlight _scrollToFlight;
+	Ui::Animations::Simple _scrollToAnimation;
+	bool _scrollDownIsShown = false;
+
+	Ui::Controls::SwipeBackResult _swipeBackData;
 
 };
 
@@ -167,6 +175,29 @@ public:
 	QString takeSearchQuery() {
 		return std::move(_searchQuery);
 	}
+	void setExpandedGroups(std::set<uint64> &&groups) {
+		_expandedGroups = std::move(groups);
+	}
+	std::set<uint64> takeExpandedGroups() {
+		return std::move(_expandedGroups);
+	}
+	void setDeleteEventMeta(
+			base::flat_map<not_null<const HistoryItem*>, uint64> &&itemEventIds,
+			base::flat_map<uint64, UserId> &&eventAdminIds,
+			base::flat_map<uint64, TimeId> &&eventDates) {
+		_itemEventIds = std::move(itemEventIds);
+		_eventAdminIds = std::move(eventAdminIds);
+		_eventDates = std::move(eventDates);
+	}
+	auto takeItemEventIds() {
+		return std::move(_itemEventIds);
+	}
+	auto takeEventAdminIds() {
+		return std::move(_eventAdminIds);
+	}
+	auto takeEventDates() {
+		return std::move(_eventDates);
+	}
 
 private:
 	not_null<ChannelData*> _channel;
@@ -179,6 +210,10 @@ private:
 	bool _downLoaded = true;
 	FilterValue _filter;
 	QString _searchQuery;
+	std::set<uint64> _expandedGroups;
+	base::flat_map<not_null<const HistoryItem*>, uint64> _itemEventIds;
+	base::flat_map<uint64, UserId> _eventAdminIds;
+	base::flat_map<uint64, TimeId> _eventDates;
 
 };
 

@@ -8,7 +8,9 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #pragma once
 
 #include "ui/effects/animations.h"
+#include "ui/effects/panel_animation.h"
 #include "ui/rp_widget.h"
+#include "ui/widgets/shadow.h"
 #include "base/timer.h"
 #include "base/object_ptr.h"
 
@@ -16,13 +18,19 @@ namespace Window {
 class SessionController;
 } // namespace Window
 
-namespace Ui {
-class PanelAnimation;
-} // namespace Ui
 
 namespace ChatHelpers {
 
 class TabbedSelector;
+
+extern const char kOptionTabbedPanelShowOnClick[];
+[[nodiscard]] bool ShowPanelOnClick();
+
+struct TabbedPanelDescriptor {
+	Window::SessionController *regularWindow = nullptr;
+	object_ptr<TabbedSelector> ownedSelector = { nullptr };
+	TabbedSelector *nonOwnedSelector = nullptr;
+};
 
 class TabbedPanel : public Ui::RpWidget {
 public:
@@ -34,15 +42,18 @@ public:
 		QWidget *parent,
 		not_null<Window::SessionController*> controller,
 		object_ptr<TabbedSelector> selector);
+	TabbedPanel(QWidget *parent, TabbedPanelDescriptor &&descriptor);
 
-	[[nodiscard]] bool isSelectorStolen() const;
 	[[nodiscard]] not_null<TabbedSelector*> selector() const;
 
 	void moveBottomRight(int bottom, int right);
+	void moveTopRight(int top, int right);
 	void setDesiredHeightValues(
 		float64 ratio,
 		int minHeight,
 		int maxHeight);
+	void setDropDown(bool dropDown);
+	void setShowAnimationOrigin(Ui::PanelAnimation::Origin origin);
 
 	void hideFast();
 	bool hiding() const {
@@ -58,7 +69,7 @@ public:
 	~TabbedPanel();
 
 protected:
-	void enterEventHook(QEvent *e) override;
+	void enterEventHook(QEnterEvent *e) override;
 	void leaveEventHook(QEvent *e) override;
 	void otherEnter();
 	void otherLeave();
@@ -67,14 +78,8 @@ protected:
 	bool eventFilter(QObject *obj, QEvent *e) override;
 
 private:
-	TabbedPanel(
-		QWidget *parent,
-		not_null<Window::SessionController*> controller,
-		object_ptr<TabbedSelector> ownedSelector,
-		TabbedSelector *nonOwnedSelector);
-
 	void hideByTimerOrLeave();
-	void moveByBottom();
+	void moveHorizontally();
 	void showFromSelector();
 
 	style::margins innerPadding() const;
@@ -95,12 +100,13 @@ private:
 	bool preventAutoHide() const;
 	void updateContentHeight();
 
-	const not_null<Window::SessionController*> _controller;
+	Window::SessionController * const _regularWindow = nullptr;
 	const object_ptr<TabbedSelector> _ownedSelector = { nullptr };
 	const not_null<TabbedSelector*> _selector;
 
 	int _contentMaxHeight = 0;
 	int _contentHeight = 0;
+	int _top = 0;
 	int _bottom = 0;
 	int _right = 0;
 	float64 _heightRatio = 1.;
@@ -111,9 +117,12 @@ private:
 	Ui::Animations::Simple _a_show;
 
 	bool _shouldFinishHide = false;
+	bool _dropDown = false;
+	std::optional<Ui::PanelAnimation::Origin> _showAnimationOrigin;
 
 	bool _hiding = false;
 	bool _hideAfterSlide = false;
+	Ui::BoxShadow _shadow;
 	QPixmap _cache;
 	Ui::Animations::Simple _a_opacity;
 	base::Timer _hideTimer;

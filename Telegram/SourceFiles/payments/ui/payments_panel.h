@@ -8,8 +8,10 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #pragma once
 
 #include "base/object_ptr.h"
+#include "base/weak_ptr.h"
 
 namespace Ui {
+class Show;
 class RpWidget;
 class SeparatePanel;
 class BoxContent;
@@ -18,6 +20,7 @@ class Checkbox;
 
 namespace Webview {
 struct Available;
+struct ThemeParams;
 } // namespace Webview
 
 namespace Payments::Ui {
@@ -34,12 +37,20 @@ class FormSummary;
 class EditInformation;
 class EditCard;
 struct PaymentMethodDetails;
+struct PaymentMethodAdditional;
 struct NativeMethodDetails;
 
-class Panel final {
+enum class WebviewMode {
+	PaymentMethod,
+	Verification,
+};
+
+class Panel final : public base::has_weak_ptr {
 public:
 	explicit Panel(not_null<PanelDelegate*> delegate);
 	~Panel();
+
+	[[nodiscard]] not_null<QWidget*> widget() const;
 
 	void requestActivate();
 	void toggleProgress(bool shown);
@@ -59,29 +70,40 @@ public:
 		const RequestedInformation &current,
 		InformationField field);
 	void showEditPaymentMethod(const PaymentMethodDetails &method);
-	void showEditCard(
-		const NativeMethodDetails &native,
-		CardField field);
-	void showCardError(
-		const NativeMethodDetails &native,
-		CardField field);
+	void showAdditionalMethod(
+		const PaymentMethodAdditional &method,
+		const QString &provider,
+		bool canSaveInformation);
+	void showEditCard(const NativeMethodDetails &native, CardField field);
+	void showEditCardByUrl(
+		const QString &url,
+		const QString &provider,
+		bool canSaveInformation);
+	void showCardError(const NativeMethodDetails &native, CardField field);
 	void chooseShippingOption(const ShippingOptions &options);
 	void chooseTips(const Invoice &invoice);
 	void choosePaymentMethod(const PaymentMethodDetails &method);
 	void askSetPassword();
 	void showCloseConfirm();
 	void showWarning(const QString &bot, const QString &provider);
+	void requestTermsAcceptance(
+		const QString &username,
+		const QString &url,
+		bool recurring);
 
 	bool showWebview(
 		const QString &url,
-		bool allowBack,
+		WebviewMode mode,
 		rpl::producer<QString> bottomText);
+	void updateThemeParams(const Webview::ThemeParams &params);
 
 	[[nodiscard]] rpl::producer<> backRequests() const;
+	[[nodiscard]] rpl::producer<QString> savedMethodChosen() const;
 
 	void showBox(object_ptr<Ui::BoxContent> box);
-	void showToast(const TextWithEntities &text);
+	void showToast(TextWithEntities &&text);
 	void showCriticalError(const TextWithEntities &text);
+	[[nodiscard]] std::shared_ptr<Show> uiShow();
 
 	[[nodiscard]] rpl::lifetime &lifetime();
 
@@ -89,7 +111,7 @@ private:
 	struct Progress;
 	struct WebviewWithLifetime;
 
-	bool createWebview();
+	bool createWebview(const Webview::ThemeParams &params);
 	void showWebviewProgress();
 	void hideWebviewProgress();
 	void showWebviewError(
@@ -105,12 +127,16 @@ private:
 	std::unique_ptr<SeparatePanel> _widget;
 	std::unique_ptr<WebviewWithLifetime> _webview;
 	std::unique_ptr<RpWidget> _webviewBottom;
+	rpl::variable<int> _footerHeight;
 	std::unique_ptr<Progress> _progress;
 	QPointer<Checkbox> _saveWebviewInformation;
 	QPointer<FormSummary> _weakFormSummary;
 	rpl::variable<int> _formScrollTop;
 	QPointer<EditInformation> _weakEditInformation;
 	QPointer<EditCard> _weakEditCard;
+	rpl::event_stream<QString> _savedMethodChosen;
+	WebviewMode _webviewMode = WebviewMode::Verification;
+	bool _themeUpdateScheduled = false;
 	bool _webviewProgress = false;
 	bool _testMode = false;
 

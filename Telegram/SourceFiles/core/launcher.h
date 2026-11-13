@@ -11,25 +11,38 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 namespace Core {
 
+extern const char kOptionFractionalScalingEnabled[];
+extern const char kOptionHighDpiDownscale[];
+extern const char kOptionFreeType[];
+
 class Launcher {
 public:
 	Launcher(int argc, char *argv[]);
 
 	static std::unique_ptr<Launcher> Create(int argc, char *argv[]);
 
+	static Launcher &Instance() {
+		Expects(InstanceSetter::Instance != nullptr);
+
+		return *InstanceSetter::Instance;
+	}
+
 	virtual int exec();
 
-	QString argumentsString() const;
+	const QStringList &arguments() const;
+	QString initialWorkingDir() const;
 	bool customWorkingDir() const;
 
 	uint64 installationTag() const;
+	QByteArray instanceHash() const;
 
 	bool checkPortableVersionFolder();
+	bool validateCustomWorkingDir();
 	void workingFolderReady();
 	void writeDebugModeSetting();
 	void writeInstallBetaVersionsSetting();
 
-	virtual ~Launcher() = default;
+	virtual ~Launcher();
 
 protected:
 	enum class UpdaterLaunch {
@@ -40,6 +53,7 @@ protected:
 private:
 	void prepareSettings();
 	void initQtMessageLogging();
+	void initFFmpegMessageLogging();
 	void processArguments();
 
 	QStringList readArguments(int argc, char *argv[]) const;
@@ -52,17 +66,30 @@ private:
 	void init();
 	virtual void initHook() {
 	}
+	virtual void initHighDpi();
 
 	virtual bool launchUpdater(UpdaterLaunch action) = 0;
 
 	int executeApplication();
+
+	struct InstanceSetter {
+		InstanceSetter(not_null<Launcher*> instance) {
+			Expects(Instance == nullptr);
+
+			Instance = instance;
+		}
+
+		static Launcher *Instance;
+	};
+	InstanceSetter _setter = { this };
 
 	int _argc;
 	char **_argv;
 	QStringList _arguments;
 	BaseIntegration _baseIntegration;
 
-	bool _customWorkingDir = false;
+	QString _initialWorkingDir;
+	QString _customWorkingDir;
 
 };
 

@@ -8,13 +8,13 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "mtproto/connection_tcp.h"
 
 #include "mtproto/details/mtproto_abstract_socket.h"
+#include "mtproto/details/mtproto_web_proxy_socket.h"
 #include "base/bytes.h"
 #include "base/openssl_help.h"
+#include "base/random.h"
 #include "base/qthelp_url.h"
 
-extern "C" {
-#include <openssl/aes.h>
-} // extern "C"
+#include <QtCore/QtEndian>
 
 namespace MTP {
 namespace details {
@@ -43,6 +43,8 @@ public:
 	virtual int readPacketLength(bytes::const_span bytes) const = 0;
 	virtual bytes::const_span readPacket(bytes::const_span bytes) const = 0;
 
+	virtual QString debugPostfix() const = 0;
+
 	virtual ~Protocol() = default;
 
 private:
@@ -62,6 +64,8 @@ public:
 
 	int readPacketLength(bytes::const_span bytes) const override;
 	bytes::const_span readPacket(bytes::const_span bytes) const override;
+
+	QString debugPostfix() const override;
 
 };
 
@@ -132,11 +136,17 @@ bytes::const_span TcpConnection::Protocol::Version0::readPacket(
 	return bytes.subspan(sizeLength, size - sizeLength);
 }
 
+QString TcpConnection::Protocol::Version0::debugPostfix() const {
+	return QString();
+}
+
 class TcpConnection::Protocol::Version1 : public Version0 {
 public:
 	explicit Version1(bytes::vector &&secret);
 
 	void prepareKey(bytes::span key, bytes::const_span source) override;
+
+	QString debugPostfix() const override;
 
 private:
 	bytes::vector _secret;
@@ -154,6 +164,10 @@ void TcpConnection::Protocol::Version1::prepareKey(
 	bytes::copy(key, openssl::Sha256(payload));
 }
 
+QString TcpConnection::Protocol::Version1::debugPostfix() const {
+	return u"_obf"_q;
+}
+
 class TcpConnection::Protocol::VersionD : public Version1 {
 public:
 	using Version1::Version1;
@@ -165,6 +179,8 @@ public:
 
 	int readPacketLength(bytes::const_span bytes) const override;
 	bytes::const_span readPacket(bytes::const_span bytes) const override;
+
+	QString debugPostfix() const override;
 
 };
 
@@ -181,11 +197,11 @@ bytes::span TcpConnection::Protocol::VersionD::finalizePacket(
 	Expects(buffer.size() > 2 && buffer.size() < 0x1000003U);
 
 	const auto intsSize = uint32(buffer.size() - 2);
-	const auto padding = openssl::RandomValue<uint32>() & 0x0F;
+	const auto padding = base::RandomValue<uint32>() & 0x0F;
 	const auto bytesSize = intsSize * sizeof(mtpPrime) + padding;
 	buffer[1] = bytesSize;
 	for (auto added = 0; added < padding; added += 4) {
-		buffer.push_back(openssl::RandomValue<mtpPrime>());
+		buffer.push_back(base::RandomValue<mtpPrime>());
 	}
 
 	return bytes::make_span(buffer).subspan(4, 4 + bytesSize);
@@ -196,7 +212,7 @@ int TcpConnection::Protocol::VersionD::readPacketLength(
 	if (bytes.size() < 4) {
 		return kUnknownSize;
 	}
-	const auto value = *reinterpret_cast<const uint32*>(bytes.data()) + 4;
+	const auto value = qFromUnaligned<uint32>(bytes.data()) + 4;
 	return (value >= 8 && value < kPacketSizeMax)
 		? int(value)
 		: kInvalidSize;
@@ -210,6 +226,10 @@ bytes::const_span TcpConnection::Protocol::VersionD::readPacket(
 		&& size <= bytes.size());
 	const auto sizeLength = 4;
 	return bytes.subspan(sizeLength, size - sizeLength);
+}
+
+QString TcpConnection::Protocol::VersionD::debugPostfix() const {
+	return u"_dd"_q;
 }
 
 auto TcpConnection::Protocol::Create(bytes::const_span secret)
@@ -233,7 +253,7 @@ TcpConnection::TcpConnection(
 	const ProxyData &proxy)
 : AbstractConnection(thread, proxy)
 , _instance(instance)
-, _checkNonce(openssl::RandomValue<MTPint128>()) {
+, _checkNonce(base::RandomValue<MTPint128>()) {
 }
 
 ConnectionPointer TcpConnection::clone(const ProxyData &proxy) {
@@ -272,7 +292,7 @@ void TcpConnection::socketRead() {
 	Expects(_leftBytes > 0 || !_usingLargeBuffer);
 
 	if (!_socket || !_socket->isConnected()) {
-		LOG(("MTP Error: Socket not connected in socketRead()"));
+		CONNECTION_LOG_ERROR("Socket not connected in socketRead()");
 		error(kErrorCodeOther);
 		return;
 	}
@@ -293,7 +313,7 @@ void TcpConnection::socketRead() {
 		if (readCount > 0) {
 			const auto read = free.subspan(0, readCount);
 			aesCtrEncrypt(read, _receiveKey, &_receiveState);
-			TCP_LOG(("TCP Info: read %1 bytes").arg(readCount));
+			CONNECTION_LOG_INFO(u"Read %1 bytes"_q.arg(readCount));
 
 			_readBytes += readCount;
 			if (_leftBytes > 0) {
@@ -309,9 +329,10 @@ void TcpConnection::socketRead() {
 					_largeBuffer.clear();
 					_offsetBytes = _readBytes = 0;
 				} else {
-					TCP_LOG(("TCP Info: not enough %1 for packet! read %2"
-						).arg(_leftBytes
-						).arg(_readBytes));
+					CONNECTION_LOG_INFO(
+						u"Not enough %1 for packet! read %2"_q
+						.arg(_leftBytes)
+						.arg(_readBytes));
 					receivedSome();
 				}
 			} else {
@@ -323,8 +344,9 @@ void TcpConnection::socketRead() {
 						// Not enough bytes yet.
 						break;
 					} else if (packetSize <= 0) {
-						LOG(("TCP Error: bad packet size in 4 bytes: %1"
-							).arg(packetSize));
+						CONNECTION_LOG_ERROR(
+							u"Bad packet size in 4 bytes: %1"_q
+							.arg(packetSize));
 						error(kErrorCodeOther);
 						return;
 					} else if (available.size() >= packetSize) {
@@ -345,22 +367,23 @@ void TcpConnection::socketRead() {
 						// If the next packet won't fit in the buffer.
 						ensureAvailableInBuffer(packetSize);
 
-						TCP_LOG(("TCP Info: not enough %1 for packet! "
-							"full size %2 read %3"
-							).arg(_leftBytes
-							).arg(packetSize
-							).arg(available.size()));
+						CONNECTION_LOG_INFO(u"Not enough %1 for packet! "
+							"full size %2 read %3"_q
+							.arg(_leftBytes)
+							.arg(packetSize)
+							.arg(available.size()));
 						receivedSome();
 						break;
 					}
 				}
 			}
 		} else if (readCount < 0) {
-			LOG(("TCP Error: socket read return %1").arg(readCount));
+			CONNECTION_LOG_ERROR(u"Socket read return %1."_q.arg(readCount));
 			error(kErrorCodeOther);
 			return;
 		} else {
-			TCP_LOG(("TCP Info: no bytes read, but bytes available was true..."));
+			CONNECTION_LOG_INFO(
+				"No bytes read, but bytes available was true...");
 			break;
 		}
 	} while (_socket
@@ -370,27 +393,20 @@ void TcpConnection::socketRead() {
 
 mtpBuffer TcpConnection::parsePacket(bytes::const_span bytes) {
 	const auto packet = _protocol->readPacket(bytes);
-	TCP_LOG(("TCP Info: packet received, size = %1"
-		).arg(packet.size()));
-	const auto ints = gsl::make_span(
-		reinterpret_cast<const mtpPrime*>(packet.data()),
-		packet.size() / sizeof(mtpPrime));
-	Assert(!ints.empty());
-	if (ints.size() < 3) {
+	CONNECTION_LOG_INFO(u"Packet received, size = %1."_q.arg(packet.size()));
+	const auto count = packet.size() / sizeof(mtpPrime);
+	Assert(count > 0);
+	if (count < 3) {
 		// nop or error or new quickack, latter is not yet supported.
-		if (ints[0] != 0) {
-			LOG(("TCP Error: "
-				"error packet received, endpoint: '%1:%2', "
-				"protocolDcId: %3, code = %4"
-				).arg(_address.isEmpty() ? ("prx_" + _proxy.host) : _address
-				).arg(_address.isEmpty() ? _proxy.port : _port
-				).arg(_protocolDcId
-				).arg(ints[0]));
+		const auto first = qFromUnaligned<mtpPrime>(packet.data());
+		if (first != 0) {
+			CONNECTION_LOG_ERROR(u"Error packet received, code = %1"_q
+				.arg(first));
 		}
-		return mtpBuffer(1, ints[0]);
+		return mtpBuffer(1, first);
 	}
-	auto result = mtpBuffer(ints.size());
-	memcpy(result.data(), ints.data(), ints.size() * sizeof(mtpPrime));
+	auto result = mtpBuffer(count);
+	memcpy(result.data(), packet.data(), count * sizeof(mtpPrime));
 	return result;
 }
 
@@ -399,10 +415,7 @@ void TcpConnection::socketConnected() {
 
 	auto buffer = preparePQFake(_checkNonce);
 
-	DEBUG_LOG(("TCP Info: "
-		"dc:%1 - Sending fake req_pq to '%2'"
-		).arg(_protocolDcId
-		).arg(_address + ':' + QString::number(_port)));
+	CONNECTION_LOG_INFO("Sending fake req_pq.");
 
 	_pingTime = crl::now();
 	sendData(std::move(buffer));
@@ -426,7 +439,8 @@ void TcpConnection::sendData(mtpBuffer &&buffer) {
 
 	// buffer: 2 available int-s + data + available int.
 	const auto bytes = _protocol->finalizePacket(buffer);
-	TCP_LOG(("TCP Info: write packet %1 bytes").arg(bytes.size()));
+	CONNECTION_LOG_INFO(u"TCP Info: write packet %1 bytes."_q
+		.arg(bytes.size()));
 	aesCtrEncrypt(bytes, _sendKey, &_sendState);
 	_socket->write(connectionStartPrefix, bytes);
 }
@@ -469,10 +483,8 @@ bytes::const_span TcpConnection::prepareConnectionStartPrefix(
 		reversed.subspan(CTRState::KeySize, CTRState::IvecSize));
 
 	// write protocol and dc ids
-	const auto protocol = reinterpret_cast<uint32*>(nonce.data() + 56);
-	*protocol = _protocol->id();
-	const auto dcId = reinterpret_cast<int16*>(nonce.data() + 60);
-	*dcId = _protocolDcId;
+	qToUnaligned(_protocol->id(), nonce.data() + 56);
+	qToUnaligned(_protocolDcId, nonce.data() + 60);
 
 	bytes::copy(buffer, nonce.subspan(0, 56));
 	aesCtrEncrypt(nonce, _sendKey, &_sendState);
@@ -497,62 +509,77 @@ void TcpConnection::connectToServer(
 		const bytes::vector &protocolSecret,
 		int16 protocolDcId,
 		bool protocolForFiles) {
+	if (_status == Status::Finished) {
+		// Queued connectToServer() may arrive after disconnectFromServer().
+		return;
+	}
 	Expects(_address.isEmpty());
 	Expects(_port == 0);
 	Expects(_protocol == nullptr);
 	Expects(_protocolDcId == 0);
 
-	const auto secret = (_proxy.type == ProxyData::Type::Mtproto)
+	const auto proxyProtocol = (_proxy.type == ProxyData::Type::Mtproto)
+		|| (_proxy.type == ProxyData::Type::Web);
+	const auto secret = proxyProtocol
 		? _proxy.secretFromMtprotoPassword()
 		: protocolSecret;
-	if (_proxy.type == ProxyData::Type::Mtproto) {
+	if (proxyProtocol) {
 		_address = _proxy.host;
 		_port = _proxy.port;
 		_protocol = Protocol::Create(secret);
-
-		DEBUG_LOG(("TCP Info: "
-			"dc:%1 - Connecting to proxy '%2'"
-			).arg(protocolDcId
-			).arg(_address + ':' + QString::number(_port)));
 	} else {
 		_address = address;
 		_port = port;
 		_protocol = Protocol::Create(secret);
-
-		DEBUG_LOG(("TCP Info: "
-			"dc:%1 - Connecting to '%2'"
-			).arg(protocolDcId
-			).arg(_address + ':' + QString::number(_port)));
 	}
-	_socket = AbstractSocket::Create(
-		thread(),
-		secret,
-		ToNetworkProxy(_proxy),
-		protocolForFiles);
+	_socket = (_proxy.type == ProxyData::Type::Web)
+		? std::make_unique<WebProxySocket>(thread(), _proxy)
+		: AbstractSocket::Create(
+			thread(),
+			secret,
+			ToNetworkProxy(_proxy),
+			protocolForFiles);
 	_protocolDcId = protocolDcId;
 
+	const auto postfix = _socket->debugPostfix();
+	_debugId = u"%1(dc:%2,%3%4:%5%6)"_q
+		.arg(_debugId.toInt())
+		.arg(
+			ProtocolDcDebugId(_protocolDcId),
+			(_proxy.type == ProxyData::Type::Mtproto)
+				? "mtproxy "
+				: (_proxy.type == ProxyData::Type::Web)
+				? "webproxy "
+				: "",
+			_address)
+		.arg(_port)
+		.arg(postfix.isEmpty() ? _protocol->debugPostfix() : postfix);
+	_socket->setDebugId(_debugId);
+
+	CONNECTION_LOG_INFO("Connecting...");
+
 	_socket->connected(
-	) | rpl::start_with_next([=] {
+	) | rpl::on_next([=] {
 		socketConnected();
 	}, _connectedLifetime);
 
 	_socket->disconnected(
-	) | rpl::start_with_next([=] {
+	) | rpl::on_next([=] {
 		socketDisconnected();
 	}, _lifetime);
 
 	_socket->readyRead(
-	) | rpl::start_with_next([=] {
+	) | rpl::on_next([=] {
 		socketRead();
 	}, _lifetime);
 
 	_socket->error(
-	) | rpl::start_with_next([=] {
+	) | rpl::on_next([=] {
 		socketError();
 	}, _lifetime);
 
 	_socket->syncTimeRequests(
-	) | rpl::start_with_next([=] {
+	) | rpl::on_next([=] {
 		syncTimeRequest();
 	}, _lifetime);
 
@@ -587,19 +614,18 @@ void TcpConnection::socketPacket(bytes::const_span bytes) {
 		if (const auto res_pq = readPQFakeReply(data)) {
 			const auto &data = res_pq->c_resPQ();
 			if (data.vnonce() == _checkNonce) {
-				DEBUG_LOG(("Connection Info: Valid pq response by TCP."));
+				CONNECTION_LOG_INFO("Valid pq response by TCP.");
 				_status = Status::Ready;
 				_connectedLifetime.destroy();
 				_pingTime = (crl::now() - _pingTime);
 				connected();
 			} else {
-				DEBUG_LOG(("Connection Error: "
-					"Wrong nonce received in TCP fake pq-responce"));
+				CONNECTION_LOG_ERROR(
+					"Wrong nonce received in TCP fake pq-responce");
 				error(kErrorCodeOther);
 			}
 		} else {
-			DEBUG_LOG(("Connection Error: "
-				"Could not parse TCP fake pq-responce"));
+			CONNECTION_LOG_ERROR("Could not parse TCP fake pq-responce");
 			error(kErrorCodeOther);
 		}
 	}
@@ -623,19 +649,19 @@ QString TcpConnection::transport() const {
 	if (!isConnected()) {
 		return QString();
 	}
-	auto result = qsl("TCP");
+	auto result = u"TCP"_q;
 	if (qthelp::is_ipv6(_address)) {
-		result += qsl("/IPv6");
+		result += u"/IPv6"_q;
 	}
 	return result;
 }
 
 QString TcpConnection::tag() const {
-	auto result = qsl("TCP");
+	auto result = u"TCP"_q;
 	if (qthelp::is_ipv6(_address)) {
-		result += qsl("/IPv6");
+		result += u"/IPv6"_q;
 	} else {
-		result += qsl("/IPv4");
+		result += u"/IPv4"_q;
 	}
 	return result;
 }

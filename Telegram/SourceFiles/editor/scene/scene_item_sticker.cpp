@@ -15,7 +15,6 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "lottie/lottie_single_player.h"
 #include "main/main_session.h"
 #include "ui/ui_utility.h"
-#include "styles/style_editor.h"
 
 namespace Editor {
 namespace {
@@ -25,7 +24,7 @@ namespace {
 ItemSticker::ItemSticker(
 	not_null<DocumentData*> document,
 	ItemBase::Data data)
-: ItemBase(std::move(data))
+: ItemAnimated(std::move(data))
 , _document(document)
 , _mediaView(_document->createMediaView()) {
 	const auto stickerData = document->sticker();
@@ -34,42 +33,26 @@ ItemSticker::ItemSticker(
 	}
 	const auto updateThumbnail = [=] {
 		const auto guard = gsl::finally([&] {
-			setAspectRatio(_pixmap.isNull()
-				? 1.0
-				: (_pixmap.height() / float64(_pixmap.width())));
+			if (_image.isNull()) {
+				setAspectRatio(1.);
+			}
 		});
-		if (stickerData->animated) {
-			_lottie.player = ChatHelpers::LottiePlayerFromDocument(
-				_mediaView.get(),
-				ChatHelpers::StickerLottieSize::MessageHistory,
-				QSize(kStickerSideSize, kStickerSideSize)
-					* cIntRetinaFactor(),
-				Lottie::Quality::High);
-			_lottie.player->updates(
-			) | rpl::start_with_next([=] {
-				updatePixmap(Ui::PixmapFromImage(
-					_lottie.player->frame()));
-				_lottie.player = nullptr;
-				_lottie.lifetime.destroy();
-				update();
-			}, _lottie.lifetime);
+		if (createPlayer()) {
 			return true;
 		}
 		const auto sticker = _mediaView->getStickerLarge();
 		if (!sticker) {
 			return false;
 		}
-		auto pixmap = sticker->pixNoCache(
-			sticker->width() * cIntRetinaFactor(),
-			sticker->height() * cIntRetinaFactor(),
-			Images::Option::Smooth);
-		pixmap.setDevicePixelRatio(cRetinaFactor());
-		updatePixmap(std::move(pixmap));
+		const auto ratio = style::DevicePixelRatio();
+		auto pixmap = sticker->pixNoCache(sticker->size() * ratio);
+		pixmap.setDevicePixelRatio(ratio);
+		updatePixmap(pixmap.toImage());
 		return true;
 	};
 	if (!updateThumbnail()) {
-		_document->owner().session().downloaderTaskFinished(
-		) | rpl::start_with_next([=] {
+		_document->session().downloaderTaskFinished(
+		) | rpl::on_next([=] {
 			if (updateThumbnail()) {
 				_loadingLifetime.destroy();
 				update();
@@ -78,25 +61,163 @@ ItemSticker::ItemSticker(
 	}
 }
 
-void ItemSticker::updatePixmap(QPixmap &&pixmap) {
-	_pixmap = std::move(pixmap);
+bool ItemSticker::createPlayer() {
+	const auto stickerData = _document->sticker();
+	if (!stickerData) {
+		return false;
+	}
+	if (stickerData->isLottie()) {
+		_lottie.player = ChatHelpers::LottiePlayerFromDocument(
+			_mediaView.get(),
+			ChatHelpers::StickerLottieSize::MessageHistory,
+			QSize(kStickerSideSize, kStickerSideSize)
+				* style::DevicePixelRatio(),
+			Lottie::Quality::High);
+		_lottie.player->updates(
+		) | rpl::on_next([=] {
+			if (_image.isNull()) {
+				updatePixmap(_lottie.player->frame());
+			}
+			update();
+		}, _lottie.lifetime);
+		return true;
+	} else if (stickerData->isWebm()
+		&& !_document->dimensions.isEmpty()) {
+		const auto callback = [=](::Media::Clip::Notification value) {
+			clipCallback(value);
+		};
+		_webm = ::Media::Clip::MakeReader(
+			_mediaView->owner()->location(),
+			_mediaView->bytes(),
+			callback);
+		return true;
+	}
+	return false;
+}
+
+void ItemSticker::releasePlayers() {
+	if (!animated()) {
+		return;
+	}
+	_loopDuration = loopDuration();
+	_releasedAnimation = true;
+	_pendingRecreate = true;
+	_lottie.lifetime.destroy();
+	_lottie.player = nullptr;
+	_webm.reset();
+}
+
+void ItemSticker::setStatus(Status status) {
+	if (status != Status::Normal) {
+		releasePlayers();
+	}
+	ItemBase::setStatus(status);
+}
+
+void ItemSticker::updatePixmap(QImage &&image) {
+	_image = std::move(image);
 	if (flipped()) {
 		performFlip();
 	} else {
 		update();
 	}
+	if (!_image.isNull()) {
+		setAspectRatio(_image.height() / float64(_image.width()));
+	}
+}
+
+void ItemSticker::clipCallback(::Media::Clip::Notification notification) {
+	using namespace ::Media::Clip;
+	if (notification == Notification::Reinit) {
+		if (_webm && _webm->state() == State::Error) {
+			_webm.setBad();
+		} else if (_webm && _webm->ready() && !_webm->started()) {
+			_webm->start({
+				.frame = _document->dimensions,
+				.keepAlpha = true,
+			});
+		}
+	}
+	if (_webm && _webm->started() && _image.isNull()) {
+		updatePixmap(_webm->current(
+			{ .frame = _document->dimensions, .keepAlpha = true },
+			0));
+	}
+	update();
+}
+
+bool ItemSticker::animated() const {
+	return (_lottie.player != nullptr) || _webm.valid() || _releasedAnimation;
+}
+
+Media::Encode::AnimatedEntity::Kind ItemSticker::entityKind() const {
+	const auto data = _document->sticker();
+	return (data && data->isWebm())
+		? Media::Encode::AnimatedEntity::Kind::Webm
+		: Media::Encode::AnimatedEntity::Kind::Lottie;
+}
+
+bool ItemSticker::hasContent() const {
+	return !content().isEmpty();
+}
+
+QByteArray ItemSticker::content() const {
+	const auto &bytes = _mediaView->bytes();
+	if (!bytes.isEmpty()) {
+		return QByteArray(bytes.constData(), bytes.size());
+	}
+	auto file = QFile(_document->filepath(true));
+	return file.open(QIODevice::ReadOnly) ? file.readAll() : QByteArray();
+}
+
+crl::time ItemSticker::loopDuration() const {
+	if (_lottie.player && _lottie.player->ready()) {
+		const auto information = _lottie.player->information();
+		if (information.frameRate > 0) {
+			return crl::time(base::SafeRound(
+				information.framesCount * 1000. / information.frameRate));
+		}
+	}
+	return _loopDuration;
+}
+
+QImage ItemSticker::currentFrame() {
+	if (_lottie.player && _lottie.player->ready()) {
+		auto request = Lottie::FrameRequest();
+		request.box = QSize(kStickerSideSize, kStickerSideSize)
+			* style::DevicePixelRatio();
+		request.mirrorHorizontal = flipped();
+		auto result = _lottie.player->frame(request);
+		_lottie.player->markFrameShown();
+		return result;
+	} else if (_webm && _webm->started()) {
+		auto result = _webm->current(
+			{ .frame = _document->dimensions, .keepAlpha = true },
+			crl::now());
+		_webm->moveToNextFrame();
+		if (!result.isNull()) {
+			return result;
+		}
+	}
+	return _image;
 }
 
 void ItemSticker::paint(
 		QPainter *p,
 		const QStyleOptionGraphicsItem *option,
 		QWidget *w) {
-	p->drawPixmap(contentRect().toRect(), _pixmap);
+	if (_pendingRecreate && w) {
+		_pendingRecreate = false;
+		createPlayer();
+	}
+	const auto live = (_lottie.player && _lottie.player->ready())
+		|| (_webm && _webm->started());
+	paintFrame(p, currentFrame(), live, _webm.valid() && flipped());
 	ItemBase::paint(p, option, w);
 }
 
-MTPInputDocument ItemSticker::sticker() const {
-	return _document->mtpInput();
+not_null<DocumentData*> ItemSticker::sticker() const {
+	return _document;
 }
 
 int ItemSticker::type() const {
@@ -104,7 +225,7 @@ int ItemSticker::type() const {
 }
 
 void ItemSticker::performFlip() {
-	_pixmap = _pixmap.transformed(QTransform().scale(-1, 1));
+	_image = _image.transformed(QTransform().scale(-1, 1));
 	update();
 }
 

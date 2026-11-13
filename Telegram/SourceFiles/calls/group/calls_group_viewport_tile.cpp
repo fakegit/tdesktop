@@ -7,9 +7,11 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "calls/group/calls_group_viewport_tile.h"
 
+#include "calls/group/calls_group_members_row.h"
 #include "webrtc/webrtc_video_track.h"
 #include "lang/lang_keys.h"
 #include "ui/round_rect.h"
+#include "ui/painter.h"
 #include "ui/effects/cross_line.h"
 #include "styles/style_calls.h"
 
@@ -27,15 +29,32 @@ Viewport::VideoTile::VideoTile(
 	VideoTileTrack track,
 	rpl::producer<QSize> trackSize,
 	rpl::producer<bool> pinned,
-	Fn<void()> update)
+	Fn<void()> update,
+	bool self,
+	bool shown)
 : _endpoint(endpoint)
 , _update(std::move(update))
-, _track(track)
-, _trackSize(std::move(trackSize)) {
-	Expects(track.track != nullptr);
-	Expects(track.row != nullptr);
+, _track(std::move(track))
+, _peer(_track.row->peer())
+, _trackSize(std::move(trackSize))
+, _hasPlaceholder(shown)
+, _rtmp(endpoint.rtmp())
+, _self(self) {
+	Expects(_track.track != nullptr);
+
+	using namespace rpl::mappers;
+	_track.track->stateValue(
+	) | rpl::filter(
+		_1 == Webrtc::VideoState::Paused
+	) | rpl::take(1) | rpl::on_next([=] {
+		_hasPlaceholder = true;
+	}, _lifetime);
 
 	setup(std::move(pinned));
+}
+
+bool Viewport::VideoTile::mirror() const {
+	return _self && (_endpoint.type == VideoEndpointType::Camera);
 }
 
 QRect Viewport::VideoTile::pinOuter() const {
@@ -68,11 +87,8 @@ QSize Viewport::VideoTile::PausedVideoSize() {
 QSize Viewport::VideoTile::trackOrUserpicSize() const {
 	if (const auto size = trackSize(); !size.isEmpty()) {
 		return size;
-	} else if (_userpicSize.isEmpty()
-		&& _track.track->state() == Webrtc::VideoState::Paused) {
-		_userpicSize = PausedVideoSize();
 	}
-	return _userpicSize;
+	return _hasPlaceholder ? PausedVideoSize() : QSize();
 }
 
 bool Viewport::VideoTile::screencast() const {
@@ -246,7 +262,7 @@ void Viewport::VideoTile::setup(rpl::producer<bool> pinned) {
 		pinned
 	) | rpl::filter([=](bool pinned) {
 		return (_pinned != pinned);
-	}) | rpl::start_with_next([=](bool pinned) {
+	}) | rpl::on_next([=](bool pinned) {
 		_pinned = pinned;
 		updateTopControlsSize();
 		if (!_hidden) {
@@ -256,7 +272,7 @@ void Viewport::VideoTile::setup(rpl::producer<bool> pinned) {
 	}, _lifetime);
 
 	_track.track->renderNextFrame(
-	) | rpl::start_with_next(_update, _lifetime);
+	) | rpl::on_next(_update, _lifetime);
 
 	updateTopControlsSize();
 }

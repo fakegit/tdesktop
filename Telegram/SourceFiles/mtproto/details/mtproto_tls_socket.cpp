@@ -11,8 +11,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "base/openssl_help.h"
 #include "base/bytes.h"
 #include "base/invoke_queued.h"
+#include "base/random.h"
 #include "base/unixtime.h"
-#include "base/qt_adapters.h"
 
 #include <QtCore/QtEndian>
 #include <range/v3/algorithm/reverse.hpp>
@@ -21,9 +21,10 @@ namespace MTP::details {
 namespace {
 
 constexpr auto kMaxGrease = 8;
-constexpr auto kClientHelloLength = 517;
+constexpr auto kClientHelloLimit = 2048;
 constexpr auto kHelloDigestLength = 32;
 constexpr auto kLengthSize = sizeof(uint16);
+constexpr auto kMaxServerHelloLength = 65536;
 const auto kServerHelloPart1 = qstr("\x16\x03\x03");
 const auto kServerHelloPart3 = qstr("\x14\x03\x03\x00\x01\x01\x17\x03\x03");
 constexpr auto kServerHelloDigestPosition = 11;
@@ -36,14 +37,22 @@ using BigNum = openssl::BigNum;
 using BigNumContext = openssl::Context;
 
 [[nodiscard]] MTPTlsClientHello PrepareClientHelloRules() {
-	auto stack = std::vector<QVector<MTPTlsBlock>>();
+	using Scope = QVector<MTPTlsBlock>;
+	using Permutation = std::vector<Scope>;
+	using StackElement = std::variant<Scope, Permutation>;
+	auto stack = std::vector<StackElement>();
 	const auto pushToBack = [&](MTPTlsBlock &&block) {
 		Expects(!stack.empty());
 
-		stack.back().push_back(std::move(block));
+		if (const auto scope = std::get_if<Scope>(&stack.back())) {
+			scope->push_back(std::move(block));
+		} else {
+			auto &permutation = v::get<Permutation>(stack.back());
+			Assert(!permutation.empty());
+			permutation.back().push_back(std::move(block));
+		}
 	};
-	const auto S = [&](QLatin1String s) {
-		const auto data = QByteArray(s.data(), s.size());
+	const auto S = [&](QByteArray data) {
 		pushToBack(MTP_tlsBlockString(MTP_bytes(data)));
 	};
 	const auto Z = [&](int length) {
@@ -61,60 +70,163 @@ using BigNumContext = openssl::Context;
 	const auto K = [&] {
 		pushToBack(MTP_tlsBlockPublicKey());
 	};
-	const auto Open = [&] {
-		stack.emplace_back();
+	const auto M = [&] {
+		pushToBack(MTP_tlsBlockM());
 	};
-	const auto Close = [&] {
+	const auto E = [&] {
+		pushToBack(MTP_tlsBlockE());
+	};
+	const auto P = [&] {
+		pushToBack(MTP_tlsBlockPadding());
+	};
+	const auto OpenScope = [&] {
+		stack.emplace_back(Scope());
+	};
+	const auto CloseScope = [&] {
 		Expects(stack.size() > 1);
+		Expects(v::is<Scope>(stack.back()));
 
-		const auto blocks = std::move(stack.back());
+		const auto blocks = std::move(v::get<Scope>(stack.back()));
 		stack.pop_back();
 		pushToBack(MTP_tlsBlockScope(MTP_vector<MTPTlsBlock>(blocks)));
 	};
+	const auto OpenPermutation = [&] {
+		stack.emplace_back(Permutation());
+	};
+	const auto ClosePermutation = [&] {
+		Expects(stack.size() > 1);
+		Expects(v::is<Permutation>(stack.back()));
+
+		const auto list = std::move(v::get<Permutation>(stack.back()));
+		stack.pop_back();
+
+		const auto wrapped = list | ranges::views::transform([](
+				const QVector<MTPTlsBlock> &elements) {
+			return MTP_vector<MTPTlsBlock>(elements);
+		}) | ranges::to<QVector<MTPVector<MTPTlsBlock>>>();
+
+		pushToBack(MTP_tlsBlockPermutation(
+			MTP_vector<MTPVector<MTPTlsBlock>>(wrapped)));
+	};
+	const auto StartPermutationElement = [&] {
+		Expects(stack.size() > 1);
+		Expects(v::is<Permutation>(stack.back()));
+
+		v::get<Permutation>(stack.back()).emplace_back();
+	};
 	const auto Finish = [&] {
 		Expects(stack.size() == 1);
+		Expects(v::is<Scope>(stack.back()));
 
-		return stack.back();
+		return v::get<Scope>(stack.back());
 	};
 
-	stack.emplace_back();
+	stack.emplace_back(Scope());
 
-	S(qstr("\x16\x03\x01\x02\x00\x01\x00\x01\xfc\x03\x03"));
+	S("\x16\x03\x01"_q);
+	OpenScope();
+	S("\x01\x00"_q);
+	OpenScope();
+	S("\x03\x03"_q);
 	Z(32);
-	S(qstr("\x20"));
+	S("\x20"_q);
 	R(32);
-	S(qstr("\x00\x20"));
+	S("\x00\x20"_q);
 	G(0);
-	S(qstr(""
+	S(""
 		"\x13\x01\x13\x02\x13\x03\xc0\x2b\xc0\x2f\xc0\x2c\xc0\x30\xcc\xa9"
 		"\xcc\xa8\xc0\x13\xc0\x14\x00\x9c\x00\x9d\x00\x2f\x00\x35\x01\x00"
-		"\x01\x93"));
+		""_q);
+	OpenScope();
 	G(2);
-	S(qstr("\x00\x00\x00\x00"));
-	Open();
-	Open();
-	S(qstr("\x00"));
-	Open();
-	D();
-	Close();
-	Close();
-	Close();
-	S(qstr("\x00\x17\x00\x00\xff\x01\x00\x01\x00\x00\x0a\x00\x0a\x00\x08"));
-	G(4);
-	S(qstr(""
-		"\x00\x1d\x00\x17\x00\x18\x00\x0b\x00\x02\x01\x00\x00\x23\x00\x00"
-		"\x00\x10\x00\x0e\x00\x0c\x02\x68\x32\x08\x68\x74\x74\x70\x2f\x31"
-		"\x2e\x31\x00\x05\x00\x05\x01\x00\x00\x00\x00\x00\x0d\x00\x12\x00"
-		"\x10\x04\x03\x08\x04\x04\x01\x05\x03\x08\x05\x05\x01\x08\x06\x06"
-		"\x01\x00\x12\x00\x00\x00\x33\x00\x2b\x00\x29"));
-	G(4);
-	S(qstr("\x00\x01\x00\x00\x1d\x00\x20"));
-	K();
-	S(qstr("\x00\x2d\x00\x02\x01\x01\x00\x2b\x00\x0b\x0a"));
-	G(6);
-	S(qstr("\x03\x04\x03\x03\x03\x02\x03\x01\x00\x1b\x00\x03\x02\x00\x02"));
+	S("\x00\x00"_q);
+	OpenPermutation(); {
+		StartPermutationElement(); {
+			S("\x00\x00"_q);
+			OpenScope();
+			OpenScope();
+			S("\x00"_q);
+			OpenScope();
+			D();
+			CloseScope();
+			CloseScope();
+			CloseScope();
+		}
+		StartPermutationElement(); {
+			S("\x00\x05\x00\x05\x01\x00\x00\x00\x00"_q);
+		}
+		StartPermutationElement(); {
+			S("\x00\x0a\x00\x0c\x00\x0a"_q);
+			G(4);
+			S("\x11\xec\x00\x1d\x00\x17\x00\x18"_q);
+		}
+		StartPermutationElement(); {
+			S("\x00\x0b\x00\x02\x01\x00"_q);
+		}
+		StartPermutationElement(); {
+			S(""
+				"\x00\x0d\x00\x18\x00\x16\x09\x04\x09\x05\x09\x06\x04\x03"
+				"\x08\x04\x04\x01\x05\x03\x08\x05\x05\x01\x08\x06\x06\x01"_q);
+		}
+		StartPermutationElement(); {
+			S(""
+				"\x00\x10\x00\x0e\x00\x0c\x02\x68\x32\x08\x68\x74\x74\x70"
+				"\x2f\x31\x2e\x31"_q);
+		}
+		StartPermutationElement(); {
+			S("\x00\x12\x00\x00"_q);
+		}
+		StartPermutationElement(); {
+			S("\x00\x17\x00\x00"_q);
+		}
+		StartPermutationElement(); {
+			S("\x00\x1b\x00\x03\x02\x00\x02"_q);
+		}
+		StartPermutationElement(); {
+			S("\x00\x23\x00\x00"_q);
+		}
+		StartPermutationElement(); {
+			S("\x00\x2b\x00\x07\x06"_q);
+			G(6);
+			S("\x03\x04\x03\x03"_q);
+		}
+		StartPermutationElement(); {
+			S("\x00\x2d\x00\x02\x01\x01"_q);
+		}
+		StartPermutationElement(); {
+			S("\x00\x33\x04\xef\x04\xed"_q);
+			G(4);
+			S("\x00\x01\x00\x11\xec\x04\xc0"_q);
+			M();
+			K();
+			S("\x00\x1d\x00\x20"_q);
+			K();
+		}
+		StartPermutationElement(); {
+			S("\x44\xcd\x00\x05\x00\x03\x02\x68\x32"_q);
+		}
+		StartPermutationElement(); {
+			S("\xfe\x0d"_q);
+			OpenScope();
+			S("\x00\x00\x01\x00\x01"_q);
+			R(1);
+			S("\x00\x20"_q);
+			K();
+			OpenScope();
+			E();
+			CloseScope();
+			CloseScope();
+		}
+		StartPermutationElement(); {
+			S("\xff\x01\x00\x01\x00"_q);
+		}
+	} ClosePermutation();
 	G(3);
-	S(qstr("\x00\x01\x00\x00\x15"));
+	S("\x00\x01\x00"_q);
+	P();
+	CloseScope();
+	CloseScope();
+	CloseScope();
 
 	return MTP_tlsClientHello(MTP_vector<MTPTlsBlock>(Finish()));
 }
@@ -134,93 +246,41 @@ using BigNumContext = openssl::Context;
 	return result;
 }
 
-// Returns y^2 = x^3 + 486662 * x^2 + x.
-[[nodiscard]] BigNum GenerateY2(
-		const BigNum &x,
-		const BigNum &mod,
-		const BigNumContext &context) {
-	auto coef = BigNum(486662);
-	auto y = BigNum::ModAdd(x, coef, mod, context);
-	y.setModMul(y, x, mod, context);
-	coef.setWord(1);
-	y.setModAdd(y, coef, mod, context);
-	return BigNum::ModMul(y, x, mod, context);
-}
-
-// Returns x_2 = (x^2 - 1)^2/(4*y^2).
-[[nodiscard]] BigNum GenerateX2(
-		const BigNum &x,
-		const BigNum &mod,
-		const BigNumContext &context) {
-	auto denominator = GenerateY2(x, mod, context);
-	auto coef = BigNum(4);
-	denominator.setModMul(denominator, coef, mod, context);
-
-	auto numerator = BigNum::ModMul(x, x, mod, context);
-	coef.setWord(1);
-	numerator.setModSub(numerator, coef, mod, context);
-	numerator.setModMul(numerator, numerator, mod, context);
-
-	denominator.setModInverse(denominator, mod, context);
-	return BigNum::ModMul(numerator, denominator, mod, context);
-}
-
 [[nodiscard]] bytes::vector GeneratePublicKey() {
-	const auto context = BigNumContext();
-	const char modBytes[] = ""
-		"\x7f\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff"
-		"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xed";
-	const char powBytes[] = ""
-		"\x3f\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff"
-		"\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xf6";
-	const auto mod = BigNum(bytes::make_span(modBytes).subspan(0, 32));
-	const auto pow = BigNum(bytes::make_span(powBytes).subspan(0, 32));
+	const auto context = EVP_PKEY_CTX_new_id(NID_X25519, nullptr);
+	if (!context) {
+		return {};
+	}
+	const auto guardContext = gsl::finally([&] {
+		EVP_PKEY_CTX_free(context);
+	});
 
-	auto x = BigNum();
-	do {
-		while (true) {
-			auto random = bytes::vector(32);
-			bytes::set_random(random);
-			random[31] &= bytes::type(0x7FU);
-			x.setBytes(random);
-			x.setModMul(x, x, mod, context);
+	if (EVP_PKEY_keygen_init(context) <= 0) {
+		return {};
+	}
 
-			auto y = GenerateY2(x, mod, context);
-			if (BigNum::ModExp(y, pow, mod, context).isOne()) {
-				break;
-			}
-		}
-		for (auto i = 0; i != 3; ++i) {
-			x = GenerateX2(x, mod, context);
-		}
-		const auto xBytes = x.getBytes();
-		Assert(!xBytes.empty());
-		Assert(xBytes.size() <= 32);
-	} while (x.bytesSize() == 32);
+	auto key = (EVP_PKEY*)nullptr;
+	if (EVP_PKEY_keygen(context, &key) <= 0) {
+		return {};
+	}
+	const auto guardKey = gsl::finally([&] {
+		EVP_PKEY_free(key);
+	});
 
-	const auto xBytes = x.getBytes();
-	auto result = bytes::vector(32, bytes::type());
-	bytes::copy(
-		bytes::make_span(result).subspan(32 - xBytes.size()),
-		xBytes);
-	ranges::reverse(result);
+	auto length = size_t(0);
+	if (!EVP_PKEY_get_raw_public_key(key, nullptr, &length)) {
+		return {};
+	}
+	Assert(length == 32);
 
-	//auto string = QString();
-	//string.reserve(64);
-	//for (const auto byte : result) {
-	//	const auto code = uchar(byte);
-	//	const auto hex = [](uchar value) -> char {
-	//		if (value >= 0 && value <= 9) {
-	//			return '0' + value;
-	//		} else if (value >= 10 && value <= 15) {
-	//			return 'a' + (value - 10);
-	//		}
-	//		return '-';
-	//	};
-	//	string.append(hex(code / 16)).append(hex(code % 16));
-	//}
-	//LOG(("KEY: %1").arg(string));
-
+	auto result = bytes::vector(length);
+	const auto code = EVP_PKEY_get_raw_public_key(
+		key,
+		reinterpret_cast<unsigned char *>(result.data()),
+		&length);
+	if (!code) {
+		return {};
+	}
 	return result;
 }
 
@@ -229,66 +289,83 @@ struct ClientHello {
 	QByteArray digest;
 };
 
-class ClientHelloGenerator {
+class Generator {
 public:
-	ClientHelloGenerator(
+	Generator(
 		const MTPTlsClientHello &rules,
 		bytes::const_span domain,
 		bytes::const_span key);
-	[[nodiscard]] ClientHello result();
+	[[nodiscard]] ClientHello take();
 
 private:
-	[[nodiscard]] bytes::span grow(int size);
-	void writeBlocks(const QVector<MTPTlsBlock> &blocks);
-	void writeBlock(const MTPTlsBlock &data);
-	void writeBlock(const MTPDtlsBlockString &data);
-	void writeBlock(const MTPDtlsBlockZero &data);
-	void writeBlock(const MTPDtlsBlockGrease &data);
-	void writeBlock(const MTPDtlsBlockRandom &data);
-	void writeBlock(const MTPDtlsBlockDomain &data);
-	void writeBlock(const MTPDtlsBlockPublicKey &data);
-	void writeBlock(const MTPDtlsBlockScope &data);
-	void writePadding();
-	void writeDigest();
-	void writeTimestamp();
+	class Part final {
+	public:
+		explicit Part(
+			bytes::const_span domain,
+			const bytes::vector &greases);
 
-	bytes::const_span _domain;
-	bytes::const_span _key;
+		[[nodiscard]] bytes::span grow(int size);
+		void writeBlocks(const QVector<MTPTlsBlock> &blocks);
+		void writeBlock(const MTPTlsBlock &data);
+		void writeBlock(const MTPDtlsBlockString &data);
+		void writeBlock(const MTPDtlsBlockZero &data);
+		void writeBlock(const MTPDtlsBlockGrease &data);
+		void writeBlock(const MTPDtlsBlockRandom &data);
+		void writeBlock(const MTPDtlsBlockDomain &data);
+		void writeBlock(const MTPDtlsBlockPublicKey &data);
+		void writeBlock(const MTPDtlsBlockScope &data);
+		void writeBlock(const MTPDtlsBlockPermutation &data);
+		void writeBlock(const MTPDtlsBlockM &data);
+		void writeBlock(const MTPDtlsBlockE &data);
+		void writeBlock(const MTPDtlsBlockPadding &data);
+		void finalize(bytes::const_span key);
+		[[nodiscard]] QByteArray extractDigest() const;
+
+		[[nodiscard]] bool error() const;
+		[[nodiscard]] QByteArray take();
+
+	private:
+		void writeDigest(bytes::const_span key);
+		void injectTimestamp();
+
+		bytes::const_span _domain;
+		const bytes::vector &_greases;
+		QByteArray _result;
+		const char *_data = nullptr;
+		int _digestPosition = -1;
+		bool _error = false;
+
+	};
+
 	bytes::vector _greases;
-	std::vector<int> _scopeStack;
-	QByteArray _result;
+	Part _result;
 	QByteArray _digest;
-	int _digestPosition = -1;
-	bool _error = false;
 
 };
 
-ClientHelloGenerator::ClientHelloGenerator(
-	const MTPTlsClientHello &rules,
+Generator::Part::Part(
 	bytes::const_span domain,
-	bytes::const_span key)
+	const bytes::vector &greases)
 : _domain(domain)
-, _key(key)
-, _greases(PrepareGreases()) {
-	_result.reserve(kClientHelloLength);
-	writeBlocks(rules.match([&](const MTPDtlsClientHello &data) {
-		return data.vblocks().v;
-	}));
-	writePadding();
-	writeDigest();
-	writeTimestamp();
+, _greases(greases) {
+	_result.reserve(kClientHelloLimit);
+	_data = _result.constData();
 }
 
-ClientHello ClientHelloGenerator::result() {
-	return {
-		_error ? QByteArray() : std::move(_result),
-		_error ? QByteArray() : std::move(_digest) };
+bool Generator::Part::error() const {
+	return _error;
 }
 
-bytes::span ClientHelloGenerator::grow(int size) {
+QByteArray Generator::Part::take() {
+	Expects(_error || _result.constData() == _data);
+
+	return _error ? QByteArray() : std::move(_result);
+}
+
+bytes::span Generator::Part::grow(int size) {
 	if (_error
 		|| size <= 0
-		|| _result.size() + size > kClientHelloLength) {
+		|| _result.size() + size > kClientHelloLimit) {
 		_error = true;
 		return bytes::span();
 	}
@@ -298,19 +375,19 @@ bytes::span ClientHelloGenerator::grow(int size) {
 	return bytes::make_detached_span(_result).subspan(offset);
 }
 
-void ClientHelloGenerator::writeBlocks(const QVector<MTPTlsBlock> &blocks) {
+void Generator::Part::writeBlocks(const QVector<MTPTlsBlock> &blocks) {
 	for (const auto &block : blocks) {
 		writeBlock(block);
 	}
 }
 
-void ClientHelloGenerator::writeBlock(const MTPTlsBlock &data) {
+void Generator::Part::writeBlock(const MTPTlsBlock &data) {
 	data.match([&](const auto &data) {
 		writeBlock(data);
 	});
 }
 
-void ClientHelloGenerator::writeBlock(const MTPDtlsBlockString &data) {
+void Generator::Part::writeBlock(const MTPDtlsBlockString &data) {
 	const auto &bytes = data.vdata().v;
 	const auto storage = grow(bytes.size());
 	if (storage.empty()) {
@@ -319,7 +396,7 @@ void ClientHelloGenerator::writeBlock(const MTPDtlsBlockString &data) {
 	bytes::copy(storage, bytes::make_span(bytes));
 }
 
-void ClientHelloGenerator::writeBlock(const MTPDtlsBlockZero &data) {
+void Generator::Part::writeBlock(const MTPDtlsBlockZero &data) {
 	const auto length = data.vlength().v;
 	const auto already = _result.size();
 	const auto storage = grow(length);
@@ -332,7 +409,7 @@ void ClientHelloGenerator::writeBlock(const MTPDtlsBlockZero &data) {
 	bytes::set_with_const(storage, bytes::type(0));
 }
 
-void ClientHelloGenerator::writeBlock(const MTPDtlsBlockGrease &data) {
+void Generator::Part::writeBlock(const MTPDtlsBlockGrease &data) {
 	const auto seed = data.vseed().v;
 	if (seed < 0 || seed >= _greases.size()) {
 		_error = true;
@@ -345,7 +422,7 @@ void ClientHelloGenerator::writeBlock(const MTPDtlsBlockGrease &data) {
 	bytes::set_with_const(storage, _greases[seed]);
 }
 
-void ClientHelloGenerator::writeBlock(const MTPDtlsBlockRandom &data) {
+void Generator::Part::writeBlock(const MTPDtlsBlockRandom &data) {
 	const auto length = data.vlength().v;
 	const auto storage = grow(length);
 	if (storage.empty()) {
@@ -354,7 +431,7 @@ void ClientHelloGenerator::writeBlock(const MTPDtlsBlockRandom &data) {
 	bytes::set_random(storage);
 }
 
-void ClientHelloGenerator::writeBlock(const MTPDtlsBlockDomain &data) {
+void Generator::Part::writeBlock(const MTPDtlsBlockDomain &data) {
 	const auto storage = grow(_domain.size());
 	if (storage.empty()) {
 		return;
@@ -362,7 +439,7 @@ void ClientHelloGenerator::writeBlock(const MTPDtlsBlockDomain &data) {
 	bytes::copy(storage, _domain);
 }
 
-void ClientHelloGenerator::writeBlock(const MTPDtlsBlockPublicKey &data) {
+void Generator::Part::writeBlock(const MTPDtlsBlockPublicKey &data) {
 	const auto key = GeneratePublicKey();
 	const auto storage = grow(key.size());
 	if (storage.empty()) {
@@ -371,7 +448,7 @@ void ClientHelloGenerator::writeBlock(const MTPDtlsBlockPublicKey &data) {
 	bytes::copy(storage, key);
 }
 
-void ClientHelloGenerator::writeBlock(const MTPDtlsBlockScope &data) {
+void Generator::Part::writeBlock(const MTPDtlsBlockScope &data) {
 	const auto storage = grow(kLengthSize);
 	if (storage.empty()) {
 		return;
@@ -382,27 +459,96 @@ void ClientHelloGenerator::writeBlock(const MTPDtlsBlockScope &data) {
 	bytes::copy(storage, bytes::object_as_span(&length));
 }
 
-void ClientHelloGenerator::writePadding() {
-	const auto padding = kClientHelloLength - kLengthSize - _result.size();
-	writeBlock(MTP_tlsBlockScope(
-		MTP_vector<MTPTlsBlock>(1, MTP_tlsBlockZero(MTP_int(padding)))));
+void Generator::Part::writeBlock(const MTPDtlsBlockPermutation &data) {
+	auto list = std::vector<QByteArray>();
+	list.reserve(data.ventries().v.size());
+	for (const auto &inner : data.ventries().v) {
+		auto part = Part(_domain, _greases);
+		part.writeBlocks(inner.v);
+		if (part.error()) {
+			_error = true;
+			return;
+		}
+		list.push_back(part.take());
+	}
+	ranges::shuffle(list);
+	for (const auto &element : list) {
+		const auto storage = grow(element.size());
+		if (storage.empty()) {
+			return;
+		}
+		bytes::copy(storage, bytes::make_span(element));
+	}
 }
 
-void ClientHelloGenerator::writeDigest() {
-	if (_digestPosition < 0) {
+void Generator::Part::writeBlock(const MTPDtlsBlockM &data) {
+	constexpr auto kElements = 384;
+	constexpr auto kAdded = 32;
+
+	const auto storage = grow(kElements * 3 + kAdded);
+	if (storage.empty()) {
+		return;
+	}
+
+	auto random = bytes::vector(kElements * 8 + kAdded);
+	bytes::set_random(random);
+
+	auto chars = reinterpret_cast<char*>(storage.data());
+	for (auto i = 0; i < kElements; ++i) {
+		const auto pair = random.data() + i * 2 * sizeof(uint32);
+		const auto a = int(qFromUnaligned<uint32>(pair) % 3329);
+		const auto b = int(qFromUnaligned<uint32>(pair + sizeof(uint32)) % 3329);
+		*chars++ = (char)(a & 255);
+		*chars++ = (char)((a >> 8) + ((b & 15) << 4));
+		*chars++ = (char)(b >> 4);
+	}
+	bytes::set_random(storage.subspan(kElements * 3));
+}
+
+void Generator::Part::writeBlock(const MTPDtlsBlockE &data) {
+	const auto lengths = std::array{ 144, 176, 208, 240 };
+	const auto length = lengths[base::RandomIndex(lengths.size())];
+	writeBlock(MTP_tlsBlockRandom(MTP_int(length)));
+}
+
+void Generator::Part::writeBlock(const MTPDtlsBlockPadding &data) {
+	const auto length = int(_result.size());
+	if (length < 513) {
+		const auto zero = MTP_tlsBlockZero(MTP_int(513 - length));
+		writeBlock(MTP_tlsBlockString(MTP_bytes("\x00\x15"_q)));
+		writeBlock(MTP_tlsBlockScope(MTP_vector<MTPTlsBlock>(1, zero)));
+	}
+}
+
+void Generator::Part::finalize(bytes::const_span key) {
+	if (_error) {
+		return;
+	} else if (_digestPosition < 0) {
 		_error = true;
 		return;
 	}
+	writeDigest(key);
+	injectTimestamp();
+}
+
+QByteArray Generator::Part::extractDigest() const {
+	if (_digestPosition < 0) {
+		return {};
+	}
+	return _result.mid(_digestPosition, kHelloDigestLength);
+}
+
+void Generator::Part::writeDigest(bytes::const_span key) {
+	Expects(_digestPosition >= 0);
+
 	bytes::copy(
 		bytes::make_detached_span(_result).subspan(_digestPosition),
-		openssl::HmacSha256(_key, bytes::make_span(_result)));
+		openssl::HmacSha256(key, bytes::make_span(_result)));
 }
 
-void ClientHelloGenerator::writeTimestamp() {
-	if (_digestPosition < 0) {
-		_error = true;
-		return;
-	}
+void Generator::Part::injectTimestamp() {
+	Expects(_digestPosition >= 0);
+
 	const auto storage = bytes::make_detached_span(_result).subspan(
 		_digestPosition + kHelloDigestLength - sizeof(int32),
 		sizeof(int32));
@@ -410,20 +556,28 @@ void ClientHelloGenerator::writeTimestamp() {
 	bytes::copy(bytes::object_as_span(&already), storage);
 	already ^= qToLittleEndian(int32(base::unixtime::http_now()));
 	bytes::copy(storage, bytes::object_as_span(&already));
+}
 
-	_digest = QByteArray(kHelloDigestLength, Qt::Uninitialized);
-	bytes::copy(
-		bytes::make_detached_span(_digest),
-		bytes::make_detached_span(_result).subspan(
-			_digestPosition,
-			kHelloDigestLength));
+Generator::Generator(
+	const MTPTlsClientHello &rules,
+	bytes::const_span domain,
+	bytes::const_span key)
+: _greases(PrepareGreases())
+, _result(domain, _greases) {
+	_result.writeBlocks(rules.data().vblocks().v);
+	_result.finalize(key);
+}
+
+ClientHello Generator::take() {
+	auto digest = _result.extractDigest();
+	return { _result.take(), std::move(digest) };
 }
 
 [[nodiscard]] ClientHello PrepareClientHello(
 		const MTPTlsClientHello &rules,
 		bytes::const_span domain,
 		bytes::const_span key) {
-	return ClientHelloGenerator(rules, domain, key).result();
+	return Generator(rules, domain, key).take();
 }
 
 [[nodiscard]] bool CheckPart(bytes::const_span data, QLatin1String check) {
@@ -437,8 +591,7 @@ void ClientHelloGenerator::writeTimestamp() {
 
 [[nodiscard]] int ReadPartLength(bytes::const_span data, int offset) {
 	const auto storage = data.subspan(offset, kLengthSize);
-	return qFromBigEndian(
-		*reinterpret_cast<const uint16*>(storage.data()));
+	return qFromBigEndian<uint16>(storage.data());
 }
 
 } // namespace
@@ -482,7 +635,7 @@ TlsSocket::TlsSocket(
 		wrap([=] { plainReadyRead(); }));
 	connect(
 		&_socket,
-		base::QTcpSocket_error,
+		&QAbstractSocket::errorOccurred,
 		wrap([=](Error e) { handleError(e); }));
 }
 
@@ -505,7 +658,7 @@ void TlsSocket::plainConnected() {
 		domainFromSecret(),
 		keyFromSecret());
 	if (hello.data.isEmpty()) {
-		LOG(("TLS Error: Could not generate Client Hello!"));
+		logError(888, "Could not generate Client Hello.");
 		_state = State::Error;
 		_error.fire({});
 	} else {
@@ -558,12 +711,17 @@ void TlsSocket::checkHelloParts12(int parts1Size) {
 		+ part2Size
 		+ kServerHelloPart3.size()
 		+ kLengthSize;
+	if (parts123Size > kMaxServerHelloLength) {
+		logError(888, "Bad Server Hello size.");
+		handleError();
+		return;
+	}
 	if (_serverHelloLength == parts1Size) {
 		const auto part1Offset = parts1Size
 			- kLengthSize
 			- kServerHelloPart1.size();
 		if (!CheckPart(data.subspan(part1Offset), kServerHelloPart1)) {
-			LOG(("TLS Error: Bad Server Hello part1."));
+			logError(888, "Bad Server Hello part1.");
 			handleError();
 			return;
 		}
@@ -582,12 +740,17 @@ void TlsSocket::checkHelloParts34(int parts123Size) {
 		parts123Size);
 	const auto part4Size = ReadPartLength(data, parts123Size - kLengthSize);
 	const auto full = parts123Size + part4Size;
+	if (full > kMaxServerHelloLength) {
+		logError(888, "Bad Server Hello size.");
+		handleError();
+		return;
+	}
 	if (_serverHelloLength == parts123Size) {
 		const auto part3Offset = parts123Size
 			- kLengthSize
 			- kServerHelloPart3.size();
 		if (!CheckPart(data.subspan(part3Offset), kServerHelloPart3)) {
-			LOG(("TLS Error: Bad Server Hello part."));
+			logError(888, "Bad Server Hello part.");
 			handleError();
 			return;
 		}
@@ -601,6 +764,11 @@ void TlsSocket::checkHelloParts34(int parts123Size) {
 }
 
 void TlsSocket::checkHelloDigest() {
+	if (_serverHelloLength < kServerHelloDigestPosition + kHelloDigestLength) {
+		logError(888, "Bad Server Hello size.");
+		handleError();
+		return;
+	}
 	const auto fulldata = bytes::make_detached_span(_incoming).subspan(
 		0,
 		kHelloDigestLength + _serverHelloLength);
@@ -611,7 +779,7 @@ void TlsSocket::checkHelloDigest() {
 	bytes::set_with_const(digest, bytes::type(0));
 	const auto check = openssl::HmacSha256(keyFromSecret(), fulldata);
 	if (bytes::compare(digestCopy, check) != 0) {
-		LOG(("TLS Error: Bad Server Hello digest."));
+		logError(888, "Bad Server Hello digest.");
 		handleError();
 		return;
 	}
@@ -649,7 +817,7 @@ bool TlsSocket::checkNextPacket() {
 			return true;
 		}
 		if (!CheckPart(incoming.subspan(offset), kServerHeader)) {
-			LOG(("TLS Error: Bad packet header."));
+			logError(888, "Bad packet header.");
 			return false;
 		}
 		const auto length = ReadPartLength(
@@ -710,7 +878,7 @@ int64 TlsSocket::read(bytes::span buffer) {
 	while (_incomingGoodDataLimit) {
 		const auto available = std::min(
 			_incomingGoodDataLimit,
-			_incoming.size() - _incomingGoodDataOffset);
+			int(_incoming.size()) - _incomingGoodDataOffset);
 		if (available <= 0) {
 			return written;
 		}
@@ -773,12 +941,16 @@ int32 TlsSocket::debugState() {
 	return _socket.state();
 }
 
+QString TlsSocket::debugPostfix() const {
+	return u"_ee"_q;
+}
+
 void TlsSocket::handleError(int errorCode) {
 	if (_state != State::Connected) {
 		_syncTimeRequests.fire({});
 	}
 	if (errorCode) {
-		TcpSocket::LogError(errorCode, _socket.errorString());
+		logError(errorCode, _socket.errorString());
 	}
 	_state = State::Error;
 	_error.fire({});

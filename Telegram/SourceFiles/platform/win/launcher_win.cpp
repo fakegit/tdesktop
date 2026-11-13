@@ -9,15 +9,117 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 #include "core/crash_reports.h"
 #include "core/update_checker.h"
-#include "base/platform/win/base_windows_h.h"
 
+#include <windows.h>
 #include <shellapi.h>
 #include <VersionHelpers.h>
 
+#include <crtdbg.h>
+#include <cstdlib>
+
 namespace Platform {
+namespace {
+
+// Turn a CRT/STL assertion (or pure-virtual / invalid-parameter) into a real,
+// crash-reported failure instead of a modal Abort/Retry/Ignore dialog that
+// would block a headless test agent forever.
+[[noreturn]] void TestAgentReportCrash(
+		const char *kind,
+		const QString &message) {
+	if (!message.isEmpty()) {
+		CrashReports::SetAnnotation("CrtAssert", message);
+	}
+	// Be loud on stderr too (captured when the launch redirects it to a file).
+	fprintf(stderr,
+		"\n[testagent] %s: %s\n",
+		kind,
+		message.toLocal8Bit().constData());
+	fflush(stderr);
+
+	// Crashes with an access violation -> caught by the crash reporter, dumped
+	// to tdata/working + tdata/dumps, and the process exits non-zero. No dialog.
+	Unexpected("Test agent: CRT/STL assertion violation.");
+}
+
+#ifdef _DEBUG
+int TestAgentReportHook(int reportType, char *message, int *returnValue) {
+	if (returnValue) {
+		*returnValue = 0; // Do not break into the (absent) debugger.
+	}
+	if (reportType == _CRT_ASSERT || reportType == _CRT_ERROR) {
+		TestAgentReportCrash(
+			"assert",
+			QString::fromLocal8Bit(message ? message : ""));
+	} else if (message) {
+		fputs(message, stderr);
+		fflush(stderr);
+	}
+	return TRUE; // Handled -> suppress the default message box.
+}
+
+int TestAgentReportHookW(int reportType, wchar_t *message, int *returnValue) {
+	if (returnValue) {
+		*returnValue = 0;
+	}
+	if (reportType == _CRT_ASSERT || reportType == _CRT_ERROR) {
+		TestAgentReportCrash(
+			"assert",
+			QString::fromWCharArray(message ? message : L""));
+	} else if (message) {
+		fputws(message, stderr);
+		fflush(stderr);
+	}
+	return TRUE;
+}
+#endif // _DEBUG
+
+void InstallTestAgentCrashHandling() {
+	// No Windows Error Reporting / general-protection / abort() message boxes —
+	// each would block the test agent waiting on a button it cannot press.
+	SetErrorMode(SEM_FAILCRITICALERRORS
+		| SEM_NOGPFAULTERRORBOX
+		| SEM_NOOPENFILEERRORBOX);
+	_set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+
+	// Pure-virtual call / invalid CRT parameter -> reported crash, not a dialog.
+	_set_purecall_handler([] {
+		TestAgentReportCrash("purecall", u"Pure virtual function call"_q);
+	});
+	_set_invalid_parameter_handler([](
+			const wchar_t *expression,
+			const wchar_t *,
+			const wchar_t *,
+			unsigned int,
+			uintptr_t) {
+		TestAgentReportCrash(
+			"invalid-parameter",
+			QString::fromWCharArray(
+				expression ? expression : L"CRT invalid parameter"));
+	});
+
+#ifdef _DEBUG
+	// assert()/_ASSERTE and STL bounds/iterator checks (_STL_VERIFY) report via
+	// _CrtDbgReport[W]; route them to stderr (never a window) and convert any
+	// assertion into a reported crash through the hooks above.
+	for (const auto type : { _CRT_WARN, _CRT_ERROR, _CRT_ASSERT }) {
+		_CrtSetReportMode(type, _CRTDBG_MODE_FILE);
+		_CrtSetReportFile(type, _CRTDBG_FILE_STDERR);
+	}
+	_CrtSetReportHook2(_CRT_RPTHOOK_INSTALL, TestAgentReportHook);
+	_CrtSetReportHookW2(_CRT_RPTHOOK_INSTALL, TestAgentReportHookW);
+#endif // _DEBUG
+}
+
+} // namespace
 
 Launcher::Launcher(int argc, char *argv[])
 : Core::Launcher(argc, argv) {
+}
+
+void Launcher::initHook() {
+	if (cTestAgent()) {
+		InstallTestAgentCrashHandling();
+	}
 }
 
 std::optional<QStringList> Launcher::readArgumentsHook(
@@ -46,50 +148,64 @@ bool Launcher::launchUpdater(UpdaterLaunch action) {
 	const auto operation = (action == UpdaterLaunch::JustRelaunch)
 		? QString()
 		: (cWriteProtected()
-			? qsl("runas")
+			? u"runas"_q
 			: QString());
 	const auto binaryPath = (action == UpdaterLaunch::JustRelaunch)
 		? (cExeDir() + cExeName())
 		: (cWriteProtected()
-			? (cWorkingDir() + qsl("tupdates/temp/Updater.exe"))
-			: (cExeDir() + qsl("Updater.exe")));
+			? (cWorkingDir() + u"tupdates/temp/Updater.exe"_q)
+			: (cExeDir() + u"Updater.exe"_q));
 
 	auto argumentsList = QStringList();
 	const auto pushArgument = [&](const QString &argument) {
 		argumentsList.push_back(argument.trimmed());
 	};
 	if (cLaunchMode() == LaunchModeAutoStart) {
-		pushArgument(qsl("-autostart"));
+		pushArgument(u"-autostart"_q);
 	}
 	if (Logs::DebugEnabled()) {
-		pushArgument(qsl("-debug"));
+		pushArgument(u"-debug"_q);
 	}
 	if (cStartInTray()) {
-		pushArgument(qsl("-startintray"));
-	}
-	if (cUseFreeType()) {
-		pushArgument(qsl("-freetype"));
+		pushArgument(u"-startintray"_q);
 	}
 	if (customWorkingDir()) {
-		pushArgument(qsl("-workdir"));
+		pushArgument(u"-workdir"_q);
 		pushArgument('"' + cWorkingDir() + '"');
 	}
-	if (cDataFile() != qsl("data")) {
-		pushArgument(qsl("-key"));
+	if (cDataFile() != u"data"_q) {
+		pushArgument(u"-key"_q);
 		pushArgument('"' + cDataFile() + '"');
 	}
 
 	if (action == UpdaterLaunch::JustRelaunch) {
-		pushArgument(qsl("-noupdate"));
+		pushArgument(u"-noupdate"_q);
 		if (cRestartingToSettings()) {
-			pushArgument(qsl("-tosettings"));
+			pushArgument(u"-tosettings"_q);
 		}
 	} else {
-		pushArgument(qsl("-update"));
-		pushArgument(qsl("-exename"));
+		pushArgument(u"-update"_q);
+		auto created = FILETIME();
+		auto exited = FILETIME();
+		auto kernel = FILETIME();
+		auto user = FILETIME();
+		if (GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) {
+			// WHY: Application and storage destruction precede this call, so
+			// the updater can terminate us if remaining process teardown hangs.
+			const auto creationTime = (quint64(created.dwHighDateTime) << 32)
+				| created.dwLowDateTime;
+			pushArgument(u"-finishprocess"_q);
+			pushArgument(QString::number(GetCurrentProcessId()));
+			pushArgument(QString::number(creationTime));
+		} else {
+			const auto error = GetLastError();
+			LOG(("Update Error: could not query process creation time: %1"
+				).arg(error));
+		}
+		pushArgument(u"-exename"_q);
 		pushArgument('"' + cExeName() + '"');
 		if (cWriteProtected()) {
-			pushArgument(qsl("-writeprotected"));
+			pushArgument(u"-writeprotected"_q);
 			pushArgument('"' + cExeDir() + '"');
 		}
 	}

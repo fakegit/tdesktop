@@ -22,7 +22,13 @@ class Controller;
 
 namespace Data {
 
+struct UniqueGift;
 class DocumentMedia;
+
+enum class CloudThemeType {
+	Dark,
+	Light,
+};
 
 struct CloudTheme {
 	uint64 id = 0;
@@ -32,12 +38,17 @@ struct CloudTheme {
 	DocumentId documentId = 0;
 	UserId createdBy = 0;
 	int usersCount = 0;
+	QString emoticon;
+	std::shared_ptr<UniqueGift> unique;
 
-	std::optional<WallPaper> paper;
-	std::optional<QColor> accentColor;
-	std::optional<QColor> outgoingAccentColor;
-	std::vector<QColor> outgoingMessagesColors;
-	bool basedOnDark = false;
+	using Type = CloudThemeType;
+	struct Settings {
+		std::optional<WallPaper> paper;
+		QColor accentColor;
+		std::optional<QColor> outgoingAccentColor;
+		std::vector<QColor> outgoingMessagesColors;
+	};
+	base::flat_map<Type, Settings> settings;
 
 	static CloudTheme Parse(
 		not_null<Main::Session*> session,
@@ -45,14 +56,12 @@ struct CloudTheme {
 		bool parseSettings = false);
 	static CloudTheme Parse(
 		not_null<Main::Session*> session,
+		const MTPDchatThemeUniqueGift &data,
+		bool parseSettings = false);
+	static CloudTheme Parse(
+		not_null<Main::Session*> session,
 		const MTPTheme &data,
 		bool parseSettings = false);
-};
-
-struct ChatTheme {
-	QString emoji;
-	CloudTheme light;
-	CloudTheme dark;
 };
 
 class CloudThemes final {
@@ -68,18 +77,27 @@ public:
 	void remove(uint64 cloudThemeId);
 
 	void refreshChatThemes();
-	[[nodiscard]] const std::vector<ChatTheme> &chatThemes() const;
+	[[nodiscard]] const std::vector<CloudTheme> &chatThemes() const;
 	[[nodiscard]] rpl::producer<> chatThemesUpdated() const;
-	[[nodiscard]] std::optional<ChatTheme> themeForEmoji(
-		const QString &emoji) const;
-	[[nodiscard]] rpl::producer<std::optional<ChatTheme>> themeForEmojiValue(
-		const QString &emoji);
+
+	void myGiftThemesLoadMore(bool reload = false);
+	[[nodiscard]] const std::vector<QString> &myGiftThemesTokens() const;
+	[[nodiscard]] rpl::producer<> myGiftThemesUpdated() const;
+	[[nodiscard]] QString processGiftThemeGetToken(
+		const MTPDchatThemeUniqueGift &data);
+	[[nodiscard]] bool myGiftThemesReady() const;
+
+	void refreshChatThemesFor(const QString &token);
+	[[nodiscard]] std::optional<CloudTheme> themeForToken(
+		const QString &token) const;
+	[[nodiscard]] auto themeForTokenValue(const QString &token)
+		-> rpl::producer<std::optional<CloudTheme>>;
 
 	[[nodiscard]] static bool TestingColors();
 	static void SetTestingColors(bool testing);
-	[[nodiscard]] static QString PrepareTestingLink(const CloudTheme &theme);
+	[[nodiscard]] QString prepareTestingLink(const CloudTheme &theme) const;
 	[[nodiscard]] std::optional<CloudTheme> updateThemeFromLink(
-		const QString &emoji,
+		const QString &emoticon,
 		const QMap<QString, QString> &params);
 
 	void applyUpdate(const MTPTheme &theme);
@@ -107,6 +125,7 @@ private:
 
 	void parseThemes(const QVector<MTPTheme> &list);
 	void checkCurrentTheme();
+	void checkAppliedChatTheme();
 
 	void install();
 	void setupReload();
@@ -123,7 +142,7 @@ private:
 		Fn<void(std::shared_ptr<Data::DocumentMedia>)> callback);
 	void invokeForLoaded(LoadingDocument &value);
 
-	void parseChatThemes(const QVector<MTPChatTheme> &list);
+	void parseChatThemes(const QVector<MTPTheme> &list);
 
 	const not_null<Main::Session*> _session;
 	uint64 _hash = 0;
@@ -132,10 +151,18 @@ private:
 	std::vector<CloudTheme> _list;
 	rpl::event_stream<> _updates;
 
-	int32 _chatThemesHash = 0;
+	uint64 _chatThemesHash = 0;
 	mtpRequestId _chatThemesRequestId = 0;
-	std::vector<ChatTheme> _chatThemes;
+	std::vector<CloudTheme> _chatThemes;
 	rpl::event_stream<> _chatThemesUpdates;
+
+	mtpRequestId _myGiftThemesRequestId = 0;
+	base::flat_map<uint64, CloudTheme> _giftThemes;
+	std::vector<QString> _myGiftThemesTokens;
+	rpl::event_stream<> _myGiftThemesUpdates;
+	uint64 _myGiftThemesHash = 0;
+	QString _myGiftThemesNextOffset;
+	bool _myGiftThemesLoaded = false;
 
 	base::Timer _reloadCurrentTimer;
 	LoadingDocument _updatingFrom;

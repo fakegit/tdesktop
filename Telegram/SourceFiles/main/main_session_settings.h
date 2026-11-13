@@ -8,6 +8,9 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #pragma once
 
 #include "data/data_auto_download.h"
+#include "data/notify/data_peer_notify_settings.h"
+#include "data/data_authorization.h"
+#include "data/data_message_reaction_id.h"
 #include "ui/rect_part.h"
 
 namespace Support {
@@ -18,6 +21,10 @@ namespace ChatHelpers {
 enum class SelectorTab;
 } // namespace ChatHelpers
 
+namespace Data {
+enum class SetupEmailState;
+} // namespace Data
+
 namespace Main {
 
 class SessionSettings final {
@@ -25,7 +32,7 @@ public:
 	SessionSettings();
 
 	[[nodiscard]] QByteArray serialize() const;
-	void addFromSerialized(const QByteArray &serialized);
+	void addFromSerialized(const QByteArray &serialized, int writerVersion);
 
 	void setSupportSwitch(Support::SwitchSettings value) {
 		_supportSwitch = value;
@@ -75,8 +82,15 @@ public:
 		_groupStickersSectionHidden.remove(peerId);
 	}
 
-	void setMediaLastPlaybackPosition(DocumentId id, crl::time time);
-	[[nodiscard]] crl::time mediaLastPlaybackPosition(DocumentId id) const;
+	void setGroupEmojiSectionHidden(PeerId peerId) {
+		_groupEmojiSectionHidden.insert(peerId);
+	}
+	[[nodiscard]] bool isGroupEmojiSectionHidden(PeerId peerId) const {
+		return _groupEmojiSectionHidden.contains(peerId);
+	}
+	void removeGroupEmojiSectionHidden(PeerId peerId) {
+		_groupEmojiSectionHidden.remove(peerId);
+	}
 
 	[[nodiscard]] Data::AutoDownload::Full &autoDownload() {
 		return _autoDownload;
@@ -93,25 +107,22 @@ public:
 	[[nodiscard]] bool archiveInMainMenu() const;
 	[[nodiscard]] rpl::producer<bool> archiveInMainMenuChanges() const;
 
-	void setSkipArchiveInSearch(bool skip);
-	[[nodiscard]] bool skipArchiveInSearch() const;
-	[[nodiscard]] rpl::producer<bool> skipArchiveInSearchChanges() const;
-
 	[[nodiscard]] bool hadLegacyCallsPeerToPeerNobody() const {
 		return _hadLegacyCallsPeerToPeerNobody;
 	}
 
-	[[nodiscard]] MsgId hiddenPinnedMessageId(PeerId peerId) const {
-		const auto i = _hiddenPinnedMessages.find(peerId);
-		return (i != end(_hiddenPinnedMessages)) ? i->second : 0;
-	}
-	void setHiddenPinnedMessageId(PeerId peerId, MsgId msgId) {
-		if (msgId) {
-			_hiddenPinnedMessages[peerId] = msgId;
-		} else {
-			_hiddenPinnedMessages.remove(peerId);
-		}
-	}
+	[[nodiscard]] MsgId hiddenPinnedMessageId(
+		PeerId peerId,
+		MsgId topicRootId = 0,
+		PeerId monoforumPeerId = 0) const;
+	void setHiddenPinnedMessageId(
+		PeerId peerId,
+		MsgId topicRootId,
+		PeerId monoforumPeerId,
+		MsgId msgId);
+
+	[[nodiscard]] qint32 subsectionTabsMode(PeerId peerId) const;
+	void setSubsectionTabsMode(PeerId peerId, qint32 mode);
 
 	[[nodiscard]] bool dialogsFiltersEnabled() const {
 		return _dialogsFiltersEnabled;
@@ -123,21 +134,108 @@ public:
 	[[nodiscard]] bool photoEditorHintShown() const;
 	void incrementPhotoEditorHintShown();
 
+	[[nodiscard]] bool shouldShowDisableSharingBox() const;
+	void incrementDisableSharingBoxShown();
+	void resetDisableSharingBoxShown();
+
+	[[nodiscard]] bool shouldShowStashHint() const;
+	void incrementStashHintShown();
+	void markStashHintUsed();
+
+	[[nodiscard]] std::vector<TimeId> mutePeriods() const;
+	void addMutePeriod(TimeId period);
+
+	[[nodiscard]] TimeId lastNonPremiumLimitDownload() const {
+		return _lastNonPremiumLimitDownload;
+	}
+	[[nodiscard]] TimeId lastNonPremiumLimitUpload() const {
+		return _lastNonPremiumLimitUpload;
+	}
+	void setLastNonPremiumLimitDownload(TimeId when) {
+		_lastNonPremiumLimitDownload = when;
+	}
+	void setLastNonPremiumLimitUpload(TimeId when) {
+		_lastNonPremiumLimitUpload = when;
+	}
+	void setRingtoneVolume(
+		Data::DefaultNotify defaultNotify,
+		ushort volume);
+	[[nodiscard]] ushort ringtoneVolume(
+		Data::DefaultNotify defaultNotify) const;
+	void setRingtoneVolume(
+		PeerId peerId,
+		MsgId topicRootId,
+		PeerId monoforumPeerId,
+		ushort volume);
+	[[nodiscard]] ushort ringtoneVolume(
+		PeerId peerId,
+		MsgId topicRootId,
+		PeerId monoforumPeerId) const;
+
+	void markTranscriptionAsRated(uint64 transcriptionId);
+	[[nodiscard]] bool isTranscriptionRated(uint64 transcriptionId) const;
+
+	void setUnreviewed(std::vector<Data::UnreviewedAuth> auths);
+	[[nodiscard]] const std::vector<Data::UnreviewedAuth> &unreviewed() const;
+
+	void setSetupEmailState(Data::SetupEmailState state);
+	[[nodiscard]] Data::SetupEmailState setupEmailState() const;
+
+	void setModerateCommonGroups(std::vector<int32> groups) {
+		_moderateCommonGroups = std::move(groups);
+	}
+	[[nodiscard]] const std::vector<int32> &moderateCommonGroups() const {
+		return _moderateCommonGroups;
+	}
+
+	void setPhoneNumberHidden(bool hidden) {
+		_phoneNumberHidden = hidden;
+	}
+	[[nodiscard]] bool phoneNumberHidden() const {
+		return _phoneNumberHidden.current();
+	}
+	[[nodiscard]] rpl::producer<bool> phoneNumberHiddenValue() const {
+		return _phoneNumberHidden.value();
+	}
+
+	void setExtraFavoriteReactions(std::vector<Data::ReactionId> list);
+	[[nodiscard]] auto extraFavoriteReactions() const
+	-> const std::vector<Data::ReactionId> &;
+
 private:
 	static constexpr auto kDefaultSupportChatsLimitSlice = 7 * 24 * 60 * 60;
 	static constexpr auto kPhotoEditorHintMaxShowsCount = 5;
+	static constexpr auto kDisableSharingBoxMaxShowsCount = 3;
+	static constexpr auto kStashHintMaxShowsCount = 2;
+
+	struct ThreadId {
+		PeerId peerId;
+		MsgId topicRootId;
+		PeerId monoforumPeerId;
+
+		friend inline constexpr auto operator<=>(
+			ThreadId,
+			ThreadId) = default;
+	};
 
 	ChatHelpers::SelectorTab _selectorTab; // per-window
 	base::flat_set<PeerId> _groupStickersSectionHidden;
+	base::flat_set<PeerId> _groupEmojiSectionHidden;
 	bool _hadLegacyCallsPeerToPeerNobody = false;
 	Data::AutoDownload::Full _autoDownload;
 	rpl::variable<bool> _archiveCollapsed = false;
 	rpl::variable<bool> _archiveInMainMenu = false;
-	rpl::variable<bool> _skipArchiveInSearch = false;
-	std::vector<std::pair<DocumentId, crl::time>> _mediaLastPlaybackPosition;
-	base::flat_map<PeerId, MsgId> _hiddenPinnedMessages;
+	base::flat_map<ThreadId, MsgId> _hiddenPinnedMessages;
+	base::flat_map<PeerId, qint32> _subsectionTabsModes;
+	base::flat_map<Data::DefaultNotify, ushort> _ringtoneDefaultVolumes;
+	base::flat_map<ThreadId, ushort> _ringtoneVolumes;
 	bool _dialogsFiltersEnabled = false;
 	int _photoEditorHintShowsCount = 0;
+	int _disableSharingBoxShowsCount = 0;
+	int _stashHintShowsCount = 0;
+	std::vector<TimeId> _mutePeriods;
+	TimeId _lastNonPremiumLimitDownload = 0;
+	TimeId _lastNonPremiumLimitUpload = 0;
 
 	Support::SwitchSettings _supportSwitch;
 	bool _supportFixChatsOrder = true;
@@ -146,6 +244,18 @@ private:
 	rpl::variable<int> _supportChatsTimeSlice
 		= kDefaultSupportChatsLimitSlice;
 	rpl::variable<bool> _supportAllSearchResults = false;
+
+	base::flat_set<uint64> _ratedTranscriptions;
+
+	std::vector<Data::UnreviewedAuth> _unreviewed;
+
+	Data::SetupEmailState _setupEmailState;
+
+	std::vector<int32> _moderateCommonGroups;
+
+	rpl::variable<bool> _phoneNumberHidden = false;
+
+	std::vector<Data::ReactionId> _extraFavoriteReactions;
 
 };
 

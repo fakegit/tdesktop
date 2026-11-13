@@ -33,6 +33,7 @@ public:
 
 	// Called from the main thread.
 	void setSpeed(float64 speed);
+	void setVolume(float64 volume);
 	[[nodiscard]] rpl::producer<> waitingForData() const;
 
 	// Called from the main thread.
@@ -79,7 +80,7 @@ private:
 	crl::time _startedPosition = kTimeUnknown;
 
 	// Accessed from the main thread.
-	base::Subscription _subscription;
+	rpl::lifetime _subscription;
 	rpl::event_stream<> _waitingForData;
 	// First set from the same unspecified thread before _ready is called.
 	// After that accessed from the main thread.

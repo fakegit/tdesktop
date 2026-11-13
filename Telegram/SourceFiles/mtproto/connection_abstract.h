@@ -13,6 +13,9 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 #include <QtCore/QObject>
 #include <QtCore/QThread>
+#include <QtCore/QtEndian>
+
+#include <deque>
 
 namespace MTP {
 
@@ -23,6 +26,8 @@ namespace details {
 struct ConnectionOptions;
 
 class AbstractConnection;
+
+inline constexpr auto kTestModeDcIdShift = 10000;
 
 class ConnectionPointer {
 public:
@@ -122,6 +127,13 @@ public:
 	[[nodiscard]] gsl::span<const mtpPrime> parseNotSecureResponse(
 		const mtpBuffer &buffer) const;
 
+	[[nodiscard]] static QString ProtocolDcDebugId(int16 protocolDcId);
+	[[nodiscard]] QString debugId() const {
+		return _debugId;
+	}
+	void logInfo(const QString &message);
+	void logError(const QString &message);
+
 	// Used to emit error(...) with no real code from the server.
 	static constexpr auto kErrorCodeOther = -499;
 
@@ -140,6 +152,8 @@ protected:
 	BuffersQueue _receivedQueue; // list of received packets, not processed yet
 	int _pingTime = 0;
 	ProxyData _proxy;
+
+	QString _debugId;
 
 	// first we always send fake MTPReq_pq to see if connection works at all
 	// we send them simultaneously through TCP/HTTP/IPv4/IPv6 to choose the working one
@@ -176,7 +190,7 @@ mtpBuffer AbstractConnection::prepareNotSecurePacket(
 	result.resize(kPrefixInts);
 
 	const auto messageId = &result[kTcpPrefixInts + kAuthKeyIdInts];
-	*reinterpret_cast<mtpMsgId*>(messageId) = newId;
+	qToUnaligned(newId, messageId);
 
 	request.write(result);
 
@@ -192,6 +206,9 @@ mtpBuffer AbstractConnection::prepareNotSecurePacket(
 
 	return result;
 }
+
+#define CONNECTION_LOG_INFO(x) if (Logs::DebugEnabled()) { logInfo(x); }
+#define CONNECTION_LOG_ERROR(x) if (Logs::DebugEnabled()) { logError(x); }
 
 } // namespace details
 } // namespace MTP

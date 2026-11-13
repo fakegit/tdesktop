@@ -7,20 +7,37 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "core/ui_integration.h"
 
+#include "api/api_text_entities.h"
 #include "core/local_url_handlers.h"
 #include "core/file_utilities.h"
 #include "core/application.h"
+#include "core/bank_card_click_handler.h"
 #include "core/sandbox.h"
 #include "core/click_handler_types.h"
+#include "data/stickers/data_custom_emoji.h"
+#include "data/data_session.h"
+#include "iv/iv_instance.h"
+#include "ui/text/text_custom_emoji.h"
+#include "ui/text/text_utilities.h"
 #include "ui/basic_click_handlers.h"
 #include "ui/emoji_config.h"
+#include "ui/toast/toast.h"
 #include "lang/lang_keys.h"
 #include "platform/platform_specific.h"
 #include "boxes/url_auth_box.h"
+#include "core/phone_click_handler.h"
 #include "main/main_account.h"
 #include "main/main_session.h"
 #include "main/main_app_config.h"
+#include "mtproto/mtproto_config.h"
+#include "window/window_controller.h"
+#include "window/window_session_controller.h"
 #include "mainwindow.h"
+#include "base/unixtime.h"
+#include "styles/style_chat_helpers.h"
+
+#include <QtCore/QDateTime>
+#include <QtCore/QLocale>
 
 namespace Core {
 namespace {
@@ -42,10 +59,15 @@ const auto kBadPrefix = u"http://"_q;
 [[nodiscard]] QString UrlWithAutoLoginToken(
 		const QString &url,
 		QUrl parsed,
-		const QString &domain) {
-	const auto &config = Core::App().activeAccount().appConfig();
-	const auto token = config.get<QString>("autologin_token", {});
-	const auto domains = config.get<std::vector<QString>>(
+		const QString &domain,
+		QVariant context) {
+	const auto my = context.value<ClickHandlerContext>();
+	const auto window = my.sessionWindow.get();
+	const auto &active = window
+		? window->session().account()
+		: Core::App().activeAccount();
+	const auto token = active.mtp().configValues().autologinToken;
+	const auto domains = active.appConfig().get<std::vector<QString>>(
 		"autologin_domains",
 		{});
 	if (token.isEmpty()
@@ -69,19 +91,37 @@ const auto kBadPrefix = u"http://"_q;
 		QVariant context) {
 	auto &account = Core::App().activeAccount();
 	const auto &config = account.appConfig();
+	const auto my = context.value<ClickHandlerContext>();
+	const auto window = my.sessionWindow.get();
+	const auto show = window
+		? window->uiShow()
+		: my.show;
 	const auto domains = config.get<std::vector<QString>>(
 		"url_auth_domains",
 		{});
 	if (!account.sessionExists()
 		|| domain.isEmpty()
+		|| !show
 		|| !ranges::contains(domains, domain)) {
 		return false;
 	}
 	const auto good = url.startsWith(kBadPrefix, Qt::CaseInsensitive)
 		? (kGoodPrefix + url.mid(kBadPrefix.size()))
 		: url;
-	UrlAuthBox::Activate(&account.session(), good, context);
+	UrlAuthBox::ActivateUrl(show, &account.session(), good, context);
 	return true;
+}
+
+[[nodiscard]] bool SchemeRequiresConfirmation(const QString &url) {
+	if (UrlClickHandler::IsEmail(url)) {
+		return false;
+	}
+	const auto opened = UrlClickHandler::EncodeForOpening(url);
+	const auto scheme = opened.left(opened.indexOf(':')).toLower();
+	return !opened.startsWith(u"tc://"_q, Qt::CaseInsensitive)
+		&& (!File::IsUrlSchemeAllowed(scheme)
+			|| scheme == u"mailto"_q
+			|| scheme == u"tel"_q);
 }
 
 [[nodiscard]] QString OpenGLCheckFilePath() {
@@ -92,7 +132,176 @@ const auto kBadPrefix = u"http://"_q;
 	return cWorkingDir() + "tdata/angle_backend";
 }
 
+[[nodiscard]] bool IsBotCommand(const QString &text) {
+	if (text.size() < 2 || text.size() > 98 || text.front() != '/') {
+		return false;
+	}
+	const auto command = QStringView(text).mid(1);
+	const auto at = command.indexOf('@');
+	const auto name = (at < 0) ? command : command.left(at);
+	const auto bot = (at < 0) ? QStringView() : command.mid(at + 1);
+	if (name.isEmpty()
+		|| name.size() > 64
+		|| (at >= 0 && (bot.size() < 3 || bot.size() > 32))) {
+		return false;
+	}
+	const auto valid = [](QChar ch) {
+		const auto value = ch.unicode();
+		return (value >= 'A' && value <= 'Z')
+			|| (value >= 'a' && value <= 'z')
+			|| (value >= '0' && value <= '9')
+			|| (value == '_');
+	};
+	return ranges::all_of(name, valid) && ranges::all_of(bot, valid);
+}
+
+[[nodiscard]] Ui::Text::FormattedDateResult FormatDateRelative(TimeId date) {
+	const auto now = base::unixtime::now();
+	const auto delta = int64(date) - int64(now);
+	const auto absDelta = std::abs(delta);
+	const auto future = (delta > 0);
+	auto text = QString();
+	auto nextUpdate = int32(0);
+
+	if (absDelta < 1) {
+		text = tr::lng_date_relative_now(tr::now);
+		nextUpdate = now + 1;
+	} else if (absDelta < 60) {
+		const auto count = int(absDelta);
+		text = (future
+			? tr::lng_date_relative_in_seconds
+			: tr::lng_date_relative_seconds_ago)(tr::now, lt_count, count);
+		nextUpdate = now + 1;
+	} else if (absDelta < 3600) {
+		const auto count = int(absDelta / 60);
+		text = (future
+			? tr::lng_date_relative_in_minutes
+			: tr::lng_date_relative_minutes_ago)(tr::now, lt_count, count);
+		nextUpdate = future
+			? ((count > 1)
+				? (date - (count - 1) * 60)
+				: (date - 59))
+			: (date + (count + 1) * 60);
+	} else if (absDelta < 86400) {
+		const auto count = int(absDelta / 3600);
+		text = (future
+			? tr::lng_date_relative_in_hours
+			: tr::lng_date_relative_hours_ago)(tr::now, lt_count, count);
+		nextUpdate = future
+			? ((count > 1)
+				? (date - (count - 1) * 3600)
+				: (date - 3599))
+			: (date + (count + 1) * 3600);
+	} else if (absDelta < 30 * 86400) {
+		const auto count = int(absDelta / 86400);
+		text = (future
+			? tr::lng_date_relative_in_days
+			: tr::lng_date_relative_days_ago)(tr::now, lt_count, count);
+		nextUpdate = future
+			? ((count > 1)
+				? (date - (count - 1) * 86400)
+				: (date - 86399))
+			: (date + (count + 1) * 86400);
+	} else if (absDelta < 365 * 86400) {
+		const auto count = int(absDelta / (30 * 86400));
+		text = (future
+			? tr::lng_date_relative_in_months
+			: tr::lng_date_relative_months_ago)(tr::now, lt_count, count);
+		nextUpdate = future
+			? ((count > 1)
+				? (date - (count - 1) * 30 * 86400)
+				: (date - 30 * 86400 + 1))
+			: (date + (count + 1) * 30 * 86400);
+	} else {
+		const auto count = int(absDelta / (365 * 86400));
+		text = (future
+			? tr::lng_date_relative_in_years
+			: tr::lng_date_relative_years_ago)(tr::now, lt_count, count);
+		nextUpdate = future
+			? ((count > 1)
+				? (date - (count - 1) * 365 * 86400)
+				: (date - 365 * 86400 + 1))
+			: (date + (count + 1) * 365 * 86400);
+	}
+	return { text, nextUpdate };
+}
+
+[[nodiscard]] Ui::Text::FormattedDateResult FormatDateWithFlags(
+		TimeId date,
+		FormattedDateFlags flags) {
+	if (flags & FormattedDateFlag::Relative) {
+		return FormatDateRelative(date);
+	}
+	const auto dateTime = QDateTime::fromSecsSinceEpoch(date);
+	const auto locale = QLocale();
+	auto parts = QStringList();
+	const auto hasDayOfWeek = (flags & FormattedDateFlag::DayOfWeek);
+	const auto hasShortDate = (flags & FormattedDateFlag::ShortDate);
+	const auto hasLongDate = (flags & FormattedDateFlag::LongDate);
+	const auto hasShortTime = (flags & FormattedDateFlag::ShortTime);
+	const auto hasLongTime = (flags & FormattedDateFlag::LongTime);
+	if (hasDayOfWeek) {
+		parts.push_back(hasLongDate
+			? langDayOfWeekFull(dateTime.date())
+			: langDayOfWeek(dateTime.date()));
+	}
+	if (hasLongDate) {
+		parts.push_back(langDayOfMonthFull(dateTime.date()));
+	} else if (hasShortDate) {
+		parts.push_back(langDayOfMonth(dateTime.date()));
+	}
+	if (hasLongTime) {
+		parts.push_back(locale.toString(
+			dateTime.time(),
+			QLocale::LongFormat));
+	} else if (hasShortTime) {
+		parts.push_back(locale.toString(
+			dateTime.time(),
+			QLocale::ShortFormat));
+	}
+	auto text = parts.join(u" "_q);
+	if (text.isEmpty()) {
+		text = locale.toString(dateTime, QLocale::ShortFormat);
+	}
+	return { text, 0 };
+}
+
 } // namespace
+
+Ui::Text::MarkedContext TextContext(TextContextArgs &&args) {
+	using Context = Ui::Text::MarkedContext;
+	using Factory = Ui::Text::CustomEmojiFactory;
+
+	const auto session = args.session;
+	auto simple = [session](QStringView data, const Context &context) {
+		return session->data().customEmojiManager().create(
+			data,
+			context.repaint);
+	};
+	auto factory = !args.customEmojiLoopLimit
+		? Factory(simple)
+		: (args.customEmojiLoopLimit > 0)
+		? Factory([simple, loop = args.customEmojiLoopLimit](
+				QStringView data,
+				const Context &context) {
+			return MakeWrappedEmoji<Ui::Text::LimitedLoopsEmoji>(
+				simple(data, context),
+				loop);
+		})
+		: Factory([simple](
+				QStringView data,
+				const Context &context) {
+			return MakeWrappedEmoji<Ui::Text::FirstFrameEmoji>(
+				simple(data, context));
+		});
+	args.details.session = session;
+	return {
+		.repaint = std::move(args.repaint),
+		.customEmojiFactory = std::move(factory),
+		.formattedDateFactory = FormatDateWithFlags,
+		.other = std::move(args.details),
+	};
+}
 
 void UiIntegration::postponeCall(FnMut<void()> &&callable) {
 	Sandbox::Instance().postponeCall(std::move(callable));
@@ -110,6 +319,10 @@ QString UiIntegration::emojiCacheFolder() {
 	return cWorkingDir() + "tdata/emoji";
 }
 
+QString UiIntegration::fontsCacheFolder() {
+	return cWorkingDir() + "tdata/fonts";
+}
+
 QString UiIntegration::openglCheckFilePath() {
 	return OpenGLCheckFilePath();
 }
@@ -119,8 +332,8 @@ QString UiIntegration::angleBackendFilePath() {
 }
 
 void UiIntegration::textActionsUpdated() {
-	if (const auto window = App::wnd()) {
-		window->updateGlobalMenu();
+	if (const auto window = Core::App().activeWindow()) {
+		window->widget()->updateGlobalMenu();
 	}
 }
 
@@ -128,22 +341,30 @@ void UiIntegration::activationFromTopPanel() {
 	Platform::IgnoreApplicationActivationRightNow();
 }
 
+void UiIntegration::touchCounterIncrement() {
+	++_touchCounter;
+}
+
+int UiIntegration::touchCounterNow() {
+	return _touchCounter;
+}
+
 bool UiIntegration::screenIsLocked() {
 	return Core::App().screenIsLocked();
 }
 
-QString UiIntegration::timeFormat() {
-	return cTimeFormat();
-}
-
 std::shared_ptr<ClickHandler> UiIntegration::createLinkHandler(
 		const EntityLinkData &data,
-		const std::any &context) {
-	const auto my = std::any_cast<MarkedTextContext>(&context);
+		const Ui::Text::MarkedContext &context) {
+	const auto my = std::any_cast<Core::TextContextDetails>(&context.other);
 	switch (data.type) {
 	case EntityType::Url:
+		if (data.data.startsWith(u"internal:"_q, Qt::CaseInsensitive)) {
+			return nullptr;
+		}
 		return (!data.data.isEmpty()
-			&& UrlClickHandler::IsSuspicious(data.data))
+			&& (UrlClickHandler::IsSuspicious(data.data)
+				|| SchemeRequiresConfirmation(data.data)))
 			? std::make_shared<HiddenUrlClickHandler>(data.data)
 			: Integration::createLinkHandler(data, context);
 
@@ -152,20 +373,27 @@ std::shared_ptr<ClickHandler> UiIntegration::createLinkHandler(
 			? std::make_shared<HiddenUrlClickHandler>(data.data)
 			: Integration::createLinkHandler(data, context);
 
+	case EntityType::Email:
+		return UrlClickHandler::IsEmail(data.data)
+			? Integration::createLinkHandler(data, context)
+			: nullptr;
+
 	case EntityType::BotCommand:
-		return std::make_shared<BotCommandClickHandler>(data.data);
+		return IsBotCommand(data.data)
+			? std::make_shared<BotCommandClickHandler>(data.data)
+			: nullptr;
 
 	case EntityType::Hashtag:
-		using HashtagMentionType = MarkedTextContext::HashtagMentionType;
+		using HashtagMentionType = TextContextDetails::HashtagMentionType;
 		if (my && my->type == HashtagMentionType::Twitter) {
 			return std::make_shared<UrlClickHandler>(
-				(qsl("https://twitter.com/hashtag/")
+				(u"https://twitter.com/hashtag/"_q
 					+ data.data.mid(1)
-					+ qsl("?src=hash")),
+					+ u"?src=hash"_q),
 				true);
 		} else if (my && my->type == HashtagMentionType::Instagram) {
 			return std::make_shared<UrlClickHandler>(
-				(qsl("https://instagram.com/explore/tags/")
+				(u"https://instagram.com/explore/tags/"_q
 					+ data.data.mid(1)
 					+ '/'),
 				true);
@@ -176,14 +404,14 @@ std::shared_ptr<ClickHandler> UiIntegration::createLinkHandler(
 		return std::make_shared<CashtagClickHandler>(data.data);
 
 	case EntityType::Mention:
-		using HashtagMentionType = MarkedTextContext::HashtagMentionType;
+		using HashtagMentionType = TextContextDetails::HashtagMentionType;
 		if (my && my->type == HashtagMentionType::Twitter) {
 			return std::make_shared<UrlClickHandler>(
-				qsl("https://twitter.com/") + data.data.mid(1),
+				u"https://twitter.com/"_q + data.data.mid(1),
 				true);
 		} else if (my && my->type == HashtagMentionType::Instagram) {
 			return std::make_shared<UrlClickHandler>(
-				qsl("https://instagram.com/") + data.data.mid(1) + '/',
+				u"https://instagram.com/"_q + data.data.mid(1) + '/',
 				true);
 		}
 		return std::make_shared<MentionClickHandler>(data.data);
@@ -202,64 +430,104 @@ std::shared_ptr<ClickHandler> UiIntegration::createLinkHandler(
 			LOG(("Bad mention name: %1").arg(data.data));
 		}
 	} break;
+
+	case EntityType::Code:
+		return std::make_shared<MonospaceClickHandler>(data.text, data.type);
+	case EntityType::Pre:
+		return std::make_shared<MonospaceClickHandler>(data.text, data.type);
+	case EntityType::Phone:
+		return (my && my->session)
+			? std::make_shared<PhoneClickHandler>(my->session, data.text)
+			: nullptr;
+	case EntityType::BankCard:
+		return (my && my->session)
+			? std::make_shared<BankCardClickHandler>(my->session, data.text)
+			: nullptr;
+	case EntityType::TonAddress:
+		return std::make_shared<TonAddressClickHandler>(data.text);
+	case EntityType::FormattedDate: {
+		const auto [date, flags] = DeserializeFormattedDateData(data.data);
+		if (date) {
+			return std::make_shared<FormattedDateClickHandler>(date, flags);
+		}
+	} break;
 	}
 	return Integration::createLinkHandler(data, context);
 }
 
 bool UiIntegration::handleUrlClick(
-		const QString &url,
+		const QString &original,
 		const QVariant &context) {
+	// Only our own token may be added below, never one that came with it,
+	// unless the url itself was given to us by the server for this login.
+	const auto url = context.value<ClickHandlerContext>().keepWebAuthTokens
+		? original
+		: UrlWithoutWebAuthTokens(original);
 	const auto local = Core::TryConvertUrlToLocal(url);
-	if (Core::InternalPassportLink(local)) {
+	if (Core::InternalPassportOrOAuthLink(local)) {
 		return true;
 	}
 
 	if (UrlClickHandler::IsEmail(url)) {
 		File::OpenEmailLink(url);
 		return true;
-	} else if (local.startsWith(qstr("tg://"), Qt::CaseInsensitive)) {
+	} else if (local.startsWith(u"tg://"_q, Qt::CaseInsensitive)) {
 		Core::App().openLocalUrl(local, context);
 		return true;
-	} else if (local.startsWith(qstr("internal:"), Qt::CaseInsensitive)) {
+	} else if (local.startsWith(u"tonsite://"_q, Qt::CaseInsensitive)) {
+		Core::App().iv().showTonSite(local, context);
+		return true;
+	} else if (local.startsWith(u"internal:"_q, Qt::CaseInsensitive)) {
 		Core::App().openInternalUrl(local, context);
 		return true;
+	} else if (Iv::PreferForUri(url)
+		&& !context.value<ClickHandlerContext>().ignoreIv) {
+		const auto my = context.value<ClickHandlerContext>();
+		if (const auto controller = my.sessionWindow.get()) {
+			Core::App().iv().openWithIvPreferred(controller, url, context);
+			return true;
+		}
 	}
 
 	auto parsed = UrlForAutoLogin(url);
 	const auto domain = DomainForAutoLogin(parsed);
 	const auto skip = context.value<ClickHandlerContext>().skipBotAutoLogin;
 	if (skip || !BotAutoLogin(url, domain, context)) {
-		File::OpenUrl(UrlWithAutoLoginToken(url, std::move(parsed), domain));
+		File::OpenUrlWithOwnAutoLogin(
+			UrlWithAutoLoginToken(url, std::move(parsed), domain, context));
 	}
 	return true;
+}
 
+bool UiIntegration::copyPreOnClick(const QVariant &context) {
+	const auto my = context.value<ClickHandlerContext>();
+	if (const auto window = my.sessionWindow.get()) {
+		window->showToast({
+			.text = { tr::lng_code_copied(tr::now) },
+			.iconLottie = u"toast/copy"_q,
+			.iconLottieSize = st::toastLottieIconSize,
+		});
+	} else if (my.show) {
+		my.show->showToast({
+			.text = { tr::lng_code_copied(tr::now) },
+			.iconLottie = u"toast/copy"_q,
+			.iconLottieSize = st::toastLottieIconSize,
+		});
+	}
+	return true;
 }
 
 rpl::producer<> UiIntegration::forcePopupMenuHideRequests() {
 	return Core::App().passcodeLockChanges() | rpl::to_empty;
 }
 
-QString UiIntegration::convertTagToMimeTag(const QString &tagId) {
-	if (TextUtilities::IsMentionLink(tagId)) {
-		if (const auto session = Core::App().activeAccount().maybeSession()) {
-			return tagId + ':' + QString::number(session->userId().bare);
-		}
-	}
-	return tagId;
-}
-
 const Ui::Emoji::One *UiIntegration::defaultEmojiVariant(
 		const Ui::Emoji::One *emoji) {
-	if (!emoji || !emoji->hasVariants()) {
+	if (!emoji) {
 		return emoji;
 	}
-	const auto nonColored = emoji->nonColoredId();
-	const auto &variants = Core::App().settings().emojiVariants();
-	const auto i = variants.find(nonColored);
-	const auto result = (i != end(variants))
-		? emoji->variant(i->second)
-		: emoji;
-	Core::App().settings().incrementRecentEmoji(result);
+	const auto result = Core::App().settings().lookupEmojiVariant(emoji);
+	Core::App().settings().incrementRecentEmoji({ result });
 	return result;
 }
 
@@ -311,8 +579,84 @@ QString UiIntegration::phraseFormattingStrikeOut() {
 	return tr::lng_menu_formatting_strike_out(tr::now);
 }
 
+QString UiIntegration::phraseFormattingBlockquote() {
+	return tr::lng_menu_formatting_blockquote(tr::now);
+}
+
 QString UiIntegration::phraseFormattingMonospace() {
 	return tr::lng_menu_formatting_monospace(tr::now);
+}
+
+QString UiIntegration::phraseFormattingSpoiler() {
+	return tr::lng_menu_formatting_spoiler(tr::now);
+}
+
+QString UiIntegration::phraseFormattingDate() {
+	return tr::lng_menu_formatting_date(tr::now);
+}
+
+QString UiIntegration::phraseButtonOk() {
+	return tr::lng_box_ok(tr::now);
+}
+
+QString UiIntegration::phraseButtonClose() {
+	return tr::lng_close(tr::now);
+}
+
+QString UiIntegration::phraseButtonCancel() {
+	return tr::lng_cancel(tr::now);
+}
+
+QString UiIntegration::phrasePanelCloseWarning() {
+	return tr::lng_bot_close_warning_title(tr::now);
+}
+
+QString UiIntegration::phrasePanelCloseUnsaved() {
+	return tr::lng_bot_close_warning(tr::now);
+}
+
+QString UiIntegration::phrasePanelCloseAnyway() {
+	return tr::lng_bot_close_warning_sure(tr::now);
+}
+
+QString UiIntegration::phraseBotSharePhone() {
+	return tr::lng_bot_share_phone(tr::now);
+}
+
+QString UiIntegration::phraseBotSharePhoneTitle() {
+	return tr::lng_settings_phone_label(tr::now);
+}
+
+QString UiIntegration::phraseBotSharePhoneConfirm() {
+	return tr::lng_bot_share_phone_confirm(tr::now);
+}
+
+QString UiIntegration::phraseBotAllowWrite() {
+	return tr::lng_bot_allow_write(tr::now);
+}
+
+QString UiIntegration::phraseBotAllowWriteTitle() {
+	return tr::lng_bot_allow_write_title(tr::now);
+}
+
+QString UiIntegration::phraseBotAllowWriteConfirm() {
+	return tr::lng_bot_allow_write_confirm(tr::now);
+}
+
+QString UiIntegration::phraseQuoteHeaderCopy() {
+	return tr::lng_code_block_header_copy(tr::now);
+}
+
+QString UiIntegration::phraseMinimize() {
+	return tr::lng_minimize_window(tr::now);
+}
+
+QString UiIntegration::phraseMaximize() {
+	return tr::lng_maximize_window(tr::now);
+}
+
+QString UiIntegration::phraseRestore() {
+	return tr::lng_restore_window(tr::now);
 }
 
 bool OpenGLLastCheckFailed() {

@@ -72,12 +72,6 @@ void ResolvingConnection::setChild(ConnectionPointer &&child) {
 		&AbstractConnection::disconnected,
 		this,
 		&ResolvingConnection::handleDisconnected);
-	DEBUG_LOG(("Resolving Info: dc:%1 proxy '%2' got new child '%3'").arg(
-		QString::number(_protocolDcId),
-		_proxy.host + ':' + QString::number(_proxy.port),
-		(_ipIndex >= 0 && _ipIndex < _proxy.resolvedIPs.size())
-			? _proxy.resolvedIPs[_ipIndex]
-			: _proxy.host));
 	if (_protocolDcId) {
 		_child->connectToServer(
 			_address,
@@ -85,6 +79,8 @@ void ResolvingConnection::setChild(ConnectionPointer &&child) {
 			_protocolSecret,
 			_protocolDcId,
 			_protocolForFiles);
+		CONNECTION_LOG_INFO("Resolving connected a new child: "
+			+ _child->debugId());
 	}
 }
 
@@ -189,7 +185,8 @@ crl::time ResolvingConnection::pingTime() const {
 }
 
 crl::time ResolvingConnection::fullConnectTimeout() const {
-	return kOneConnectionTimeout * qMax(int(_proxy.resolvedIPs.size()), 1);
+	return kOneConnectionTimeout
+		* std::max(int(_proxy.resolvedIPs.size()), 1);
 }
 
 void ResolvingConnection::sendData(mtpBuffer &&buffer) {
@@ -224,18 +221,13 @@ void ResolvingConnection::connectToServer(
 	_protocolSecret = protocolSecret;
 	_protocolDcId = protocolDcId;
 	_protocolForFiles = protocolForFiles;
-	DEBUG_LOG(("Resolving Info: dc:%1 proxy '%2' connects a child '%3'").arg(
-		QString::number(_protocolDcId),
-		_proxy.host +':' + QString::number(_proxy.port),
-		(_ipIndex >= 0 && _ipIndex < _proxy.resolvedIPs.size())
-			? _proxy.resolvedIPs[_ipIndex]
-			: _proxy.host));
-	return _child->connectToServer(
+	_child->connectToServer(
 		address,
 		port,
 		protocolSecret,
 		protocolDcId,
 		protocolForFiles);
+	CONNECTION_LOG_INFO("Resolving connected a child: " + _child->debugId());
 }
 
 bool ResolvingConnection::isConnected() const {

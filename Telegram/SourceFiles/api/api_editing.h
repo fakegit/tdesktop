@@ -7,15 +7,21 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #pragma once
 
+#include "api/api_common.h"
+
+#include <optional>
+
 class HistoryItem;
+
+namespace Data {
+struct WebPageDraft;
+} // namespace Data
 
 namespace MTP {
 class Error;
 } // namespace MTP
 
 namespace Api {
-
-struct SendOptions;
 
 const auto kDefaultEditMessagesErrors = {
 	u"MESSAGE_ID_INVALID"_q,
@@ -29,29 +35,42 @@ void RescheduleMessage(
 
 void EditMessageWithUploadedDocument(
 	HistoryItem *item,
-	const MTPInputFile &file,
-	const std::optional<MTPInputFile> &thumb,
-	SendOptions options,
-	std::vector<MTPInputDocument> attachedStickers);
+	RemoteFileInfo info,
+	SendOptions options);
 
 void EditMessageWithUploadedPhoto(
 	HistoryItem *item,
-	const MTPInputFile &file,
-	SendOptions options,
-	std::vector<MTPInputDocument> attachedStickers);
+	RemoteFileInfo info,
+	SendOptions options);
 
 mtpRequestId EditCaption(
 	not_null<HistoryItem*> item,
 	const TextWithEntities &caption,
 	SendOptions options,
-	Fn<void(const MTPUpdates &)> done,
-	Fn<void(const MTP::Error &)> fail);
+	Fn<void()> done,
+	Fn<void(const QString &)> fail);
 
 mtpRequestId EditTextMessage(
 	not_null<HistoryItem*> item,
 	const TextWithEntities &caption,
+	Data::WebPageDraft webpage,
 	SendOptions options,
-	Fn<void(const MTPUpdates &, mtpRequestId requestId)> done,
-	Fn<void(const MTP::Error &, mtpRequestId requestId)> fail);
+	Fn<void(mtpRequestId requestId)> done,
+	Fn<void(const QString &error, mtpRequestId requestId)> fail,
+	bool spoilered,
+	VideoCoverEdit videoCover = {});
+mtpRequestId EditRichMessage(
+	not_null<HistoryItem*> item,
+	Fn<std::optional<MTPInputRichMessage>()> richMessage,
+	SendOptions options,
+	Fn<void(mtpRequestId requestId)> done,
+	Fn<void(const QString &error, mtpRequestId requestId)> fail);
+
+void EditTodoList(
+	not_null<HistoryItem*> item,
+	const TodoListData &data,
+	SendOptions options,
+	Fn<void(mtpRequestId requestId)> done,
+	Fn<void(const QString &error, mtpRequestId requestId)> fail);
 
 } // namespace Api

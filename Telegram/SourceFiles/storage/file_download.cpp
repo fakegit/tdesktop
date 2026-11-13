@@ -22,9 +22,20 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "apiwrap.h"
 #include "core/crash_reports.h"
 #include "base/bytes.h"
-#include "base/openssl_help.h"
 
 namespace {
+
+[[nodiscard]] QByteArray OwningBytes(const QByteArray &data) {
+	// QByteArray::fromRawData() makes an array whose bytes live outside its
+	// own refcounted block, and every copy of it keeps pointing there, so it
+	// dangles once those bytes are freed. Qt marks such an array by leaving
+	// its allocated capacity at zero, while an array that owns its block
+	// always reports a capacity of at least size(), so only a borrowing one
+	// can report capacity() < size(). Measured on Qt 5.15.19 and 6.11.1.
+	return (data.capacity() < data.size())
+		? QByteArray(data.constData(), data.size())
+		: data;
+}
 
 class FromMemoryLoader final : public FileLoader {
 public:
@@ -32,8 +43,8 @@ public:
 		not_null<Main::Session*> session,
 		const QByteArray &data,
 		const QString &toFile,
-		int loadSize,
-		int fullSize,
+		int64 loadSize,
+		int64 fullSize,
 		LocationType locationType,
 		LoadToCacheSetting toCache,
 		LoadFromCloudSetting fromCloud,
@@ -54,8 +65,8 @@ FromMemoryLoader::FromMemoryLoader(
 	not_null<Main::Session*> session,
 	const QByteArray &data,
 	const QString &toFile,
-	int loadSize,
-	int fullSize,
+	int64 loadSize,
+	int64 fullSize,
 	LocationType locationType,
 	LoadToCacheSetting toCache,
 	LoadFromCloudSetting fromCloud,
@@ -94,8 +105,8 @@ void FromMemoryLoader::startLoading() {
 FileLoader::FileLoader(
 	not_null<Main::Session*> session,
 	const QString &toFile,
-	int loadSize,
-	int fullSize,
+	int64 loadSize,
+	int64 fullSize,
 	LocationType locationType,
 	LoadToCacheSetting toCache,
 	LoadFromCloudSetting fromCloud,
@@ -124,17 +135,17 @@ Main::Session &FileLoader::session() const {
 }
 
 void FileLoader::finishWithBytes(const QByteArray &data) {
-	_data = data;
+	_data = OwningBytes(data);
 	_localStatus = LocalStatus::Loaded;
 	if (!_filename.isEmpty() && _toCache == LoadToCacheAsWell) {
 		if (!_fileIsOpen) _fileIsOpen = _file.open(QIODevice::WriteOnly);
 		if (!_fileIsOpen) {
-			cancel(true);
+			cancel(FailureReason::FileWriteFailure);
 			return;
 		}
 		_file.seek(0);
 		if (_file.write(_data) != qint64(_data.size())) {
-			cancel(true);
+			cancel(FailureReason::FileWriteFailure);
 			return;
 		}
 	}
@@ -151,16 +162,16 @@ void FileLoader::finishWithBytes(const QByteArray &data) {
 	session->notifyDownloaderTaskFinished();
 }
 
-QImage FileLoader::imageData(int progressiveSizeLimit) const {
+QImage FileLoader::imageData() const {
 	if (_imageData.isNull() && _locationType == UnknownFileLocation) {
-		readImage(progressiveSizeLimit);
+		readImage();
 	}
 	return _imageData;
 }
 
-void FileLoader::readImage(int progressiveSizeLimit) const {
-	const auto buffer = progressiveSizeLimit
-		? QByteArray::fromRawData(_data.data(), progressiveSizeLimit)
+void FileLoader::readImage() const {
+	const auto buffer = (_loadSize > 0 && _loadSize < _data.size())
+		? QByteArray::fromRawData(_data.data(), _loadSize)
 		: _data;
 	auto read = Images::Read({ .content = buffer });
 	if (!read.image.isNull()) {
@@ -194,7 +205,7 @@ void FileLoader::permitLoadFromCloud() {
 	_fromCloud = LoadFromCloudOrLocal;
 }
 
-void FileLoader::increaseLoadSize(int size, bool autoLoading) {
+void FileLoader::increaseLoadSize(int64 size, bool autoLoading) {
 	Expects(size > _loadSize);
 	Expects(size <= _fullSize);
 
@@ -259,7 +270,7 @@ bool FileLoader::checkForOpen() {
 	if (_fileIsOpen) {
 		return true;
 	}
-	cancel(true);
+	cancel(FailureReason::FileWriteFailure);
 	return false;
 }
 
@@ -330,10 +341,10 @@ bool FileLoader::tryLoadLocal() {
 }
 
 void FileLoader::cancel() {
-	cancel(false);
+	cancel(FailureReason::NoFailure);
 }
 
-void FileLoader::cancel(bool fail) {
+void FileLoader::cancel(FailureReason fail) {
 	const auto started = (currentOffset() > 0);
 
 	cancelHook();
@@ -348,8 +359,8 @@ void FileLoader::cancel(bool fail) {
 	_data = QByteArray();
 
 	const auto weak = base::make_weak(this);
-	if (fail) {
-		_updates.fire_error_copy(started);
+	if (fail != FailureReason::NoFailure) {
+		_updates.fire_error_copy({ fail, started });
 	} else {
 		_updates.fire_done();
 	}
@@ -359,11 +370,11 @@ void FileLoader::cancel(bool fail) {
 	}
 }
 
-int FileLoader::currentOffset() const {
+int64 FileLoader::currentOffset() const {
 	return (_fileIsOpen ? _file.size() : _data.size()) - _skippedBytes;
 }
 
-bool FileLoader::writeResultPart(int offset, bytes::const_span buffer) {
+bool FileLoader::writeResultPart(int64 offset, bytes::const_span buffer) {
 	Expects(!_finished);
 
 	if (buffer.empty()) {
@@ -378,7 +389,7 @@ bool FileLoader::writeResultPart(int offset, bytes::const_span buffer) {
 		}
 		_file.seek(offset);
 		if (_file.write(reinterpret_cast<const char*>(buffer.data()), buffer.size()) != qint64(buffer.size())) {
-			cancel(true);
+			cancel(FailureReason::FileWriteFailure);
 			return false;
 		}
 		return true;
@@ -403,7 +414,7 @@ bool FileLoader::writeResultPart(int offset, bytes::const_span buffer) {
 	return true;
 }
 
-QByteArray FileLoader::readLoadedPartBack(int offset, int size) {
+QByteArray FileLoader::readLoadedPartBack(int64 offset, int size) {
 	Expects(offset >= 0 && size > 0);
 
 	if (_fileIsOpen) {
@@ -411,7 +422,7 @@ QByteArray FileLoader::readLoadedPartBack(int offset, int size) {
 			_file.close();
 			_fileIsOpen = _file.open(QIODevice::ReadWrite);
 			if (!_fileIsOpen) {
-				cancel(true);
+				cancel(FailureReason::FileWriteFailure);
 				return QByteArray();
 			}
 		}
@@ -429,13 +440,17 @@ QByteArray FileLoader::readLoadedPartBack(int offset, int size) {
 bool FileLoader::finalizeResult() {
 	Expects(!_finished);
 
+	if (_skippedBytes != 0) {
+		cancel(FailureReason::OtherFailure);
+		return false;
+	}
 	if (!_filename.isEmpty() && (_toCache == LoadToCacheAsWell)) {
 		if (!_fileIsOpen) {
 			_fileIsOpen = _file.open(QIODevice::WriteOnly);
 		}
 		_file.seek(0);
 		if (!_fileIsOpen || _file.write(_data) != qint64(_data.size())) {
-			cancel(true);
+			cancel(FailureReason::FileWriteFailure);
 			return false;
 		}
 	}
@@ -479,8 +494,8 @@ std::unique_ptr<FileLoader> CreateFileLoader(
 		const DownloadLocation &location,
 		Data::FileOrigin origin,
 		const QString &toFile,
-		int loadSize,
-		int fullSize,
+		int64 loadSize,
+		int64 fullSize,
 		LocationType locationType,
 		LoadToCacheSetting toCache,
 		LoadFromCloudSetting fromCloud,
@@ -523,6 +538,15 @@ std::unique_ptr<FileLoader> CreateFileLoader(
 			session,
 			data.url,
 			toFile,
+			fromCloud,
+			autoLoading,
+			cacheTag);
+	}, [&](const AudioAlbumThumbLocation &data) {
+		result = std::make_unique<mtpFileLoader>(
+			session,
+			data,
+			loadSize,
+			fullSize,
 			fromCloud,
 			autoLoading,
 			cacheTag);

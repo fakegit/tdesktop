@@ -17,8 +17,17 @@ class SingleFilePreview final : public AbstractSingleFilePreview {
 public:
 	SingleFilePreview(
 		QWidget *parent,
+		const style::ComposeControls &st,
+		const PreparedFile &file,
+		const Text::MarkedContext &captionContext,
+		AttachControls::Type type = AttachControls::Type::Full);
+	SingleFilePreview(
+		QWidget *parent,
+		const style::ComposeControls &st,
 		const PreparedFile &file,
 		AttachControls::Type type = AttachControls::Type::Full);
+	void setDisplayName(const QString &displayName) override;
+	void setCaption(const TextWithTags &caption) override;
 
 private:
 	void preparePreview(const PreparedFile &file);

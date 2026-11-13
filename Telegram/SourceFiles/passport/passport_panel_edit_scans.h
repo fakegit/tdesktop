@@ -72,9 +72,10 @@ private:
 	struct SpecialScan;
 	struct List {
 		List(not_null<PanelController*> controller, ScanListData &&data);
+		List(not_null<PanelController*> controller);
 		List(
 			not_null<PanelController*> controller,
-			std::optional<ScanListData> &&data = std::nullopt);
+			std::optional<ScanListData> &&data);
 
 		bool uploadedSomeMore() const;
 		bool uploadMoreRequired() const;
@@ -121,10 +122,6 @@ private:
 		SpecialScan &scan,
 		const ScanInfo &info,
 		bool requiresBothSides);
-	base::unique_qptr<Ui::SlideWrap<ScanButton>> createScan(
-		not_null<Ui::VerticalLayout*> parent,
-		const ScanInfo &info,
-		const QString &name);
 	SpecialScan &findSpecialScan(FileType type);
 
 	void updateErrorLabels();

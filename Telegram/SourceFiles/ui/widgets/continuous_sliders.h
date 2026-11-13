@@ -7,13 +7,17 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #pragma once
 
-#include "styles/style_widgets.h"
 #include "ui/effects/animations.h"
 #include "ui/rp_widget.h"
 
 namespace base {
 class Timer;
 } // namespace base
+
+namespace style {
+struct FilledSlider;
+struct MediaSlider;
+} // namespace style
 
 namespace Ui {
 
@@ -54,13 +58,24 @@ public:
 
 	void setMoveByWheel(bool move);
 
+	QAccessible::Role accessibilityRole() override {
+		return QAccessible::Role::Slider;
+	}
+
+	QString accessibilityValue() const override {
+		const auto rounded = int(base::SafeRound(_value * 100.));
+		const auto percent = std::clamp(rounded, 0, 100);
+		return QString::number(percent) + '%';
+	}
+
 protected:
 	void mouseMoveEvent(QMouseEvent *e) override;
 	void mousePressEvent(QMouseEvent *e) override;
 	void mouseReleaseEvent(QMouseEvent *e) override;
 	void wheelEvent(QWheelEvent *e) override;
-	void enterEventHook(QEvent *e) override;
+	void enterEventHook(QEnterEvent *e) override;
 	void leaveEventHook(QEvent *e) override;
+	void keyPressEvent(QKeyEvent *e) override;
 
 	float64 fadeOpacity() const {
 		return _fadeOpacity;
@@ -133,6 +148,16 @@ private:
 
 class MediaSlider : public ContinuousSlider {
 public:
+	struct ColorOverrides {
+		std::optional<QColor> activeFg;
+		std::optional<QColor> activeBg;
+		std::optional<QColor> activeBorder;
+		std::optional<QColor> seekFg;
+		std::optional<QColor> seekBorder;
+		std::optional<QColor> inactiveFg;
+		std::optional<QColor> inactiveBorder;
+	};
+
 	MediaSlider(QWidget *parent, const style::MediaSlider &st);
 
 	void setAlwaysDisplayMarker(bool alwaysDisplayMarker) {
@@ -144,15 +169,16 @@ public:
 	template <
 		typename Value,
 		typename Convert,
-		typename Callback,
+		typename Progress,
 		typename = std::enable_if_t<
-			rpl::details::is_callable_plain_v<Callback, Value>
+			rpl::details::is_callable_plain_v<Progress, Value>
 			&& std::is_same_v<Value, decltype(std::declval<Convert>()(1))>>>
 	void setPseudoDiscrete(
 			int valuesCount,
 			Convert &&convert,
 			Value current,
-			Callback &&callback) {
+			Progress &&progress,
+			int indexMin = 0) {
 		Expects(valuesCount > 1);
 
 		setAlwaysDisplayMarker(true);
@@ -167,19 +193,59 @@ public:
 			}
 		}
 		setAdjustCallback([=](float64 value) {
-			return std::round(value * sectionsCount) / sectionsCount;
+			return std::max(
+				base::SafeRound(value * sectionsCount),
+				indexMin * 1.
+			) / sectionsCount;
 		});
-		setChangeProgressCallback([
-			=,
-			convert = std::forward<Convert>(convert),
-			callback = std::forward<Callback>(callback)
-		](float64 value) {
-			const auto index = int(std::round(value * sectionsCount));
-			callback(convert(index));
+		setChangeProgressCallback([=](float64 value) {
+			const auto index = std::max(
+				int(base::SafeRound(value * sectionsCount)),
+				indexMin);
+			progress(convert(index));
 		});
 	}
-	void setActiveFgOverride(std::optional<QColor> color);
+
+	template <
+		typename Value,
+		typename Convert,
+		typename Progress,
+		typename Finished,
+		typename = std::enable_if_t<
+			rpl::details::is_callable_plain_v<Progress, Value>
+			&& rpl::details::is_callable_plain_v<Finished, Value>
+			&& std::is_same_v<Value, decltype(std::declval<Convert>()(1))>>>
+	void setPseudoDiscrete(
+			int valuesCount,
+			Convert &&convert,
+			Value current,
+			Progress &&progress,
+			Finished &&finished,
+			int indexMin = 0) {
+		setPseudoDiscrete(
+			valuesCount,
+			std::forward<Convert>(convert),
+			current,
+			std::forward<Progress>(progress),
+			indexMin);
+		setChangeFinishedCallback([=](float64 value) {
+			const auto sectionsCount = (valuesCount - 1);
+			const auto index = std::max(
+				int(base::SafeRound(value * sectionsCount)),
+				indexMin);
+			finished(convert(index));
+		});
+	}
+
+	enum class DividerStyle : uchar {
+		Marks,
+		Gaps,
+	};
+
+	void setColorOverrides(ColorOverrides overrides);
 	void addDivider(float64 atValue, const QSize &size);
+	void clearDividers();
+	void setDividerStyle(DividerStyle style);
 
 protected:
 	void paintEvent(QPaintEvent *e) override;
@@ -192,13 +258,28 @@ private:
 
 	QSize getSeekDecreaseSize() const override;
 	float64 getOverDuration() const override;
+	void rebuildDividerExclusion();
 
 	const style::MediaSlider &_st;
 	bool _alwaysDisplayMarker = false;
 	bool _paintDisabled = false;
 
 	std::vector<Divider> _dividers;
-	std::optional<QColor> _activeFgOverride;
+	DividerStyle _dividerStyle = DividerStyle::Marks;
+	QRegion _dividerExclusion;
+	QSize _dividerExclusionSize;
+	ColorOverrides _overrides;
+
+};
+
+class MediaSliderWheelless : public MediaSlider {
+public:
+	using Ui::MediaSlider::MediaSlider;
+
+protected:
+	void wheelEvent(QWheelEvent *e) override {
+		e->ignore();
+	}
 
 };
 

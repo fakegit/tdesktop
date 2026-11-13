@@ -14,6 +14,10 @@ namespace Data {
 struct PersonalInfo;
 struct UserpicsInfo;
 struct UserpicsSlice;
+struct StoriesInfo;
+struct StoriesSlice;
+struct ProfileMusicInfo;
+struct ProfileMusicSlice;
 struct ContactsList;
 struct SessionsList;
 struct DialogsInfo;
@@ -35,6 +39,7 @@ class Stats;
 enum class Format {
 	Html,
 	Json,
+	HtmlAndJson,
 };
 
 class AbstractWriter {
@@ -54,6 +59,18 @@ public:
 	[[nodiscard]] virtual Result writeUserpicsSlice(
 		const Data::UserpicsSlice &data) = 0;
 	[[nodiscard]] virtual Result writeUserpicsEnd() = 0;
+
+	[[nodiscard]] virtual Result writeStoriesStart(
+		const Data::StoriesInfo &data) = 0;
+	[[nodiscard]] virtual Result writeStoriesSlice(
+		const Data::StoriesSlice &data) = 0;
+	[[nodiscard]] virtual Result writeStoriesEnd() = 0;
+
+	[[nodiscard]] virtual Result writeProfileMusicStart(
+		const Data::ProfileMusicInfo &data) = 0;
+	[[nodiscard]] virtual Result writeProfileMusicSlice(
+		const Data::ProfileMusicSlice &data) = 0;
+	[[nodiscard]] virtual Result writeProfileMusicEnd() = 0;
 
 	[[nodiscard]] virtual Result writeContactsList(
 		const Data::ContactsList &data) = 0;
@@ -78,10 +95,6 @@ public:
 	[[nodiscard]] virtual QString mainFilePath() = 0;
 
 	virtual ~AbstractWriter() = default;
-
-	Stats produceTestExample(
-		const QString &path,
-		const Environment &environment);
 
 };
 

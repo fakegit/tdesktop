@@ -9,6 +9,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 #include "ui/widgets/buttons.h"
 #include "ui/effects/radial_animation.h"
+#include "ui/painter.h"
 #include "ui/ui_utility.h"
 #include "mtproto/mtp_instance.h"
 #include "mtproto/facade.h"
@@ -20,6 +21,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "boxes/abstract_box.h"
 #include "lang/lang_keys.h"
 #include "styles/style_window.h"
+
+#include <QtGui/QWindow>
 
 namespace Window {
 namespace {
@@ -33,6 +36,8 @@ class Progress : public Ui::RpWidget {
 public:
 	Progress(QWidget *parent);
 
+	rpl::producer<> animationStepRequests() const;
+
 protected:
 	void paintEvent(QPaintEvent *e) override;
 
@@ -40,6 +45,7 @@ private:
 	void animationStep();
 
 	Ui::InfiniteRadialAnimation _animation;
+	rpl::event_stream<> _animationStepRequests;
 
 };
 
@@ -49,11 +55,18 @@ Progress::Progress(QWidget *parent)
 	setAttribute(Qt::WA_OpaquePaintEvent);
 	setAttribute(Qt::WA_TransparentForMouseEvents);
 	resize(st::connectingRadial.size);
-	_animation.start(st::connectingRadial.sineDuration);
+
+	shownValue() | rpl::on_next([=](bool shown) {
+		if (shown) {
+			_animation.start(st::connectingRadial.sineDuration);
+		} else {
+			_animation.stop(anim::type::instant);
+		}
+	}, lifetime());
 }
 
 void Progress::paintEvent(QPaintEvent *e) {
-	Painter p(this);
+	auto p = QPainter(this);
 
 	p.fillRect(e->rect(), st::windowBg);
 	const auto &st = st::connectingRadial;
@@ -67,8 +80,13 @@ void Progress::paintEvent(QPaintEvent *e) {
 
 void Progress::animationStep() {
 	if (!anim::Disabled()) {
+		_animationStepRequests.fire({});
 		update();
 	}
+}
+
+rpl::producer<> Progress::animationStepRequests() const {
+	return _animationStepRequests.events();
 }
 
 } // namespace
@@ -79,6 +97,10 @@ public:
 		QWidget *parent,
 		not_null<Main::Account*> account,
 		const Layout &layout);
+
+	QAccessible::Role accessibilityRole() override {
+		return QAccessible::Role::StatusBar;
+	}
 
 	void refreshRetryLink(bool hasRetry);
 	void setLayout(const Layout &layout);
@@ -105,7 +127,7 @@ private:
 	const not_null<Main::Account*> _account;
 	Layout _currentLayout;
 	base::unique_qptr<Ui::LinkButton> _retry;
-	QPointer<Ui::RpWidget> _progress;
+	QPointer<Progress> _progress;
 	QPointer<ProxyIcon> _proxyIcon;
 	rpl::event_stream<> _refreshStateRequests;
 
@@ -141,7 +163,7 @@ ConnectionState::Widget::ProxyIcon::ProxyIcon(QWidget *parent) : RpWidget(parent
 			st::connectingProxyOn.height()));
 
 	style::PaletteChanged(
-	) | rpl::start_with_next([=] {
+	) | rpl::on_next([=] {
 		refreshCacheImages();
 	}, lifetime());
 
@@ -151,12 +173,12 @@ ConnectionState::Widget::ProxyIcon::ProxyIcon(QWidget *parent) : RpWidget(parent
 void ConnectionState::Widget::ProxyIcon::refreshCacheImages() {
 	const auto prepareCache = [&](const style::icon &icon) {
 		auto image = QImage(
-			size() * cIntRetinaFactor(),
+			size() * style::DevicePixelRatio(),
 			QImage::Format_ARGB32_Premultiplied);
-		image.setDevicePixelRatio(cRetinaFactor());
+		image.setDevicePixelRatio(style::DevicePixelRatio());
 		image.fill(st::windowBg->c);
 		{
-			Painter p(&image);
+			auto p = QPainter(&image);
 			icon.paint(
 				p,
 				(width() - icon.width()) / 2,
@@ -187,7 +209,7 @@ void ConnectionState::Widget::ProxyIcon::setOpacity(float64 opacity) {
 }
 
 void ConnectionState::Widget::ProxyIcon::paintEvent(QPaintEvent *e) {
-	Painter p(this);
+	auto p = QPainter(this);
 	p.setOpacity(_opacity);
 	p.drawPixmap(0, 0, _toggled ? _cacheOn : _cacheOff);
 }
@@ -195,6 +217,7 @@ void ConnectionState::Widget::ProxyIcon::paintEvent(QPaintEvent *e) {
 bool ConnectionState::State::operator==(const State &other) const {
 	return (type == other.type)
 		&& (useProxy == other.useProxy)
+		&& (exposed == other.exposed)
 		&& (underCursor == other.underCursor)
 		&& (updateReady == other.updateReady)
 		&& (waitTillRetry == other.waitTillRetry);
@@ -211,7 +234,7 @@ ConnectionState::ConnectionState(
 	rpl::combine(
 		std::move(shown),
 		visibility()
-	) | rpl::start_with_next([=](bool shown, float64 visible) {
+	) | rpl::on_next([=](bool shown, float64 visible) {
 		if (!shown || visible == 0.) {
 			_widget = nullptr;
 		} else if (!_widget) {
@@ -222,15 +245,17 @@ ConnectionState::ConnectionState(
 	if (!Core::UpdaterDisabled()) {
 		Core::UpdateChecker checker;
 		rpl::merge(
-			rpl::single(rpl::empty_value()),
+			rpl::single(rpl::empty),
 			checker.ready()
-		) | rpl::start_with_next([=] {
+		) | rpl::on_next([=] {
 			refreshState();
 		}, _lifetime);
 	}
 
-	Core::App().settings().proxy().connectionTypeValue(
-	) | rpl::start_with_next([=] {
+	rpl::combine(
+		Core::App().settings().proxy().connectionTypeValue(),
+		rpl::single(QRect()) | rpl::then(_parent->paintRequest())
+	) | rpl::on_next([=] {
 		refreshState();
 	}, _lifetime);
 }
@@ -243,16 +268,17 @@ void ConnectionState::createWidget() {
 
 	rpl::combine(
 		visibility(),
-		_parent->heightValue()
-	) | rpl::start_with_next([=](float64 visible, int height) {
+		_parent->heightValue(),
+		_bottomSkip.value()
+	) | rpl::on_next([=](float64 visible, int height, int skip) {
 		_widget->moveToLeft(0, anim::interpolate(
 			height - st::connectingMargin.top(),
-			height - _widget->height(),
+			height - _widget->height() - skip,
 			visible));
 	}, _widget->lifetime());
 
 	_widget->refreshStateRequests(
-	) | rpl::start_with_next([=] {
+	) | rpl::on_next([=] {
 		refreshState();
 	}, _widget->lifetime());
 }
@@ -281,28 +307,35 @@ void ConnectionState::setForceHidden(bool hidden) {
 	}
 }
 
+void ConnectionState::setBottomSkip(int skip) {
+	_bottomSkip = skip;
+}
+
 void ConnectionState::refreshState() {
 	using Checker = Core::UpdateChecker;
 	const auto state = [&]() -> State {
+		const auto exposed = _parent->window()->windowHandle()
+			&& _parent->window()->windowHandle()->isExposed();
 		const auto under = _widget && _widget->isOver();
-		const auto ready = (Checker().state() == Checker::State::Ready);
+		const auto ready = !Core::UpdaterDisabled()
+			&& (Checker().state() == Checker::State::Ready);
 		const auto state = _account->mtp().dcstate();
 		const auto proxy = Core::App().settings().proxy().isEnabled();
 		if (state == MTP::ConnectingState
 			|| state == MTP::DisconnectedState
 			|| (state < 0 && state > -600)) {
-			return { State::Type::Connecting, proxy, under, ready };
+			return { State::Type::Connecting, proxy, exposed, under, ready };
 		} else if (state < 0
 			&& state >= -kMinimalWaitingStateDuration
 			&& _state.type != State::Type::Waiting) {
-			return { State::Type::Connecting, proxy, under, ready };
+			return { State::Type::Connecting, proxy, exposed, under, ready };
 		} else if (state < 0) {
 			const auto wait = ((-state) / 1000) + 1;
-			return { State::Type::Waiting, proxy, under, ready, wait };
+			return { State::Type::Waiting, proxy, exposed, under, ready, wait };
 		}
-		return { State::Type::Connected, proxy, under, ready };
+		return { State::Type::Connected, proxy, exposed, under, ready };
 	}();
-	if (state.waitTillRetry > 0) {
+	if (state.exposed && state.waitTillRetry > 0) {
 		_refreshTimer.callOnce(kRefreshTimeout);
 	}
 	if (state == _state) {
@@ -415,7 +448,8 @@ auto ConnectionState::computeLayout(const State &state) const -> Layout {
 	auto result = Layout();
 	result.proxyEnabled = state.useProxy;
 	result.progressShown = (state.type != State::Type::Connected);
-	result.visible = !state.updateReady
+	result.visible = state.exposed
+		&& !state.updateReady
 		&& (state.useProxy
 			|| state.type == State::Type::Connecting
 			|| state.type == State::Type::Waiting);
@@ -482,6 +516,11 @@ ConnectionState::Widget::Widget(
 	addClickHandler([=] {
 		Ui::show(ProxiesBoxController::CreateOwningBox(account));
 	});
+
+	_progress->animationStepRequests(
+	) | rpl::on_next([=] {
+		_refreshStateRequests.fire({});
+	}, _progress->lifetime());
 }
 
 void ConnectionState::Widget::onStateChanged(
@@ -592,6 +631,7 @@ void ConnectionState::Widget::setLayout(const Layout &layout) {
 	_currentLayout = layout;
 	_proxyIcon->setToggled(_currentLayout.proxyEnabled);
 	refreshRetryLink(_currentLayout.hasRetry);
+	setAccessibleName(_currentLayout.text);
 }
 
 void ConnectionState::Widget::setProgressVisibility(bool visible) {

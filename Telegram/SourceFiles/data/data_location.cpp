@@ -10,6 +10,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "ui/image/image.h"
 #include "data/data_file_origin.h"
 
+#include <cmath>
+
 namespace Data {
 namespace {
 
@@ -20,10 +22,39 @@ namespace {
 
 } // namespace
 
-LocationPoint::LocationPoint(const MTPDgeoPoint &point)
-: _lat(point.vlat().v)
-, _lon(point.vlong().v)
-, _access(point.vaccess_hash().v) {
+bool ValidGeoCoordinates(float64 lat, float64 lon) {
+	return std::isfinite(lat)
+		&& std::isfinite(lon)
+		&& (std::abs(lat) <= 90.)
+		&& (std::abs(lon) <= 180.);
+}
+
+LocationPoint::LocationPoint(float64 lat, float64 lon, uint64 accessHash)
+: _lat(lat)
+, _lon(lon)
+, _access(accessHash) {
+}
+
+std::optional<LocationPoint> LocationPoint::FromMTP(
+		const MTPGeoPoint &point) {
+	return point.match([](const MTPDgeoPoint &data) {
+		return FromCoordinates(
+			data.vlat().v,
+			data.vlong().v,
+			data.vaccess_hash().v);
+	}, [](const MTPDgeoPointEmpty &) {
+		return std::optional<LocationPoint>();
+	});
+}
+
+std::optional<LocationPoint> LocationPoint::FromCoordinates(
+		float64 lat,
+		float64 lon,
+		uint64 accessHash) {
+	if (!ValidGeoCoordinates(lat, lon)) {
+		return std::nullopt;
+	}
+	return LocationPoint(lat, lon, accessHash);
 }
 
 QString LocationPoint::latAsString() const {
@@ -62,7 +93,7 @@ size_t LocationPoint::hash() const {
 }
 
 GeoPointLocation ComputeLocation(const LocationPoint &point) {
-	const auto scale = 1 + (cScale() * cIntRetinaFactor()) / 200;
+	const auto scale = 1 + (cScale() * style::DevicePixelRatio()) / 200;
 	const auto zoom = 13 + (scale - 1);
 	const auto w = st::locationSize.width() / scale;
 	const auto h = st::locationSize.height() / scale;

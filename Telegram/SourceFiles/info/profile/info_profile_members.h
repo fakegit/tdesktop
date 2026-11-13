@@ -10,6 +10,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "ui/rp_widget.h"
 #include "boxes/peer_list_box.h"
 
+class ParticipantsBoxController;
+
 namespace Ui {
 class InputField;
 class CrossButton;
@@ -19,6 +21,10 @@ struct ScrollToRequest;
 class AbstractButton;
 class SettingsButton;
 } // namespace Ui
+
+namespace Window {
+class Show;
+} // namespace Window
 
 namespace Info {
 
@@ -39,15 +45,24 @@ class Members
 public:
 	Members(
 		QWidget *parent,
-		not_null<Controller*> controller);
+		not_null<Controller*> controller,
+		bool skipHeader = false);
 
 	rpl::producer<Ui::ScrollToRequest> scrollToRequests() const;
+
+	void applySearchQuery(const QString &query);
+
+	void setGroupByRole(bool grouped);
+	[[nodiscard]] rpl::producer<bool> groupByRoleValue() const;
+	[[nodiscard]] rpl::producer<bool> groupByRoleAvailableValue() const;
+	[[nodiscard]] rpl::producer<bool> rowsVisibleValue() const;
 
 	std::unique_ptr<MembersState> saveState();
 	void restoreState(std::unique_ptr<MembersState> state);
 
-	int desiredHeight() const;
-	rpl::producer<int> onlineCountValue() const;
+	[[nodiscard]] int desiredHeight() const;
+	[[nodiscard]] rpl::producer<int> onlineCountValue() const;
+	[[nodiscard]] rpl::producer<int> fullCountValue() const;
 
 protected:
 	void visibleTopBottomUpdated(
@@ -71,6 +86,7 @@ private:
 	void peerListFinishSelectedRowsBunch() override;
 	void peerListSetDescription(
 		object_ptr<Ui::FlatLabel> description) override;
+	std::shared_ptr<Main::SessionShow> peerListUiShow() override;
 
 	//void peerListAppendRow(
 	//	std::unique_ptr<PeerListRow> row) override {
@@ -102,10 +118,13 @@ private:
 	void updateHeaderControlsGeometry(int newWidth);
 	//void updateSearchEnabledByContent();
 
+	std::shared_ptr<Main::SessionShow> _show;
+
 	//Wrap _wrap;
 	not_null<Controller*> _controller;
+	const bool _skipHeader = false;
 	not_null<PeerData*> _peer;
-	std::unique_ptr<PeerListController> _listController;
+	std::unique_ptr<ParticipantsBoxController> _listController;
 	object_ptr<Ui::RpWidget> _header = { nullptr };
 	object_ptr<ListWidget> _list = { nullptr };
 
@@ -122,6 +141,7 @@ private:
 	//base::Timer _searchTimer;
 
 	rpl::event_stream<Ui::ScrollToRequest> _scrollToRequests;
+	rpl::variable<bool> _rowsVisible = false;
 
 };
 

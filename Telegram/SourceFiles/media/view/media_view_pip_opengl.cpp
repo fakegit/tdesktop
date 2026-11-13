@@ -12,8 +12,9 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "ui/widgets/shadow.h"
 #include "media/streaming/media_streaming_common.h"
 #include "base/platform/base_platform_info.h"
+#include "styles/style_basic.h"
 #include "styles/style_media_view.h"
-#include "styles/style_calls.h" // st::callShadow.
+#include "styles/style_widgets.h"
 
 namespace Media::View {
 namespace {
@@ -148,7 +149,7 @@ vec4 shadow() {
 Pip::RendererGL::RendererGL(not_null<Pip*> owner)
 : _owner(owner) {
 	style::PaletteChanged(
-	) | rpl::start_with_next([=] {
+	) | rpl::on_next([=] {
 		_radialImage.invalidate();
 		_playbackImage.invalidate();
 		_volumeControllerImage.invalidate();
@@ -156,9 +157,7 @@ Pip::RendererGL::RendererGL(not_null<Pip*> owner)
 	}, _lifetime);
 }
 
-void Pip::RendererGL::init(
-		not_null<QOpenGLWidget*> widget,
-		QOpenGLFunctions &f) {
+void Pip::RendererGL::init(QOpenGLFunctions &f) {
 	constexpr auto kQuads = 8;
 	constexpr auto kQuadVertices = kQuads * 4;
 	constexpr auto kQuadValues = kQuadVertices * 4;
@@ -195,6 +194,17 @@ void Pip::RendererGL::init(
 			FragmentRoundToShadow(),
 		}));
 
+	_nv12ChromaFormat = TwoComponentTextureFormat();
+	_nv12Program.emplace();
+	LinkProgram(
+		&*_nv12Program,
+		_texturedVertexShader,
+		FragmentShader({
+			FragmentSampleNV12Texture(_nv12ChromaFormat),
+			FragmentApplyFade(),
+			FragmentRoundToShadow(),
+		}));
+
 	_imageProgram.emplace();
 	LinkProgram(
 		&*_imageProgram,
@@ -223,26 +233,37 @@ void Pip::RendererGL::init(
 	createShadowTexture();
 }
 
-void Pip::RendererGL::deinit(
-		not_null<QOpenGLWidget*> widget,
-		QOpenGLFunctions *f) {
+void Pip::RendererGL::deinit(QOpenGLFunctions *f) {
+	_radialImage.destroy(f);
+	_controlsImage.destroy(f);
+	_playbackImage.destroy(f);
+	_volumeControllerImage.destroy(f);
+	_shadowImage.destroy(f);
 	_textures.destroy(f);
+	_rgbaSize = QSize();
+	_lumaSize = QSize();
+	_chromaSize = QSize();
+	_chromaSizeV = QSize();
+	_chromaNV12 = false;
+	_trackFrameIndex = 0;
+	_cacheKey = 0;
 	_imageProgram = std::nullopt;
 	_texturedVertexShader = nullptr;
 	_argb32Program = std::nullopt;
 	_yuv420Program = std::nullopt;
+	_nv12Program = std::nullopt;
 	_controlsProgram = std::nullopt;
 	_contentBuffer = std::nullopt;
 }
 
 void Pip::RendererGL::createShadowTexture() {
-	const auto &shadow = st::callShadow;
-	const auto size = 2 * st::callShadow.topLeft.size()
+	const auto &shadow = PipShadow();
+	const auto size = 2 * PipShadow().topLeft.size()
 		+ QSize(st::roundRadiusLarge, st::roundRadiusLarge);
 	auto image = QImage(
-		size * cIntRetinaFactor(),
+		size * style::DevicePixelRatio(),
 		QImage::Format_ARGB32_Premultiplied);
-	image.setDevicePixelRatio(cRetinaFactor());
+	image.setDevicePixelRatio(style::DevicePixelRatio());
 	image.fill(Qt::transparent);
 	{
 		auto p = QPainter(&image);
@@ -258,9 +279,10 @@ void Pip::RendererGL::createShadowTexture() {
 void Pip::RendererGL::paint(
 		not_null<QOpenGLWidget*> widget,
 		QOpenGLFunctions &f) {
-	const auto factor = widget->devicePixelRatio();
+	const auto factor = widget->devicePixelRatioF();
 	if (_factor != factor) {
 		_factor = factor;
+		_ifactor = int(std::ceil(_factor));
 		_controlsImage.invalidate();
 	}
 	_blendingEnabled = false;
@@ -285,14 +307,24 @@ void Pip::RendererGL::paintTransformedVideoFrame(
 	}
 	geometry.rotation = (geometry.rotation + geometry.videoRotation) % 360;
 	if (data.format == Streaming::FrameFormat::ARGB32) {
-		Assert(!data.original.isNull());
-		paintTransformedStaticContent(data.original, geometry);
+		Assert(!data.image.isNull());
+		paintTransformedStaticContent(data.image, geometry);
+		return;
+	} else if (data.format == Streaming::FrameFormat::NativeTexture) {
+		const auto image = _owner->currentVideoFrameImage();
+		if (!image.isNull()) {
+			paintTransformedStaticContent(image, geometry);
+		}
 		return;
 	}
-	Assert(data.format == Streaming::FrameFormat::YUV420);
-	Assert(!data.yuv420->size.isEmpty());
-	const auto yuv = data.yuv420;
-	_yuv420Program->bind();
+	Assert(!data.yuv->size.isEmpty());
+	const auto program = (data.format == Streaming::FrameFormat::NV12)
+		? &*_nv12Program
+		: &*_yuv420Program;
+	program->bind();
+	const auto nv12 = (data.format == Streaming::FrameFormat::NV12);
+	const auto yuv = data.yuv;
+	const auto nv12changed = (_chromaNV12 != nv12);
 
 	const auto upload = (_trackFrameIndex != data.index);
 	_trackFrameIndex = data.index;
@@ -314,31 +346,42 @@ void Pip::RendererGL::paintTransformedVideoFrame(
 	_textures.bind(*_f, 2);
 	if (upload) {
 		uploadTexture(
-			GL_ALPHA,
-			GL_ALPHA,
+			nv12 ? _nv12ChromaFormat : GL_ALPHA,
+			nv12 ? _nv12ChromaFormat : GL_ALPHA,
 			yuv->chromaSize,
-			_chromaSize,
-			yuv->u.stride,
+			nv12changed ? QSize() : _chromaSize,
+			yuv->u.stride / (nv12 ? 2 : 1),
 			yuv->u.data);
-	}
-	_f->glActiveTexture(GL_TEXTURE2);
-	_textures.bind(*_f, 3);
-	if (upload) {
-		uploadTexture(
-			GL_ALPHA,
-			GL_ALPHA,
-			yuv->chromaSize,
-			_chromaSize,
-			yuv->v.stride,
-			yuv->v.data);
 		_chromaSize = yuv->chromaSize;
-		_f->glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+		if (nv12) {
+			_f->glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+		}
+		_chromaNV12 = nv12;
 	}
-	_yuv420Program->setUniformValue("y_texture", GLint(0));
-	_yuv420Program->setUniformValue("u_texture", GLint(1));
-	_yuv420Program->setUniformValue("v_texture", GLint(2));
+	if (!nv12) {
+		_f->glActiveTexture(GL_TEXTURE2);
+		_textures.bind(*_f, 3);
+		if (upload) {
+			uploadTexture(
+				GL_ALPHA,
+				GL_ALPHA,
+				yuv->chromaSize,
+				_chromaSizeV,
+				yuv->v.stride,
+				yuv->v.data);
+			_chromaSizeV = yuv->chromaSize;
+			_f->glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+		}
+	}
+	program->setUniformValue("y_texture", GLint(0));
+	if (nv12) {
+		program->setUniformValue("uv_texture", GLint(1));
+	} else {
+		program->setUniformValue("u_texture", GLint(1));
+		program->setUniformValue("v_texture", GLint(2));
+	}
 
-	paintTransformedContent(&*_yuv420Program, geometry);
+	paintTransformedContent(program, geometry);
 }
 
 void Pip::RendererGL::paintTransformedStaticContent(
@@ -400,28 +443,29 @@ void Pip::RendererGL::paintTransformedContent(
 		(geometry.outer.height() - geometry.inner.y()) * yscale,
 	};
 
+	_contentBuffer->bind();
 	_contentBuffer->write(0, coords, sizeof(coords));
 
 	const auto rgbaFrame = _chromaSize.isEmpty();
 	_f->glActiveTexture(rgbaFrame ? GL_TEXTURE1 : GL_TEXTURE3);
 	_shadowImage.bind(*_f);
 
-	const auto globalFactor = cIntRetinaFactor();
+	const auto globalFactor = style::DevicePixelRatio();
 	const auto fadeAlpha = st::radialBg->c.alphaF() * geometry.fade;
 	const auto roundRect = transformRect(RoundingRect(geometry));
 	program->setUniformValue("roundRect", Uniform(roundRect));
 	program->setUniformValue("h_texture", GLint(rgbaFrame ? 1 : 3));
 	program->setUniformValue("h_size", QSizeF(_shadowImage.image().size()));
 	program->setUniformValue("h_extend", QVector4D(
-		st::callShadow.extend.left() * globalFactor,
-		st::callShadow.extend.top() * globalFactor,
-		st::callShadow.extend.right() * globalFactor,
-		st::callShadow.extend.bottom() * globalFactor));
+		PipShadow().extend.left() * globalFactor,
+		PipShadow().extend.top() * globalFactor,
+		PipShadow().extend.right() * globalFactor,
+		PipShadow().extend.bottom() * globalFactor));
 	program->setUniformValue("h_components", QVector4D(
-		float(st::callShadow.topLeft.width() * globalFactor),
-		float(st::callShadow.topLeft.height() * globalFactor),
-		float(st::callShadow.left.width() * globalFactor),
-		float(st::callShadow.top.height() * globalFactor)));
+		float(PipShadow().topLeft.width() * globalFactor),
+		float(PipShadow().topLeft.height() * globalFactor),
+		float(PipShadow().left.width() * globalFactor),
+		float(PipShadow().top.height() * globalFactor)));
 	program->setUniformValue(
 		"roundRadius",
 		GLfloat(st::roundRadiusLarge * _factor));
@@ -471,7 +515,7 @@ void Pip::RendererGL::uploadTexture(
 void Pip::RendererGL::paintRadialLoading(
 		QRect inner,
 		float64 controlsShown) {
-	paintUsingRaster(_radialImage, inner, [&](Painter &&p) {
+	paintUsingRaster(_radialImage, inner, [&](QPainter &&p) {
 		// Raster renderer paints content, then radial loading, then fade.
 		// Here we paint fade together with the content, so we should emulate
 		// radial loading being under the fade.
@@ -485,9 +529,9 @@ void Pip::RendererGL::paintRadialLoading(
 		const auto fadeAlpha = controlsShown * fade.alphaF();
 		const auto fgAlpha = 1. - fadeAlpha;
 		const auto color = (fadeAlpha == 0.) ? fg : QColor(
-			int(std::round(fg.red() * fgAlpha + fade.red() * fadeAlpha)),
-			int(std::round(fg.green() * fgAlpha + fade.green() * fadeAlpha)),
-			int(std::round(fg.blue() * fgAlpha + fade.blue() * fadeAlpha)),
+			int(base::SafeRound(fg.red() * fgAlpha + fade.red() * fadeAlpha)),
+			int(base::SafeRound(fg.green() * fgAlpha + fade.green() * fadeAlpha)),
+			int(base::SafeRound(fg.blue() * fgAlpha + fade.blue() * fadeAlpha)),
 			fg.alpha());
 
 		_owner->paintRadialLoadingContent(p, newInner, color);
@@ -495,14 +539,14 @@ void Pip::RendererGL::paintRadialLoading(
 }
 
 void Pip::RendererGL::paintPlayback(QRect outer, float64 shown) {
-	paintUsingRaster(_playbackImage, outer, [&](Painter &&p) {
+	paintUsingRaster(_playbackImage, outer, [&](QPainter &&p) {
 		const auto newOuter = QRect(QPoint(), outer.size());
 		_owner->paintPlaybackContent(p, newOuter, shown);
 	}, kPlaybackOffset, true);
 }
 
 void Pip::RendererGL::paintVolumeController(QRect outer, float64 shown) {
-	paintUsingRaster(_volumeControllerImage, outer, [&](Painter &&p) {
+	paintUsingRaster(_volumeControllerImage, outer, [&](QPainter &&p) {
 		const auto newOuter = QRect(QPoint(), outer.size());
 		_owner->paintVolumeControllerContent(p, newOuter, shown);
 	}, kVolumeControllerOffset, true);
@@ -561,6 +605,7 @@ void Pip::RendererGL::paintButton(
 		iconOverRect.texture.right(), iconOverRect.texture.top(),
 		iconOverRect.texture.left(), iconOverRect.texture.top(),
 	};
+	_contentBuffer->bind();
 	_contentBuffer->write(
 		offset * 4 * sizeof(GLfloat),
 		coords,
@@ -585,20 +630,28 @@ void Pip::RendererGL::paintButton(
 
 auto Pip::RendererGL::ControlMeta(OverState control, int index)
 -> Control {
+	if (const auto result = FindControlMeta(control, index)) {
+		return *result;
+	}
+	Unexpected("Control value in Pip::RendererGL::ControlIndex.");
+}
+
+auto Pip::Renderer::FindControlMeta(OverState control, int index)
+-> std::optional<Control> {
 	Expects(index >= 0);
 
 	switch (control) {
-	case OverState::Close: Assert(index < 1); return {
+	case OverState::Close: Assert(index < 1); return Control{
 		0,
 		&st::pipCloseIcon,
 		&st::pipCloseIconOver,
 	};
-	case OverState::Enlarge: Assert(index < 1); return {
+	case OverState::Enlarge: Assert(index < 1); return Control{
 		1,
 		&st::pipEnlargeIcon,
 		&st::pipEnlargeIconOver,
 	};
-	case OverState::VolumeToggle: Assert(index < 3); return {
+	case OverState::VolumeToggle: Assert(index < 3); return Control{
 		(2 + index),
 		(index == 0
 			? &st::pipVolumeIcon0
@@ -611,13 +664,13 @@ auto Pip::RendererGL::ControlMeta(OverState control, int index)
 			? &st::pipVolumeIcon1Over
 			: &st::pipVolumeIcon2Over),
 	};
-	case OverState::Other: Assert(index < 2); return {
+	case OverState::Other: Assert(index < 2); return Control{
 		(5 + index),
 		(index ? &st::pipPauseIcon : &st::pipPlayIcon),
 		(index ? &st::pipPauseIconOver : &st::pipPlayIconOver),
 	};
 	}
-	Unexpected("Control value in Pip::RendererGL::ControlIndex.");
+	return std::nullopt;
 }
 
 void Pip::RendererGL::validateControls() {
@@ -633,6 +686,14 @@ void Pip::RendererGL::validateControls() {
 		ControlMeta(OverState::Other),
 		ControlMeta(OverState::Other, 1),
 	};
+	_controlsImage.setImage(
+		PrepareControlsImage(metas, _controlsTextures, _ifactor));
+}
+
+QImage Pip::Renderer::PrepareControlsImage(
+		std::initializer_list<Control> metas,
+		std::array<QRect, kControlsCount * 2> &textures,
+		int factor) {
 	auto maxWidth = 0;
 	auto fullHeight = 0;
 	for (const auto &meta : metas) {
@@ -641,19 +702,19 @@ void Pip::RendererGL::validateControls() {
 		fullHeight += 2 * meta.icon->height();
 	}
 	auto image = QImage(
-		QSize(maxWidth, fullHeight) * _factor,
+		QSize(maxWidth, fullHeight) * factor,
 		QImage::Format_ARGB32_Premultiplied);
 	image.fill(Qt::transparent);
-	image.setDevicePixelRatio(_factor);
+	image.setDevicePixelRatio(factor);
 	{
 		auto p = QPainter(&image);
 		auto index = 0;
 		auto height = 0;
 		const auto paint = [&](not_null<const style::icon*> icon) {
 			icon->paint(p, 0, height, maxWidth);
-			_controlsTextures[index++] = QRect(
-				QPoint(0, height) * _factor,
-				icon->size() * _factor);
+			textures[index++] = QRect(
+				QPoint(0, height) * factor,
+				icon->size() * factor);
 			height += icon->height();
 		};
 		for (const auto &meta : metas) {
@@ -661,7 +722,7 @@ void Pip::RendererGL::validateControls() {
 			paint(meta.iconOver);
 		}
 	}
-	_controlsImage.setImage(std::move(image));
+	return image;
 }
 
 void Pip::RendererGL::invalidateControls() {
@@ -672,11 +733,11 @@ void Pip::RendererGL::invalidateControls() {
 void Pip::RendererGL::paintUsingRaster(
 		Ui::GL::Image &image,
 		QRect rect,
-		Fn<void(Painter&&)> method,
+		Fn<void(QPainter&&)> method,
 		int bufferOffset,
 		bool transparent) {
 	auto raster = image.takeImage();
-	const auto size = rect.size() * _factor;
+	const auto size = rect.size() * _ifactor;
 	if (raster.width() < size.width() || raster.height() < size.height()) {
 		raster = QImage(size, QImage::Format_ARGB32_Premultiplied);
 		raster.setDevicePixelRatio(_factor);
@@ -685,14 +746,14 @@ void Pip::RendererGL::paintUsingRaster(
 				|| raster.height() > size.height())) {
 			raster.fill(Qt::transparent);
 		}
-	} else if (raster.devicePixelRatio() != _factor) {
-		raster.setDevicePixelRatio(_factor);
+	} else if (raster.devicePixelRatio() != _ifactor) {
+		raster.setDevicePixelRatio(_ifactor);
 	}
 
 	if (transparent) {
 		raster.fill(Qt::transparent);
 	}
-	method(Painter(&raster));
+	method(QPainter(&raster));
 
 	_f->glActiveTexture(GL_TEXTURE0);
 
@@ -714,6 +775,7 @@ void Pip::RendererGL::paintUsingRaster(
 		geometry.left(), geometry.bottom(),
 		textured.texture.left(), textured.texture.top(),
 	};
+	_contentBuffer->bind();
 	_contentBuffer->write(
 		bufferOffset * 4 * sizeof(GLfloat),
 		coords,
@@ -749,14 +811,14 @@ QRect Pip::RendererGL::RoundingRect(ContentGeometry geometry) {
 		inner.y(),
 		geometry.outer.width() - inner.x() - inner.width(),
 		geometry.outer.height() - inner.y() - inner.height(),
-		st::callShadow.topLeft.width(),
-		st::callShadow.topLeft.height(),
-		st::callShadow.topRight.width(),
-		st::callShadow.topRight.height(),
-		st::callShadow.bottomRight.width(),
-		st::callShadow.bottomRight.height(),
-		st::callShadow.bottomLeft.width(),
-		st::callShadow.bottomLeft.height(),
+		PipShadow().topLeft.width(),
+		PipShadow().topLeft.height(),
+		PipShadow().topRight.width(),
+		PipShadow().topRight.height(),
+		PipShadow().bottomRight.width(),
+		PipShadow().bottomRight.height(),
+		PipShadow().bottomLeft.width(),
+		PipShadow().bottomLeft.height(),
 	});
 	return geometry.inner.marginsAdded({
 		(attached & RectPart::Left) ? added : 0,

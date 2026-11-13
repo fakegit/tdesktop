@@ -9,6 +9,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 #include "base/flat_set.h"
 
+class QDebug;
+
 namespace MTP {
 
 class Error {
@@ -39,7 +41,8 @@ private:
 };
 
 inline bool IsFloodError(const QString &type) {
-	return type.startsWith(qstr("FLOOD_WAIT_"));
+	return type.startsWith(u"FLOOD_WAIT_"_q)
+		|| type.startsWith(u"FLOOD_PREMIUM_WAIT_"_q);
 }
 
 inline bool IsFloodError(const Error &error) {
@@ -52,6 +55,17 @@ inline bool IsTemporaryError(const Error &error) {
 
 inline bool IsDefaultHandledError(const Error &error) {
 	return IsTemporaryError(error);
+}
+
+inline bool IgnoreError(const Error &error) {
+	return error.code() == 406;
+}
+
+template <typename ShowPtr>
+void ShowErrorFallback(const ShowPtr &show, const Error &error) {
+	if (!IgnoreError(error)) {
+		show->showToast(error.type());
+	}
 }
 
 struct Response {
@@ -67,5 +81,7 @@ struct ResponseHandler {
 	DoneHandler done;
 	FailHandler fail;
 };
+
+[[nodiscard]] QDebug operator<<(QDebug debug, const Error &error);
 
 } // namespace MTP

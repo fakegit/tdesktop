@@ -10,12 +10,18 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "calls/group/calls_group_viewport_tile.h"
 #include "calls/group/calls_group_viewport_opengl.h"
 #include "calls/group/calls_group_viewport_raster.h"
+#if QT_VERSION >= QT_VERSION_CHECK(6, 7, 0) && !defined DESKTOP_APP_DISABLE_PRIVATE_QT_API
+#include "calls/group/calls_group_viewport_rhi.h"
+#include "ui/rhi/rhi_renderer.h"
+#include <rhi/qrhi.h>
+#endif
 #include "calls/group/calls_group_common.h"
 #include "calls/group/calls_group_call.h"
 #include "calls/group/calls_group_members_row.h"
 #include "media/view/media_view_pip.h"
 #include "base/platform/base_platform_info.h"
 #include "webrtc/webrtc_video_track.h"
+#include "ui/integration.h"
 #include "ui/painter.h"
 #include "ui/abstract_button.h"
 #include "ui/gl/gl_surface.h"
@@ -25,8 +31,9 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "lang/lang_keys.h"
 #include "styles/style_calls.h"
 
+#include <QOpenGLShader>
 #include <QtGui/QtEvents>
-#include <QtGui/QOpenGLShader>
+#include <QOpenGLWidget>
 
 namespace Calls::Group {
 namespace {
@@ -50,23 +57,50 @@ namespace {
 Viewport::Viewport(
 	not_null<QWidget*> parent,
 	PanelMode mode,
-	Ui::GL::Backend backend)
+	Ui::GL::Backend backend,
+	Ui::RpWidgetWrap *borrowedRp,
+	bool borrowedOpenGL)
 : _mode(mode)
-, _content(Ui::GL::CreateSurface(parent, chooseRenderer(backend))) {
+, _opengl(borrowedOpenGL)
+, _qrhi(borrowedRp && (backend == Ui::GL::Backend::QRhi))
+, _content(borrowedRp
+	? nullptr
+	: Ui::GL::CreateSurface(parent, chooseRenderer(backend)))
+, _borrowed(borrowedRp) {
 	setup();
 }
 
-Viewport::~Viewport() = default;
+Viewport::~Viewport() {
+	if (_borrowed) {
+		// QRhi sets _opengl too, but must drop its QRhi cleanup callback.
+		if (_opengl && !_qrhi) {
+			const auto w = static_cast<QOpenGLWidget*>(widget().get());
+			w->makeCurrent();
+			const auto context = w->context();
+			const auto valid = w->isValid()
+				&& context
+				&& (QOpenGLContext::currentContext() == context);
+			ensureBorrowedCleared(valid ? context->functions() : nullptr);
+		} else {
+			ensureBorrowedCleared();
+		}
+	}
+	_content.release();
+}
 
 not_null<QWidget*> Viewport::widget() const {
-	return _content->rpWidget();
+	return _borrowed ? _borrowed->rpWidget() : _content->rpWidget();
 }
 
 not_null<Ui::RpWidgetWrap*> Viewport::rp() const {
-	return _content.get();
+	return _borrowed ? _borrowed : _content.get();
 }
 
 void Viewport::setup() {
+	if (_borrowed) {
+		return;
+	}
+
 	const auto raw = widget();
 
 	raw->resize(0, 0);
@@ -75,13 +109,13 @@ void Viewport::setup() {
 
 	_content->sizeValue(
 	) | rpl::filter([=] {
-		return wide();
-	}) | rpl::start_with_next([=] {
+		return wide() || videoStream();
+	}) | rpl::on_next([=] {
 		updateTilesGeometry();
 	}, lifetime());
 
 	_content->events(
-	) | rpl::start_with_next([=](not_null<QEvent*> e) {
+	) | rpl::on_next([=](not_null<QEvent*> e) {
 		const auto type = e->type();
 		if (type == QEvent::Enter) {
 			Ui::Integration::Instance().registerLeaveSubscription(raw);
@@ -104,20 +138,30 @@ void Viewport::setup() {
 	}, lifetime());
 }
 
-void Viewport::setGeometry(QRect geometry) {
-	Expects(wide());
+void Viewport::setGeometry(bool fullscreen, QRect geometry) {
+	Expects(wide() || videoStream());
 
+	if (_borrowed) {
+		updateMyWidgetPart();
+		_borrowedGeometry = geometry;
+		updateMyWidgetPart();
+		updateTilesGeometry();
+		return;
+	}
+
+	const auto changed = (_fullscreen != fullscreen);
+	if (changed) {
+		_fullscreen = fullscreen;
+	}
 	if (widget()->geometry() != geometry) {
-		_geometryStaleAfterModeChange = false;
 		widget()->setGeometry(geometry);
-	} else if (_geometryStaleAfterModeChange) {
-		_geometryStaleAfterModeChange = false;
+	} else if (changed) {
 		updateTilesGeometry();
 	}
 }
 
 void Viewport::resizeToWidth(int width) {
-	Expects(!wide());
+	Expects(!wide() && !videoStream());
 
 	updateTilesGeometry(width);
 }
@@ -134,6 +178,10 @@ bool Viewport::wide() const {
 	return (_mode == PanelMode::Wide);
 }
 
+bool Viewport::videoStream() const {
+	return (_mode == PanelMode::VideoStream);
+}
+
 void Viewport::setMode(PanelMode mode, not_null<QWidget*> parent) {
 	if (_mode == mode && widget()->parent() == parent) {
 		return;
@@ -148,7 +196,7 @@ void Viewport::setMode(PanelMode mode, not_null<QWidget*> parent) {
 			widget()->show();
 		}
 	}
-	if (!wide()) {
+	if (!wide() && !videoStream()) {
 		for (const auto &tile : _tiles) {
 			tile->toggleTopControlsShown(false);
 		}
@@ -168,7 +216,9 @@ void Viewport::handleMouseRelease(QPoint position, Qt::MouseButton button) {
 	setPressed({});
 	if (const auto tile = pressed.tile) {
 		if (pressed == _selected) {
-			if (button == Qt::RightButton) {
+			if (videoStream()) {
+				return;
+			} else if (button == Qt::RightButton) {
 				tile->row()->showContextMenu();
 			} else if (!wide()
 				|| (_hasTwoOrMore && !_large)
@@ -186,7 +236,7 @@ void Viewport::handleMouseMove(QPoint position) {
 }
 
 void Viewport::updateSelected(QPoint position) {
-	if (!widget()->rect().contains(position)) {
+	if (_borrowed || !widget()->rect().contains(position)) {
 		setSelected({});
 		return;
 	}
@@ -214,35 +264,63 @@ void Viewport::updateSelected(QPoint position) {
 }
 
 void Viewport::updateSelected() {
+	if (_borrowed) {
+		return;
+	}
 	updateSelected(widget()->mapFromGlobal(QCursor::pos()));
 }
 
 void Viewport::setControlsShown(float64 shown) {
 	_controlsShownRatio = shown;
-	widget()->update();
+	updateMyWidgetPart();
+}
+
+void Viewport::updateMyWidgetPart() {
+	if (!_borrowed) {
+		widget()->update();
+	} else if (!_borrowedGeometry.isEmpty()) {
+		widget()->update(_borrowedGeometry);
+	}
+}
+
+void Viewport::setCursorShown(bool shown) {
+	if (_cursorHidden == shown) {
+		_cursorHidden = !shown;
+		updateCursor();
+	}
 }
 
 void Viewport::add(
 		const VideoEndpoint &endpoint,
 		VideoTileTrack track,
 		rpl::producer<QSize> trackSize,
-		rpl::producer<bool> pinned) {
+		rpl::producer<bool> pinned,
+		bool self,
+		bool shown) {
+	// Tiles are added async (see Panel::setupVideo), so a quick
+	// deactivate + activate of the same endpoint queues two additions,
+	// while the removal between them is a no-op (no tile added yet).
+	// A duplicate tile is never removed afterwards and outlives both
+	// its member row and its video track, crashing the GL renderer.
+	remove(endpoint);
 	_tiles.push_back(std::make_unique<VideoTile>(
 		endpoint,
 		track,
 		std::move(trackSize),
 		std::move(pinned),
-		[=] { widget()->update(); }));
+		[=] { updateMyWidgetPart(); },
+		self,
+		shown));
 
 	_tiles.back()->trackSizeValue(
 	) | rpl::filter([](QSize size) {
 		return !size.isEmpty();
-	}) | rpl::start_with_next([=] {
+	}) | rpl::on_next([=] {
 		updateTilesGeometry();
 	}, _tiles.back()->lifetime());
 
 	_tiles.back()->track()->stateValue(
-	) | rpl::start_with_next([=] {
+	) | rpl::on_next([=] {
 		updateTilesGeometry();
 	}, _tiles.back()->lifetime());
 }
@@ -282,6 +360,18 @@ void Viewport::remove(const VideoEndpoint &endpoint) {
 	}
 }
 
+void Viewport::removeByRow(not_null<MembersRow*> row) {
+	auto endpoints = std::vector<VideoEndpoint>();
+	for (const auto &tile : _tiles) {
+		if (tile->row().get() == row.get()) {
+			endpoints.push_back(tile->endpoint());
+		}
+	}
+	for (const auto &endpoint : endpoints) {
+		remove(endpoint);
+	}
+}
+
 void Viewport::prepareLargeChangeAnimation() {
 	if (!wide()) {
 		return;
@@ -311,7 +401,8 @@ void Viewport::prepareLargeChangeAnimation() {
 void Viewport::startLargeChangeAnimation() {
 	Expects(!_largeChangeAnimation.animating());
 
-	if (!wide()
+	if (_borrowed
+		|| !wide()
 		|| anim::Disabled()
 		|| (_startTilesLayout.list.size() < 2)
 		|| !_opengl
@@ -401,7 +492,7 @@ Viewport::Layout Viewport::applyLarge(Layout layout) const {
 }
 
 void Viewport::updateTilesAnimated() {
-	if (!_largeChangeAnimation.animating()) {
+	if (_borrowed || !_largeChangeAnimation.animating()) {
 		updateTilesGeometry();
 		return;
 	}
@@ -461,15 +552,15 @@ Viewport::Layout Viewport::countWide(int outerWidth, int outerHeight) const {
 		const auto columns = slices;
 		const auto sizew = (outerWidth + skip) / float64(columns);
 		for (auto column = 0; column != columns; ++column) {
-			const auto left = int(std::round(column * sizew));
-			const auto width = int(std::round(column * sizew + sizew - skip))
-				- left;
-			const auto rows = int(std::round((count - index)
+			const auto left = int(base::SafeRound(column * sizew));
+			const auto width = int(
+				base::SafeRound(column * sizew + sizew - skip)) - left;
+			const auto rows = int(base::SafeRound((count - index)
 				/ float64(columns - column)));
 			const auto sizeh = (outerHeight + skip) / float64(rows);
 			for (auto row = 0; row != rows; ++row) {
-				const auto top = int(std::round(row * sizeh));
-				const auto height = int(std::round(
+				const auto top = int(base::SafeRound(row * sizeh));
+				const auto height = int(base::SafeRound(
 					row * sizeh + sizeh - skip)) - top;
 				auto &geometry = sizes[index];
 				geometry.columns = {
@@ -493,15 +584,15 @@ Viewport::Layout Viewport::countWide(int outerWidth, int outerHeight) const {
 		const auto rows = slices;
 		const auto sizeh = (outerHeight + skip) / float64(rows);
 		for (auto row = 0; row != rows; ++row) {
-			const auto top = int(std::round(row * sizeh));
-			const auto height = int(std::round(row * sizeh + sizeh - skip))
-				- top;
-			const auto columns = int(std::round((count - index)
+			const auto top = int(base::SafeRound(row * sizeh));
+			const auto height = int(
+				base::SafeRound(row * sizeh + sizeh - skip)) - top;
+			const auto columns = int(base::SafeRound((count - index)
 				/ float64(rows - row)));
 			const auto sizew = (outerWidth + skip) / float64(columns);
 			for (auto column = 0; column != columns; ++column) {
-				const auto left = int(std::round(column * sizew));
-				const auto width = int(std::round(
+				const auto left = int(base::SafeRound(column * sizew));
+				const auto width = int(base::SafeRound(
 					column * sizew + sizew - skip)) - left;
 				auto &geometry = sizes[index];
 				geometry.rows = {
@@ -525,7 +616,11 @@ Viewport::Layout Viewport::countWide(int outerWidth, int outerHeight) const {
 }
 
 void Viewport::showLarge(const VideoEndpoint &endpoint) {
-	// If a video get's switched off, GroupCall first unpins it,
+	if (_borrowed) {
+		return;
+	}
+
+	// If a video gets switched off, GroupCall first unpins it,
 	// then removes it from Large endpoint, then removes from active tracks.
 	//
 	// If we want to animate large video removal properly, we need to
@@ -552,7 +647,9 @@ void Viewport::showLarge(const VideoEndpoint &endpoint) {
 }
 
 void Viewport::updateTilesGeometry() {
-	updateTilesGeometry(widget()->width());
+	updateTilesGeometry(_borrowed
+		? _borrowedGeometry.width()
+		: widget()->width());
 }
 
 void Viewport::updateTilesGeometry(int outerWidth) {
@@ -561,16 +658,18 @@ void Viewport::updateTilesGeometry(int outerWidth) {
 		if (mouseInside) {
 			updateSelected();
 		}
-		widget()->update();
+		updateMyWidgetPart();
 	});
 
-	const auto outerHeight = widget()->height();
+	const auto outerHeight = _borrowed
+		? _borrowedGeometry.height()
+		: widget()->height();
 	if (_tiles.empty() || !outerWidth) {
 		_fullHeight = 0;
 		return;
 	}
 
-	if (wide()) {
+	if (wide() || videoStream()) {
 		updateTilesGeometryWide(outerWidth, outerHeight);
 		refreshHasTwoOrMore();
 		_fullHeight = 0;
@@ -720,13 +819,13 @@ void Viewport::updateTilesGeometryColumn(int outerWidth) {
 			top += height + st::groupCallVideoSmallSkip;
 		}
 	};
-	const auto topPeer = _large ? _large->row()->peer().get() : nullptr;
+	const auto topPeer = _large ? _large->peer().get() : nullptr;
 	const auto reorderNeeded = [&] {
-		if (!_large) {
+		if (!topPeer) {
 			return false;
 		}
 		for (const auto &tile : _tiles) {
-			if (tile.get() != _large && tile->row()->peer() == topPeer) {
+			if (tile.get() != _large && tile->peer() == topPeer) {
 				return (tile.get() != _tiles.front().get())
 					&& !tile->trackOrUserpicSize().isEmpty();
 			}
@@ -742,7 +841,7 @@ void Viewport::updateTilesGeometryColumn(int outerWidth) {
 		ranges::stable_partition(
 			_tilesForOrder,
 			[&](not_null<VideoTile*> tile) {
-				return (tile->row()->peer() == topPeer);
+				return (tile->peer() == topPeer);
 			});
 		for (const auto &tile : _tilesForOrder) {
 			layoutNext(tile);
@@ -763,8 +862,10 @@ void Viewport::setTileGeometry(not_null<VideoTile*> tile, QRect geometry) {
 	const auto kSmall = style::ConvertScale(240);
 	const auto &endpoint = tile->endpoint();
 	const auto forceThumbnailQuality = !wide()
+		&& !videoStream()
 		&& (ranges::count(_tiles, false, &VideoTile::hidden) > 1);
-	const auto forceFullQuality = wide() && (tile.get() == _large);
+	const auto forceFullQuality = videoStream()
+		|| (wide() && (tile.get() == _large));
 	const auto quality = forceThumbnailQuality
 		? VideoQuality::Thumbnail
 		: (forceFullQuality || min >= kMedium)
@@ -793,8 +894,15 @@ void Viewport::setSelected(Selection value) {
 }
 
 void Viewport::updateCursor() {
+	if (_borrowed) {
+		return;
+	}
 	const auto pointer = _selected.tile && (!wide() || _hasTwoOrMore);
-	widget()->setCursor(pointer ? style::cur_pointer : style::cur_default);
+	widget()->setCursor(_cursorHidden
+		? Qt::BlankCursor
+		: pointer
+		? style::cur_pointer
+		: style::cur_default);
 }
 
 void Viewport::setPressed(Selection value) {
@@ -805,14 +913,40 @@ void Viewport::setPressed(Selection value) {
 }
 
 Ui::GL::ChosenRenderer Viewport::chooseRenderer(Ui::GL::Backend backend) {
+#if QT_VERSION >= QT_VERSION_CHECK(6, 7, 0) && !defined DESKTOP_APP_DISABLE_PRIVATE_QT_API
+	if (backend == Ui::GL::Backend::QRhi) {
+		_opengl = true;
+		_qrhi = true;
+		return {
+			.renderer = std::make_unique<RendererRhi>(this),
+			.backend = Ui::GL::Backend::QRhi,
+		};
+	}
+#else
+	if (backend == Ui::GL::Backend::QRhi) {
+		return {
+			.renderer = std::make_unique<RendererSW>(this),
+			.backend = Ui::GL::Backend::QRhi,
+		};
+	}
+#endif
 	_opengl = (backend == Ui::GL::Backend::OpenGL);
 	return {
-		.renderer = (_opengl
-			? std::unique_ptr<Ui::GL::Renderer>(
-				std::make_unique<RendererGL>(this))
-			: std::make_unique<RendererSW>(this)),
+		.renderer = makeRenderer(),
 		.backend = backend,
 	};
+}
+
+std::unique_ptr<Ui::GL::Renderer> Viewport::makeRenderer() {
+#if QT_VERSION >= QT_VERSION_CHECK(6, 7, 0) && !defined DESKTOP_APP_DISABLE_PRIVATE_QT_API
+	if (_qrhi) {
+		return std::make_unique<RendererRhi>(this);
+	}
+#endif
+	return _opengl
+		? std::unique_ptr<Ui::GL::Renderer>(
+			std::make_unique<RendererGL>(this))
+		: std::make_unique<RendererSW>(this);
 }
 
 bool Viewport::requireARGB32() const {
@@ -843,55 +977,123 @@ rpl::producer<bool> Viewport::mouseInsideValue() const {
 	return _mouseInside.value();
 }
 
-rpl::lifetime &Viewport::lifetime() {
-	return _content->lifetime();
+void Viewport::ensureBorrowedRenderer(QOpenGLFunctions &f) {
+	Expects(_borrowed != nullptr);
+	Expects(_opengl);
+
+	if (_borrowedRenderer) {
+		return;
+	}
+	_borrowedRenderer = makeRenderer();
+	_borrowedRenderer->init(f);
 }
 
-QImage GenerateShadow(
-		int height,
-		int topAlpha,
-		int bottomAlpha,
-		QColor color) {
-	Expects(topAlpha >= 0 && topAlpha < 256);
-	Expects(bottomAlpha >= 0 && bottomAlpha < 256);
-	Expects(height * style::DevicePixelRatio() < 65536);
+void Viewport::ensureBorrowedCleared(QOpenGLFunctions *f) {
+	Expects(_borrowed != nullptr);
+	Expects(_opengl);
 
-	const auto base = (uint32(color.red()) << 16)
-		| (uint32(color.green()) << 8)
-		| uint32(color.blue());
-	const auto premultiplied = (topAlpha == bottomAlpha) || !base;
-	auto result = QImage(
-		QSize(1, height * style::DevicePixelRatio()),
-		(premultiplied
-			? QImage::Format_ARGB32_Premultiplied
-			: QImage::Format_ARGB32));
-	if (topAlpha == bottomAlpha) {
-		color.setAlpha(topAlpha);
-		result.fill(color);
-		return result;
+	if (const auto renderer = base::take(_borrowedRenderer)) {
+		renderer->deinit(f);
 	}
-	constexpr auto kShift = 16;
-	constexpr auto kMultiply = (1U << kShift);
-	const auto values = std::abs(topAlpha - bottomAlpha);
-	const auto rows = uint32(result.height());
-	const auto step = (values * kMultiply) / (rows - 1);
-	const auto till = rows * uint32(step);
-	Assert(result.bytesPerLine() == sizeof(uint32));
-	auto ints = reinterpret_cast<uint32*>(result.bits());
-	if (topAlpha < bottomAlpha) {
-		for (auto i = uint32(0); i != till; i += step) {
-			*ints++ = base | ((topAlpha + (i >> kShift)) << 24);
+}
+
+void Viewport::borrowedPaint(QOpenGLFunctions &f) {
+	Expects(_borrowedRenderer != nullptr);
+	Expects(_opengl);
+
+	_borrowedRenderer->paint(static_cast<QOpenGLWidget*>(widget().get()), f);
+}
+
+void Viewport::ensureBorrowedRenderer() {
+	Expects(_borrowed != nullptr);
+	Expects(!_opengl);
+
+	if (_borrowedRenderer) {
+		return;
+	}
+	_borrowedRenderer = makeRenderer();
+}
+
+void Viewport::ensureBorrowedCleared() {
+	Expects(_borrowed != nullptr);
+	Expects(!_opengl || _qrhi);
+
+#if QT_VERSION >= QT_VERSION_CHECK(6, 7, 0) && !defined DESKTOP_APP_DISABLE_PRIVATE_QT_API
+	if (const auto rhi = base::take(_borrowedRhi)) {
+		rhi->removeCleanupCallback(this);
+	}
+#endif
+	base::take(_borrowedRenderer);
+}
+
+void Viewport::borrowedPaint(Painter &p, const QRegion &clip) {
+	Expects(_borrowedRenderer != nullptr);
+	Expects(!_opengl);
+
+	_borrowedRenderer->paintFallback(p, clip, Ui::GL::Backend::Raster);
+}
+
+#if QT_VERSION >= QT_VERSION_CHECK(6, 7, 0) && !defined DESKTOP_APP_DISABLE_PRIVATE_QT_API
+Ui::Rhi::Renderer *Viewport::ensureBorrowedRhi(
+		QRhi *rhi,
+		QRhiRenderTarget *rt,
+		QRhiCommandBuffer *cb) {
+	Expects(_borrowed != nullptr);
+
+	if (!_borrowedRenderer) {
+		_borrowedRenderer = makeRenderer();
+	}
+	if (const auto r = dynamic_cast<Ui::Rhi::Renderer*>(
+			_borrowedRenderer.get())) {
+		if (_borrowedRhi != rhi) {
+			if (_borrowedRhi) {
+				_borrowedRhi->removeCleanupCallback(this);
+			}
+			r->releaseResources();
+			_borrowedRhi = rhi;
+			rhi->addCleanupCallback(this, [=](QRhi*) {
+				_borrowedRhi = nullptr;
+				if (const auto renderer = dynamic_cast<Ui::Rhi::Renderer*>(
+						_borrowedRenderer.get())) {
+					renderer->releaseResources();
+				}
+			});
 		}
-	} else {
-		for (auto i = uint32(0); i != till; i += step) {
-			*ints++ = base | ((topAlpha - (i >> kShift)) << 24);
-		}
+		r->initialize(rhi, rt, cb);
+		return r;
 	}
-	if (!premultiplied) {
-		result = std::move(result).convertToFormat(
-			QImage::Format_ARGB32_Premultiplied);
+	return nullptr;
+}
+
+void Viewport::borrowedPaintOffscreen(
+		QRhi *rhi,
+		QRhiRenderTarget *rt,
+		QRhiCommandBuffer *cb) {
+	if (const auto r = ensureBorrowedRhi(rhi, rt, cb)) {
+		r->renderOffscreen(rhi, rt, cb);
 	}
-	return result;
+}
+
+void Viewport::borrowedPaintOnscreen(
+		QRhi *rhi,
+		QRhiRenderTarget *rt,
+		QRhiCommandBuffer *cb) {
+	if (_borrowedRhi != rhi) {
+		return;
+	}
+	if (const auto r = dynamic_cast<Ui::Rhi::Renderer*>(
+			_borrowedRenderer.get())) {
+		r->renderOnscreen(rhi, rt, cb);
+	}
+}
+#endif
+
+QPoint Viewport::borrowedOrigin() const {
+	return _borrowed ? _borrowedGeometry.topLeft() : QPoint();
+}
+
+rpl::lifetime &Viewport::lifetime() {
+	return _lifetime;
 }
 
 rpl::producer<QString> MuteButtonTooltip(not_null<GroupCall*> call) {
@@ -923,6 +1125,9 @@ rpl::producer<QString> MuteButtonTooltip(not_null<GroupCall*> call) {
 	//				: tr::lng_group_call_set_reminder();
 	//		}) | rpl::flatten_latest();
 	//	}
+	if (call->rtmp()) {
+		return nullptr;
+	}
 		return call->mutedValue(
 		) | rpl::map([](MuteState muted) {
 			switch (muted) {

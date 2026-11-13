@@ -10,10 +10,6 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include <rpl/event_stream.h>
 #include "window/section_widget.h"
 
-namespace Ui {
-class SettingsSlider;
-} // namespace Ui
-
 namespace Window {
 class ConnectionState;
 } // namespace Window
@@ -48,10 +44,13 @@ public:
 	bool showInternal(
 		not_null<Window::SectionMemento*> memento,
 		const Window::SectionShow &params) override;
+	bool showBackInternal() override;
 	std::shared_ptr<Window::SectionMemento> createMemento() override;
 
 	object_ptr<Ui::LayerWidget> moveContentToLayer(
 		QRect bodyGeometry) override;
+
+	rpl::producer<> removeRequests() const override;
 
 	// Float player interface.
 	bool floatPlayerHandleWheelEvent(QEvent *e) override;
@@ -63,6 +62,7 @@ protected:
 
 	void showAnimatedHook(
 		const Window::SectionSlideParams &params) override;
+	void paintEvent(QPaintEvent *e) override;
 
 private:
 	void init();

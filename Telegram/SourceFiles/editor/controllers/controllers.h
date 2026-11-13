@@ -9,7 +9,11 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 #include "editor/controllers/stickers_panel_controller.h"
 #include "editor/controllers/undo_controller.h"
-#include "ui/layers/box_content.h"
+#include "ui/layers/show.h"
+
+namespace ChatHelpers {
+class Show;
+} // namespace ChatHelpers
 
 namespace Editor {
 
@@ -17,17 +21,23 @@ struct Controllers final {
 	Controllers(
 		std::unique_ptr<StickersPanelController> stickersPanelController,
 		std::unique_ptr<UndoController> undoController,
-		Fn<void(object_ptr<Ui::BoxContent>)> showBox)
+		std::shared_ptr<Ui::Show> show,
+		std::shared_ptr<Ui::Show> layerShow,
+		std::shared_ptr<ChatHelpers::Show> sessionShow)
 	: stickersPanelController(std::move(stickersPanelController))
 	, undoController(std::move(undoController))
-	, showBox(std::move(showBox)) {
+	, show(std::move(show))
+	, layerShow(std::move(layerShow))
+	, sessionShow(std::move(sessionShow)) {
 	}
 	~Controllers() {
 	};
 
 	const std::unique_ptr<StickersPanelController> stickersPanelController;
 	const std::unique_ptr<UndoController> undoController;
-	const Fn<void(object_ptr<Ui::BoxContent>)> showBox;
+	const std::shared_ptr<Ui::Show> show;
+	const std::shared_ptr<Ui::Show> layerShow;
+	const std::shared_ptr<ChatHelpers::Show> sessionShow;
 };
 
 } // namespace Editor

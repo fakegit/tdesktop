@@ -27,28 +27,30 @@ constexpr auto kChangeViewerLimit = 2;
 
 } // namespace
 
-PinnedTracker::PinnedTracker(not_null<History*> history)
-: _history(history->migrateToOrMe())
-, _migratedPeer(_history->peer->migrateFrom()) {
+PinnedTracker::PinnedTracker(not_null<Data::Thread*> thread)
+: _thread(thread->migrateToOrMe())
+, _migratedPeer(_thread->asHistory()
+	? _thread->asHistory()->peer->migrateFrom()
+	: nullptr) {
 	using namespace rpl::mappers;
-	const auto has = [&](History *history) -> rpl::producer<bool> {
-		auto &changes = _history->session().changes();
-		const auto flag = Data::HistoryUpdate::Flag::PinnedMessages;
-		if (!history) {
+	const auto has = [&](Data::Thread *thread) -> rpl::producer<bool> {
+		const auto &changes = _thread->session().changes();
+		const auto flag = Data::EntryUpdate::Flag::HasPinnedMessages;
+		if (!thread) {
 			return rpl::single(false);
 		}
-		return changes.historyFlagsValue(history, flag) | rpl::map([=] {
-			return history->hasPinnedMessages();
+		return changes.entryFlagsValue(thread, flag) | rpl::map([=] {
+			return thread->hasPinnedMessages();
 		});
 	};
 	rpl::combine(
-		has(_history),
+		has(_thread),
 		has(_migratedPeer
-			? _history->owner().history(_migratedPeer).get()
+			? _thread->owner().history(_migratedPeer).get()
 			: nullptr),
 		_1 || _2
 	) | rpl::distinct_until_changed(
-	) | rpl::start_with_next([=](bool has) {
+	) | rpl::on_next([=](bool has) {
 		if (has) {
 			refreshViewer();
 		} else {
@@ -71,23 +73,39 @@ PinnedId PinnedTracker::currentMessageId() const {
 	return _current.current();
 }
 
+FullMsgId PinnedTracker::nextPinnedId(UniversalMsgId messageId) const {
+	const auto proj1 = [](FullMsgId id) {
+		return peerIsChannel(id.peer) ? id.msg : (id.msg - ServerMaxMsgId);
+	};
+	const auto proj2 = [](FullMsgId id) {
+		return id.msg;
+	};
+	const auto i = _migratedPeer
+		? ranges::upper_bound(_slice.ids, messageId, ranges::less(), proj1)
+		: ranges::upper_bound(_slice.ids, messageId, ranges::less(), proj2);
+	return (i != end(_slice.ids)) ? *i : FullMsgId();
+}
+
 void PinnedTracker::refreshViewer() {
 	if (_viewerAroundId == _aroundId) {
 		return;
 	}
 	_dataLifetime.destroy();
 	_viewerAroundId = _aroundId;
+	const auto peer = _thread->peer();
 	SharedMediaMergedViewer(
-		&_history->peer->session(),
+		&peer->session(),
 		SharedMediaMergedKey(
 			SparseIdsMergedSlice::Key(
-				_history->peer->id,
+				peer->id,
+				_thread->topicRootId(),
+				_thread->monoforumPeerId(),
 				_migratedPeer ? _migratedPeer->id : 0,
 				_viewerAroundId),
 			Storage::SharedMediaType::Pinned),
 		kLoadedLimit,
 		kLoadedLimit
-	) | rpl::start_with_next([=](const SparseIdsMergedSlice &result) {
+	) | rpl::on_next([=](const SparseIdsMergedSlice &result) {
 		_slice.fullCount = result.fullCount();
 		_slice.skippedBefore = result.skippedBefore();
 		_slice.skippedAfter = result.skippedAfter();
@@ -99,9 +117,9 @@ void PinnedTracker::refreshViewer() {
 		}
 		refreshCurrentFromSlice();
 		if (_slice.fullCount == 0) {
-			_history->setHasPinnedMessages(false);
+			_thread->setHasPinnedMessages(false);
 			if (_migratedPeer) {
-				const auto to = _history->owner().history(_migratedPeer);
+				const auto to = _thread->owner().history(_migratedPeer);
 				to->setHasPinnedMessages(false);
 			}
 		}
@@ -110,7 +128,7 @@ void PinnedTracker::refreshViewer() {
 
 void PinnedTracker::refreshCurrentFromSlice() {
 	const auto proj1 = [](FullMsgId id) {
-		return id.channel ? id.msg : (id.msg - ServerMaxMsgId);
+		return peerIsChannel(id.peer) ? id.msg : (id.msg - ServerMaxMsgId);
 	};
 	const auto proj2 = [](FullMsgId id) {
 		return id.msg;
@@ -153,7 +171,7 @@ void PinnedTracker::clear() {
 	_current = PinnedId();
 }
 
-void PinnedTracker::trackAround(MsgId messageId) {
+void PinnedTracker::trackAround(UniversalMsgId messageId) {
 	if (_aroundId == messageId) {
 		return;
 	}

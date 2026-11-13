@@ -44,10 +44,12 @@ public:
 protected:
 	void resizeEvent(QResizeEvent *e) override;
 	void paintEvent(QPaintEvent *e) override;
-	void enterEventHook(QEvent *e) override;
+	void enterEventHook(QEnterEvent *e) override;
 	void leaveEventHook(QEvent *e) override;
 
 private:
+	style::color listBackground() const override;
+
 	// Info::AbstractController implementation.
 	Info::Key key() const override;
 	PeerData *migrated() const override;
@@ -64,6 +66,9 @@ private:
 	void ensureCreated();
 	void performDestroy();
 
+	[[nodiscard]] Data::ForumTopic *listTopic() const;
+	[[nodiscard]] Data::SavedSublist *listSublist() const;
+
 	void updateControlsGeometry();
 	void refreshList();
 	void updateSize();
@@ -78,7 +83,7 @@ private:
 		return width() - contentLeft() - contentRight();
 	}
 	int contentHeight() const {
-		return height() - contentTop() - contentBottom();;
+		return height() - contentTop() - contentBottom();
 	}
 
 	void startAnimation();
@@ -101,7 +106,10 @@ private:
 
 	rpl::lifetime _refreshListLifetime;
 	PeerData *_listPeer = nullptr;
+	PeerData *_listMusicPeer = nullptr;
 	PeerData *_listMigratedPeer = nullptr;
+	MsgId _listTopicRootId = 0;
+	PeerId _listSublistPeerId = 0;
 
 };
 

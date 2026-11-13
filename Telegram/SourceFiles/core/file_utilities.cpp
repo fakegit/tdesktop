@@ -7,22 +7,31 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "core/file_utilities.h"
 
-#include "boxes/abstract_box.h"
-#include "storage/localstorage.h"
-#include "base/platform/base_platform_info.h"
 #include "base/platform/base_platform_file_utilities.h"
-#include "platform/platform_file_utilities.h"
-#include "core/application.h"
 #include "base/unixtime.h"
-#include "ui/delayed_activation.h"
-#include "ui/chat/attach/attach_extensions.h"
+#include "core/application.h"
+#include "core/click_handler_types.h"
+#include "core/version.h"
+#include "lang/lang_keys.h"
+#include "main/main_account.h"
+#include "main/main_app_config.h"
+#include "main/main_domain.h"
 #include "main/main_session.h"
+#include "platform/platform_file_utilities.h"
+#include "storage/localstorage.h"
+#include "storage/storage_account.h"
+#include "ui/chat/attach/attach_extensions.h"
+#include "ui/toast/toast.h"
+#include "ui/delayed_activation.h"
 #include "mainwindow.h"
 
-#include <QtWidgets/QFileDialog>
 #include <QtCore/QCoreApplication>
 #include <QtCore/QStandardPaths>
 #include <QtGui/QDesktopServices>
+#include <QtWidgets/QApplication>
+#include <QtWidgets/QFileDialog>
+
+#include <array>
 
 bool filedialogGetSaveFile(
 		QPointer<QWidget> parent,
@@ -81,8 +90,8 @@ QString filedialogDefaultName(
 		time_t t = time(NULL);
 		mylocaltime(&tm, &t);
 
-		QChar zero('0');
-		base = prefix + qsl("_%1-%2-%3_%4-%5-%6").arg(tm.tm_year + 1900).arg(tm.tm_mon + 1, 2, 10, zero).arg(tm.tm_mday, 2, 10, zero).arg(tm.tm_hour, 2, 10, zero).arg(tm.tm_min, 2, 10, zero).arg(tm.tm_sec, 2, 10, zero);
+		const auto zero = QChar('0');
+		base = prefix + u"_%1-%2-%3_%4-%5-%6"_q.arg(tm.tm_year + 1900).arg(tm.tm_mon + 1, 2, 10, zero).arg(tm.tm_mday, 2, 10, zero).arg(tm.tm_hour, 2, 10, zero).arg(tm.tm_min, 2, 10, zero).arg(tm.tm_sec, 2, 10, zero);
 	}
 
 	QString name;
@@ -95,7 +104,7 @@ QString filedialogDefaultName(
 			+ base;
 		name = nameBase + extension;
 		for (int i = 0; QFileInfo::exists(name); ++i) {
-			name = nameBase + qsl(" (%1)").arg(i + 2) + extension;
+			name = nameBase + u" (%1)"_q.arg(i + 2) + extension;
 		}
 	}
 	return name;
@@ -116,14 +125,61 @@ QString filedialogNextFilename(
 	const auto nameBase = (dir.endsWith('/') ? dir : (dir + '/')) + prefix;
 	auto result = nameBase + extension;
 	for (int i = 0; result.toLower() != cur.toLower() && QFileInfo::exists(result); ++i) {
-		result = nameBase + qsl(" (%1)").arg(i + 2) + extension;
+		result = nameBase + u" (%1)"_q.arg(i + 2) + extension;
 	}
 	return result;
 }
 
 namespace File {
 
+bool IsUrlSchemeAllowed(const QString &scheme) {
+	static const auto kSchemes = std::array{
+		u"http"_q,
+		u"https"_q,
+		u"ftp"_q,
+		u"itmss"_q,
+		u"mailto"_q,
+		u"tel"_q,
+		u"tg"_q,
+		u"ton"_q,
+		u"tonsite"_q,
+	};
+	if (ranges::contains(kSchemes, scheme)) {
+		return true;
+	}
+	if (scheme.size() <= 1
+		|| scheme.compare(u"file"_q, Qt::CaseInsensitive) == 0
+		|| scheme.compare(u"webdavs"_q, Qt::CaseInsensitive) == 0
+		|| !Core::IsAppLaunched()) {
+		return false;
+	}
+	for (const auto &[index, account] : Core::App().domain().accounts()) {
+		const auto protocols = account->appConfig().get<std::vector<QString>>(
+			"web_app_allowed_protocols",
+			{});
+		if (ranges::any_of(protocols, [&](const QString &protocol) {
+			return scheme.compare(protocol, Qt::CaseInsensitive) == 0;
+		})) {
+			return true;
+		}
+	}
+	return false;
+}
+
+void ShowUnsupportedUrl() {
+	const auto text = tr::lng_open_link_unsupported(tr::now);
+	if (const auto parent = QApplication::activeWindow()) {
+		Ui::Toast::Show(parent, text);
+	} else {
+		Ui::Toast::Show(text);
+	}
+}
+
 void OpenUrl(const QString &url) {
+	OpenUrlWithOwnAutoLogin(UrlWithoutWebAuthTokens(url));
+}
+
+void OpenUrlWithOwnAutoLogin(const QString &url) {
 	crl::on_main([=] {
 		Ui::PreventDelayedActivation();
 		Platform::File::UnsafeOpenUrl(url);
@@ -137,12 +193,14 @@ void OpenEmailLink(const QString &email) {
 	});
 }
 
-void OpenWith(const QString &filepath, QPoint menuPosition) {
+void OpenWith(const QString &filepath, Fn<void()> fallback) {
+	Expects(fallback != nullptr);
+
 	InvokeQueued(QCoreApplication::instance(), [=] {
-		if (!Platform::File::UnsafeShowOpenWithDropdown(filepath, menuPosition)) {
+		if (!Platform::File::UnsafeShowOpenWithDropdown(filepath)) {
 			Ui::PreventDelayedActivation();
 			if (!Platform::File::UnsafeShowOpenWith(filepath)) {
-				Platform::File::UnsafeLaunch(filepath);
+				fallback();
 			}
 		}
 	});
@@ -158,19 +216,22 @@ void Launch(const QString &filepath) {
 void ShowInFolder(const QString &filepath) {
 	crl::on_main([=] {
 		Ui::PreventDelayedActivation();
-		if (Platform::IsLinux()) {
-			// Hide mediaview to make other apps visible.
-			Ui::hideLayer(anim::type::instant);
-		}
 		base::Platform::ShowInFolder(filepath);
 	});
 }
 
 QString DefaultDownloadPathFolder(not_null<Main::Session*> session) {
+#if OS_MAC_STORE
+	return u"Telegram Lite"_q;
+#else // OS_MAC_STORE
 	return session->supportMode() ? u"Tsupport Desktop"_q : AppName.utf16();
+#endif // OS_MAC_STORE
 }
 
 QString DefaultDownloadPath(not_null<Main::Session*> session) {
+	if (!Core::App().canReadDefaultDownloadPath()) {
+		return session->local().tempDirectory();
+	}
 	return QStandardPaths::writableLocation(
 		QStandardPaths::DownloadLocation)
 		+ '/'
@@ -181,11 +242,18 @@ QString DefaultDownloadPath(not_null<Main::Session*> session) {
 namespace internal {
 
 void UnsafeOpenUrlDefault(const QString &url) {
-	QDesktopServices::openUrl(url);
+	const auto parsed = QUrl(url);
+	if (!parsed.isValid()
+		|| parsed.isLocalFile()
+		|| !IsUrlSchemeAllowed(parsed.scheme())) {
+		ShowUnsupportedUrl();
+		return;
+	}
+	QDesktopServices::openUrl(parsed);
 }
 
 void UnsafeOpenEmailLinkDefault(const QString &email) {
-	auto url = QUrl(qstr("mailto:") + email);
+	auto url = QUrl(u"mailto:"_q + email);
 	QDesktopServices::openUrl(url);
 }
 
@@ -311,9 +379,9 @@ void GetFolder(
 
 QString AllFilesFilter() {
 #ifdef Q_OS_WIN
-	return qsl("All files (*.*)");
+	return u"All files (*.*)"_q;
 #else // Q_OS_WIN
-	return qsl("All files (*)");
+	return u"All files (*)"_q;
 #endif // Q_OS_WIN
 }
 
@@ -330,8 +398,32 @@ QString ImagesOrAllFilter() {
 }
 
 QString PhotoVideoFilesFilter() {
-	return u"Image and Video Files (*.png *.jpg *.jpeg *.mp4 *.mov);;"_q
+	return u"Image and Video Files (*"_q
+		+ Ui::ImageExtensions().join(u" *"_q)
+		+ u" *.mp4 *.mov *.m4v);;"_q
 		+ AllFilesFilter();
+}
+
+QString PhotoVideoAudioFilesFilter() {
+	return u"Image, Video and Audio Files (*"_q
+		+ Ui::ImageExtensions().join(u" *"_q)
+		+ u" *.mp4 *.mov *.m4v *.webm"_q
+		+ u" *.mp3 *.m4a *.aac *.ogg *.flac *.opus *.oga)"_q;
+}
+
+QString AudioFilesFilter() {
+	return u"Audio Files (*.mp3 *.m4a *.aac *.ogg *.flac *.opus *.oga);;"_q
+		+ AllFilesFilter();
+}
+
+QString MusicFilesFilter() {
+	return u"Audio files (*.mp3 *.m4a *.flac *.ogg *.wav *.aac *.opus);;"_q
+		+ AllFilesFilter();
+}
+
+const QString &Tmp() {
+	static const auto tmp = u"tmp"_q;
+	return tmp;
 }
 
 namespace internal {
@@ -362,6 +454,9 @@ bool GetDefault(
 		? parent->window()
 		: Core::App().getFileDialogParent();
 	Core::App().notifyFileDialogShown(true);
+	const auto guard = gsl::finally([] {
+		Core::App().notifyFileDialogShown(false);
+	});
 	if (type == Type::ReadFiles) {
 		files = QFileDialog::getOpenFileNames(resolvedParent, caption, startFile, filter);
 		QString path = files.isEmpty() ? QString() : QFileInfo(files.back()).absoluteDir().absolutePath();
@@ -377,7 +472,6 @@ bool GetDefault(
 	} else {
 		file = QFileDialog::getOpenFileName(resolvedParent, caption, startFile, filter);
 	}
-	Core::App().notifyFileDialogShown(false);
 
 	if (file.isEmpty()) {
 		files = QStringList();

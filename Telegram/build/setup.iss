@@ -4,6 +4,7 @@
 #define MyAppURL "https://desktop.telegram.org"
 #define MyAppExeName "Telegram.exe"
 #define MyAppId "53F49750-6209-4FBF-9CA8-7A333C87D1ED"
+#define CurrentYear GetDateTimeString('yyyy','','')
 
 [Setup]
 ; NOTE: The value of AppId uniquely identifies this application.
@@ -12,6 +13,7 @@
 AppId={{{#MyAppId}}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
+AppCopyright={#MyAppPublisher} 2014-{#CurrentYear}
 AppPublisher={#MyAppPublisher}
 AppPublisherURL={#MyAppURL}
 AppSupportURL={#MyAppURL}
@@ -31,45 +33,62 @@ VersionInfoVersion={#MyAppVersion}.0
 CloseApplications=force
 DisableDirPage=no
 DisableProgramGroupPage=no
+WizardStyle=modern
+SignTool=sha256
 
-#if MyBuildTarget == "win64"
-ArchitecturesAllowed=x64
-ArchitecturesInstallIn64BitMode=x64
-OutputBaseFilename=tsetup-x64.{#MyAppVersionFull}
-#define ArchModulesFolder "x64"
+#ifndef MyOutputBaseFilename
+  #if MyBuildTarget == "winarm"
+    #define MyOutputBaseFilename "tsetup-arm64." + MyAppVersionFull
+  #elif MyBuildTarget == "win64"
+    #define MyOutputBaseFilename "tsetup-x64." + MyAppVersionFull
+  #else
+    #define MyOutputBaseFilename "tsetup." + MyAppVersionFull
+  #endif
+#endif
+OutputBaseFilename={#MyOutputBaseFilename}
+
+#if MyBuildTarget == "winarm"
+  ArchitecturesAllowed="arm64"
+  #define ArchModulesFolder "arm64"
+  AppVerName={#MyAppName} {#MyAppVersion} arm64
+#elif MyBuildTarget == "win64"
+  ArchitecturesAllowed="x64compatible"
+  ArchitecturesInstallIn64BitMode="x64compatible"
+  #define ArchModulesFolder "x64"
+  AppVerName={#MyAppName} {#MyAppVersion} 64bit
 #else
-OutputBaseFilename=tsetup.{#MyAppVersionFull}
-#define ArchModulesFolder "x86"
+  #define ArchModulesFolder "x86"
+  AppVerName={#MyAppName} {#MyAppVersion} 32bit
 #endif
 
 #define ModulesFolder "modules\" + ArchModulesFolder
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
-Name: "it"; MessagesFile: "compiler:Languages\Italian.isl"
-Name: "es"; MessagesFile: "compiler:Languages\Spanish.isl"
-Name: "de"; MessagesFile: "compiler:Languages\German.isl"
-Name: "nl"; MessagesFile: "compiler:Languages\Dutch.isl"
-Name: "pt_BR"; MessagesFile: "compiler:Languages\BrazilianPortuguese.isl"
-Name: "ru"; MessagesFile: "compiler:Languages\Russian.isl"
-Name: "fr"; MessagesFile: "compiler:Languages\French.isl"
-Name: "ua"; MessagesFile: "compiler:Languages\Ukrainian.isl"
+Name: "it";      MessagesFile: "compiler:Languages\Italian.isl"
+Name: "es";      MessagesFile: "compiler:Languages\Spanish.isl"
+Name: "de";      MessagesFile: "compiler:Languages\German.isl"
+Name: "nl";      MessagesFile: "compiler:Languages\Dutch.isl"
+Name: "pt_BR";   MessagesFile: "compiler:Languages\BrazilianPortuguese.isl"
+Name: "ru";      MessagesFile: "compiler:Languages\Russian.isl"
+Name: "fr";      MessagesFile: "compiler:Languages\French.isl"
+Name: "ua";      MessagesFile: "compiler:Languages\Ukrainian.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
-Name: "quicklaunchicon"; Description: "{cm:CreateQuickLaunchIcon}"; GroupDescription: "{cm:AdditionalIcons}"; OnlyBelowVersion: 0,6.1
 
 [Files]
 Source: "{#ReleasePath}\Telegram.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#ReleasePath}\Updater.exe"; DestDir: "{app}"; Flags: ignoreversion
+#if MyBuildTarget != "winarm"
 Source: "{#ReleasePath}\{#ModulesFolder}\d3d\d3dcompiler_47.dll"; DestDir: "{app}\{#ModulesFolder}\d3d"; Flags: ignoreversion
+#endif
 ; NOTE: Don't use "Flags: ignoreversion" on any shared system files
 
 [Icons]
 Name: "{group}\{#MyAppShortName}"; Filename: "{app}\{#MyAppExeName}"
 Name: "{group}\{cm:UninstallProgram,{#MyAppShortName}}"; Filename: "{uninstallexe}"
 Name: "{userdesktop}\{#MyAppShortName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
-Name: "{userappdata}\Microsoft\Internet Explorer\Quick Launch\{#MyAppShortName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: quicklaunchicon
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppShortName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
@@ -102,7 +121,7 @@ var ResultCode: Integer;
 begin
   if CurUninstallStep = usUninstall then
   begin
-    ShellExec('', ExpandConstant('{app}\{#MyAppExeName}'), '-cleanup', '', SW_SHOW, ewWaitUntilTerminated, ResultCode);
+    Exec(ExpandConstant('{app}\{#MyAppExeName}'), '-cleanup', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   end;
 end;
 

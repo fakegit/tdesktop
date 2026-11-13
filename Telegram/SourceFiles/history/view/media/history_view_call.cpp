@@ -10,26 +10,29 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "lang/lang_keys.h"
 #include "ui/chat/chat_style.h"
 #include "ui/text/format_values.h"
+#include "ui/painter.h"
 #include "layout/layout_selection.h" // FullSelection
 #include "history/history.h"
 #include "history/history_item.h"
 #include "history/view/history_view_element.h"
 #include "history/view/history_view_cursor_state.h"
 #include "core/application.h"
+#include "core/click_handler_types.h"
 #include "calls/calls_instance.h"
 #include "data/data_media_types.h"
 #include "data/data_user.h"
 #include "main/main_session.h"
+#include "window/window_session_controller.h"
 #include "styles/style_chat.h"
+#include "styles/style_chat_style.h"
 
 namespace HistoryView {
 namespace {
 
-using FinishReason = Data::CallFinishReason;
+using State = Data::CallState;
 
-[[nodiscard]] int ComputeDuration(FinishReason reason, int duration) {
-	return (reason != FinishReason::Missed
-		&& reason != FinishReason::Busy)
+[[nodiscard]] int ComputeDuration(State state, int duration) {
+	return (state != State::Missed && state != State::Busy)
 		? duration
 		: 0;
 }
@@ -40,12 +43,15 @@ Call::Call(
 	not_null<Element*> parent,
 	not_null<Data::Call*> call)
 : Media(parent)
-, _duration(ComputeDuration(call->finishReason, call->duration))
-, _reason(call->finishReason)
+, _duration(ComputeDuration(call->state, call->duration))
+, _state(call->state)
+, _conference(call->conferenceId != 0)
 , _video(call->video) {
 	const auto item = parent->data();
-	_text = Data::MediaCall::Text(item, _reason, _video);
-	_status = parent->dateTime().time().toString(cTimeFormat());
+	_text = Data::MediaCall::Text(item, _state, _conference, _video);
+	_status = QLocale().toString(
+		parent->dateTime().time(),
+		QLocale::ShortFormat);
 	if (_duration) {
 		_status = tr::lng_call_duration_info(
 			tr::now,
@@ -57,15 +63,38 @@ Call::Call(
 }
 
 QSize Call::countOptimalSize() {
-	const auto user = _parent->data()->history()->peer->asUser();
+	const auto user = _parent->history()->peer->asUser();
+	const auto conference = _conference;
 	const auto video = _video;
-	_link = std::make_shared<LambdaClickHandler>([=] {
-		if (user) {
-			Core::App().calls().startOutgoingCall(user, video);
+	const auto contextId = _parent->data()->fullId();
+	const auto id = _parent->data()->id;
+	_link = std::make_shared<LambdaClickHandler>([=](ClickContext context) {
+		if (conference) {
+			const auto my = context.other.value<ClickHandlerContext>();
+			const auto weak = my.sessionWindow;
+			if (const auto strong = weak.get()) {
+				QSize();
+				strong->resolveConferenceCall(id, contextId);
+			}
+		} else if (user) {
+			Core::App().calls().startOutgoingCall(user, { video });
 		}
 	});
-
-	auto maxWidth = st::historyCallWidth;
+	_textWidth = st::semiboldFont->width(_text);
+	const auto statusWidth = st::historyCallArrowIn.width()
+		+ st::historyCallStatusSkip
+		+ st::normalFont->width(_status);
+	const auto &icon = _video
+		? st::historyCallCameraInIcon
+		: _conference
+		? st::historyCallGroupInIcon
+		: st::historyCallInIcon;
+	const auto iconSkip = st::historyCallIconSkip
+		+ icon.width()
+		+ st::historyCallIconPosition.x();
+	auto maxWidth = std::max(
+		st::historyCallWidth,
+		st::historyCallLeft + std::max(_textWidth, statusWidth) + iconSkip);
 	auto minHeight = st::historyCallHeight;
 	if (!isBubbleTop()) {
 		minHeight -= st::msgFileTopMinus;
@@ -88,13 +117,28 @@ void Call::draw(Painter &p, const PaintContext &context) const {
 	nametop = st::historyCallTop - topMinus;
 	statustop = st::historyCallStatusTop - topMinus;
 
+	const auto &icon = _video
+		? stm->historyCallCameraIcon
+		: _conference
+		? stm->historyCallGroupIcon
+		: stm->historyCallIcon;
+	const auto textAvailable = paintw
+		- nameleft
+		- st::historyCallIconSkip
+		- icon.width()
+		- st::historyCallIconPosition.x();
 	p.setFont(st::semiboldFont);
 	p.setPen(stm->historyFileNameFg);
-	p.drawTextLeft(nameleft, nametop, paintw, _text);
+	p.drawTextLeft(
+		nameleft,
+		nametop,
+		paintw,
+		((_textWidth > textAvailable)
+			? st::semiboldFont->elided(_text, textAvailable)
+			: _text));
 
 	auto statusleft = nameleft;
-	auto missed = (_reason == FinishReason::Missed)
-		|| (_reason == FinishReason::Busy);
+	auto missed = (_state == State::Missed) || (_state == State::Busy);
 	const auto &arrow = missed
 		? stm->historyCallArrowMissed
 		: stm->historyCallArrow;
@@ -105,9 +149,6 @@ void Call::draw(Painter &p, const PaintContext &context) const {
 	p.setPen(stm->mediaFg);
 	p.drawTextLeft(statusleft, statustop, paintw, _status);
 
-	const auto &icon = _video
-		? stm->historyCallCameraIcon
-		: stm->historyCallIcon;
 	icon.paint(p, paintw - st::historyCallIconPosition.x() - icon.width(), st::historyCallIconPosition.y() - topMinus, paintw);
 }
 

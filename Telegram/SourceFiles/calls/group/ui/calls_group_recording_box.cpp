@@ -12,11 +12,11 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "ui/image/image_prepare.h"
 #include "ui/layers/generic_box.h"
 #include "ui/widgets/checkbox.h"
-#include "ui/widgets/input_fields.h"
+#include "ui/widgets/fields/input_field.h"
 #include "ui/widgets/labels.h"
+#include "styles/style_basic.h"
 #include "styles/style_calls.h"
 #include "styles/style_layers.h"
-#include "styles/style_boxes.h"
 
 #include <QSvgRenderer>
 
@@ -26,7 +26,6 @@ namespace {
 constexpr auto kRoundRadius = 9;
 constexpr auto kMaxGroupCallLength = 40;
 constexpr auto kSwitchDuration = 200;
-constexpr auto kSelectDuration = 120;
 
 class GraphicButton final : public Ui::AbstractButton {
 public:
@@ -103,11 +102,11 @@ void GraphicButton::setToggled(bool value) {
 		[=] { update(); },
 		_toggled ? 0. : 1.,
 		_toggled ? 1. : 0.,
-		kSelectDuration);
+		st::universalDuration);
 }
 
 void GraphicButton::paintEvent(QPaintEvent *e) {
-	Painter p(this);
+	auto p = QPainter(this);
 	const auto progress = _animation.value(_toggled ? 1. : 0.);
 	p.setOpacity(progress);
 	_roundRectSelect.paint(p, rect());
@@ -121,7 +120,7 @@ RecordingInfo::RecordingInfo(not_null<Ui::RpWidget*> parent)
 : RpWidget(parent)
 , _container(this) {
 	sizeValue(
-	) | rpl::start_with_next([=](const QSize &size) {
+	) | rpl::on_next([=](const QSize &size) {
 		_container->resizeToWidth(size.width());
 	}, _container->lifetime());
 }
@@ -140,7 +139,7 @@ void RecordingInfo::prepareAudio() {
 	audioIcon->setAttribute(Qt::WA_TransparentForMouseEvents);
 
 	sizeValue(
-	) | rpl::start_with_next([=](const QSize &size) {
+	) | rpl::on_next([=](const QSize &size) {
 		audioIcon->moveToLeft((size.width() - audioIcon->width()) / 2, 0);
 	}, lifetime());
 }
@@ -175,7 +174,7 @@ void RecordingInfo::prepareVideo() {
 	};
 	for (const auto icon : icons) {
 		icon->clicks(
-		) | rpl::start_with_next([=] {
+		) | rpl::on_next([=] {
 			for (const auto &i : icons) {
 				i->setToggled(icon == i);
 			}
@@ -184,9 +183,10 @@ void RecordingInfo::prepareVideo() {
 	}
 
 	wrap->sizeValue(
-	) | rpl::start_with_next([=](const QSize &size) {
-		const auto wHalf = size.width() / icons.size();
-		for (auto i = 0; i < icons.size(); i++) {
+	) | rpl::on_next([=](const QSize &size) {
+		const auto count = int(icons.size());
+		const auto wHalf = size.width() / count;
+		for (auto i = 0; i != count; ++i) {
 			const auto &icon = icons[i];
 			icon->moveToLeft(
 				wHalf * i + (wHalf - icon->width()) / 2,
@@ -196,22 +196,13 @@ void RecordingInfo::prepareVideo() {
 }
 
 void RecordingInfo::setLabel(const QString &text) {
-	const auto label = _container->add(
+	_container->add(
 		object_ptr<Ui::FlatLabel>(
 			_container,
 			text,
 			st::groupCallRecordingSubLabel),
-		st::groupCallRecordingSubLabelMargins);
-
-	rpl::combine(
-		sizeValue(),
-		label->sizeValue()
-	) | rpl::start_with_next([=](QSize my, QSize labelSize) {
-		label->moveToLeft(
-			(my.width() - labelSize.width()) / 2,
-			label->y(),
-			my.width());
-	}, label->lifetime());
+		st::groupCallRecordingSubLabelMargins,
+		style::al_top);
 }
 
 RecordingType RecordingInfo::type() const {
@@ -222,7 +213,10 @@ Switcher::Switcher(
 	not_null<Ui::RpWidget*> parent,
 	rpl::producer<bool> &&toggled)
 : RpWidget(parent)
-, _background(this, st::groupCallRecordingInfoHeight, st::groupCallBg)
+, _background(
+	this,
+	st::groupCallRecordingInfoHeight,
+	st::groupCallDividerBar)
 , _audio(this)
 , _video(this) {
 	_audio->prepareAudio();
@@ -236,7 +230,7 @@ Switcher::Switcher(
 	};
 
 	sizeValue(
-	) | rpl::start_with_next([=](const QSize &size) {
+	) | rpl::on_next([=](const QSize &size) {
 		_audio->resize(size.width(), size.height());
 		_video->resize(size.width(), size.height());
 
@@ -248,7 +242,7 @@ Switcher::Switcher(
 
 	std::move(
 		toggled
-	) | rpl::start_with_next([=](bool toggled) {
+	) | rpl::on_next([=](bool toggled) {
 		_toggled = toggled;
 		_animation.start(
 			updatePositions,
@@ -287,7 +281,7 @@ void EditGroupCallTitleBox(
 		box->closeBox();
 		done(result);
 	};
-	QObject::connect(input, &Ui::InputField::submitted, submit);
+	input->submits() | rpl::on_next(submit, input->lifetime());
 	box->addButton(tr::lng_settings_save(), submit);
 	box->addButton(tr::lng_cancel(), [=] { box->closeBox(); });
 }
@@ -346,7 +340,7 @@ void AddTitleGroupCallRecordingBox(
 		box->closeBox();
 		done(result);
 	};
-	QObject::connect(input, &Ui::InputField::submitted, submit);
+	input->submits() | rpl::on_next(submit, input->lifetime());
 	box->addButton(tr::lng_group_call_recording_start_button(), submit);
 	box->addButton(tr::lng_cancel(), [=] { box->closeBox(); });
 }

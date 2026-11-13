@@ -8,25 +8,28 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #pragma once
 
 #include "core/core_settings_proxy.h"
+#include "media/media_common.h"
+#include "dialogs/ui/dialogs_quick_action.h"
+#include "ui/widgets/chat_filters_tabs_mode.h"
 #include "window/themes/window_themes_embedded.h"
 #include "ui/chat/attach/attach_send_files_way.h"
-#include "platform/platform_notifications_manager.h"
 #include "base/flags.h"
 #include "emoji.h"
 
 enum class RectPart;
+struct LanguageId;
 
 namespace Ui {
 enum class InputSubmitSettings;
 } // namespace Ui
 
+namespace HistoryView {
+enum class DoubleClickQuickAction;
+} // namespace HistoryView
+
 namespace Window {
 enum class Column;
 } // namespace Window
-
-namespace Webrtc {
-enum class Backend;
-} // namespace Webrtc
 
 namespace Calls::Group {
 enum class StickedTooltip;
@@ -34,9 +37,10 @@ enum class StickedTooltip;
 
 namespace Core {
 
-struct WindowPosition {
-	WindowPosition() = default;
+inline constexpr auto kScreenReaderModeDisabledKey
+	= "screen-reader-mode-disabled"_cs;
 
+struct WindowPosition {
 	int32 moncrc = 0;
 	int maximized = 0;
 	int scale = 0;
@@ -44,6 +48,65 @@ struct WindowPosition {
 	int y = 0;
 	int w = 0;
 	int h = 0;
+
+	friend inline constexpr auto operator<=>(
+		WindowPosition,
+		WindowPosition) = default;
+
+	[[nodiscard]] QRect rect() const {
+		return QRect(x, y, w, h);
+	}
+};
+
+[[nodiscard]] WindowPosition AdjustToScale(
+	WindowPosition position,
+	const QString &name);
+
+struct WindowColumns {
+	float64 dialogsWithChatWidthRatio = 0.;
+	float64 dialogsNoChatWidthRatio = 0.;
+	int thirdColumnWidth = 0;
+	int thirdSectionExtendedBy = -1;
+	bool tabbedSelectorSectionEnabled = false;
+	bool thirdSectionInfoEnabled = true;
+
+	friend inline constexpr bool operator==(
+		WindowColumns,
+		WindowColumns) = default;
+};
+
+struct WindowTitleContent {
+	bool hideChatName : 1 = false;
+	bool hideAccountName : 1 = false;
+	bool hideTotalUnread : 1 = false;
+
+	friend inline constexpr auto operator<=>(
+		WindowTitleContent,
+		WindowTitleContent) = default;
+};
+
+constexpr auto kRecentEmojiLimit = 54;
+
+struct RecentEmojiDocument {
+	DocumentId id = 0;
+	bool test = false;
+
+	friend inline auto operator<=>(
+		RecentEmojiDocument,
+		RecentEmojiDocument) = default;
+};
+
+struct RecentEmojiId {
+	std::variant<EmojiPtr, RecentEmojiDocument> data;
+
+	friend inline bool operator==(
+		RecentEmojiId,
+		RecentEmojiId) = default;
+};
+
+struct RecentEmoji {
+	RecentEmojiId id;
+	ushort rating = 0;
 };
 
 class Settings final {
@@ -64,10 +127,16 @@ public:
 		TrayOnly = 1,
 		WindowOnly = 2,
 	};
+	enum class CloseBehavior {
+		Quit = 0,
+		CloseToTaskbar = 1,
+		RunInBackground = 2,
+	};
 
 	static constexpr auto kDefaultVolume = 0.9;
 
 	Settings();
+	~Settings();
 
 	[[nodiscard]] rpl::producer<> saveDelayedRequests() const {
 		return _saveDelayed.events();
@@ -87,7 +156,7 @@ public:
 	}
 
 	[[nodiscard]] QByteArray serialize() const;
-	void addFromSerialized(const QByteArray &serialized);
+	void addFromSerialized(const QByteArray &serialized, int writerVersion);
 
 	[[nodiscard]] bool adaptiveForWide() const {
 		return _adaptiveForWide.current();
@@ -170,14 +239,13 @@ public:
 	void setNotifyView(NotifyView value) {
 		_notifyView = value;
 	}
-	[[nodiscard]] bool nativeNotifications() const {
-		return _nativeNotifications.value_or(Platform::Notifications::ByDefault());
-	}
-	void setNativeNotifications(bool value) {
-		_nativeNotifications = (value == Platform::Notifications::ByDefault())
-			? std::nullopt
-			: std::make_optional(value);
-	}
+
+	[[nodiscard]] bool nativeNotifications() const;
+	void setNativeNotifications(bool value);
+
+	[[nodiscard]] bool skipToastsInFocus() const;
+	void setSkipToastsInFocus(bool value);
+
 	[[nodiscard]] int notificationsCount() const {
 		return _notificationsCount;
 	}
@@ -190,11 +258,23 @@ public:
 	void setNotificationsCorner(ScreenCorner corner) {
 		_notificationsCorner = corner;
 	}
+	[[nodiscard]] int32 notificationsDisplayChecksum() const {
+		return _notificationsDisplayChecksum;
+	}
+	void setNotificationsDisplayChecksum(int32 checksum) {
+		_notificationsDisplayChecksum = checksum;
+	}
 	[[nodiscard]] bool includeMutedCounter() const {
 		return _includeMutedCounter;
 	}
 	void setIncludeMutedCounter(bool value) {
 		_includeMutedCounter = value;
+	}
+	[[nodiscard]] bool includeMutedCounterFolders() const {
+		return _includeMutedCounterFolders;
+	}
+	void setIncludeMutedCounterFolders(bool value) {
+		_includeMutedCounterFolders = value;
 	}
 	[[nodiscard]] bool countUnreadMessages() const {
 		return _countUnreadMessages;
@@ -217,30 +297,68 @@ public:
 	void setAutoLock(int value) {
 		_autoLock = value;
 	}
-	[[nodiscard]] QString callOutputDeviceId() const {
-		return _callOutputDeviceId.isEmpty()
-			? u"default"_q
-			: _callOutputDeviceId;
+
+	[[nodiscard]] QString playbackDeviceId() const {
+		return _playbackDeviceId.current();
 	}
-	void setCallOutputDeviceId(const QString &value) {
-		_callOutputDeviceId = value;
+	[[nodiscard]] rpl::producer<QString> playbackDeviceIdChanges() const {
+		return _playbackDeviceId.changes();
 	}
-	[[nodiscard]] QString callInputDeviceId() const {
-		return _callInputDeviceId.isEmpty()
-			? u"default"_q
-			: _callInputDeviceId;
+	[[nodiscard]] rpl::producer<QString> playbackDeviceIdValue() const {
+		return _playbackDeviceId.value();
 	}
-	void setCallInputDeviceId(const QString &value) {
-		_callInputDeviceId = value;
+	void setPlaybackDeviceId(const QString &value) {
+		_playbackDeviceId = value;
 	}
-	[[nodiscard]] QString callVideoInputDeviceId() const {
-		return _callVideoInputDeviceId.isEmpty()
-			? u"default"_q
-			: _callVideoInputDeviceId;
+	[[nodiscard]] QString captureDeviceId() const {
+		return _captureDeviceId.current();
 	}
-	void setCallVideoInputDeviceId(const QString &value) {
-		_callVideoInputDeviceId = value;
+	[[nodiscard]] rpl::producer<QString> captureDeviceIdChanges() const {
+		return _captureDeviceId.changes();
 	}
+	[[nodiscard]] rpl::producer<QString> captureDeviceIdValue() const {
+		return _captureDeviceId.value();
+	}
+	void setCaptureDeviceId(const QString &value) {
+		_captureDeviceId = value;
+	}
+	[[nodiscard]] QString cameraDeviceId() const {
+		return _cameraDeviceId.current();
+	}
+	[[nodiscard]] rpl::producer<QString> cameraDeviceIdChanges() const {
+		return _cameraDeviceId.changes();
+	}
+	[[nodiscard]] rpl::producer<QString> cameraDeviceIdValue() const {
+		return _cameraDeviceId.value();
+	}
+	void setCameraDeviceId(const QString &value) {
+		_cameraDeviceId = value;
+	}
+	[[nodiscard]] QString callPlaybackDeviceId() const {
+		return _callPlaybackDeviceId.current();
+	}
+	[[nodiscard]] rpl::producer<QString> callPlaybackDeviceIdChanges() const {
+		return _callPlaybackDeviceId.changes();
+	}
+	[[nodiscard]] rpl::producer<QString> callPlaybackDeviceIdValue() const {
+		return _callPlaybackDeviceId.value();
+	}
+	void setCallPlaybackDeviceId(const QString &value) {
+		_callPlaybackDeviceId = value;
+	}
+	[[nodiscard]] QString callCaptureDeviceId() const {
+		return _callCaptureDeviceId.current();
+	}
+	[[nodiscard]] rpl::producer<QString> callCaptureDeviceIdChanges() const {
+		return _callCaptureDeviceId.changes();
+	}
+	[[nodiscard]] rpl::producer<QString> callCaptureDeviceIdValue() const {
+		return _callCaptureDeviceId.value();
+	}
+	void setCallCaptureDeviceId(const QString &value) {
+		_callCaptureDeviceId = value;
+	}
+
 	[[nodiscard]] int callOutputVolume() const {
 		return _callOutputVolume;
 	}
@@ -259,12 +377,8 @@ public:
 	void setCallAudioDuckingEnabled(bool value) {
 		_callAudioDuckingEnabled = value;
 	}
-	[[nodiscard]] Webrtc::Backend callAudioBackend() const;
-	void setDisableCalls(bool value) {
-		_disableCalls = value;
-	}
-	[[nodiscard]] bool disableCalls() const {
-		return _disableCalls;
+	[[nodiscard]] bool disableCallsLegacy() const {
+		return _disableCallsLegacy;
 	}
 	[[nodiscard]] bool groupCallPushToTalk() const {
 		return _groupCallPushToTalk;
@@ -293,6 +407,9 @@ public:
 	[[nodiscard]] Window::Theme::AccentColors &themesAccentColors() {
 		return _themesAccentColors;
 	}
+	[[nodiscard]] const Window::Theme::AccentColors &themesAccentColors() const {
+		return _themesAccentColors;
+	}
 	void setThemesAccentColors(Window::Theme::AccentColors &&colors) {
 		_themesAccentColors = std::move(colors);
 	}
@@ -312,7 +429,11 @@ public:
 		_sendSubmitWay = value;
 	}
 	[[nodiscard]] Ui::InputSubmitSettings sendSubmitWay() const {
-		return _sendSubmitWay;
+		return _sendSubmitWay.current();
+	}
+	[[nodiscard]] auto sendSubmitWayValue() const
+	-> rpl::producer<Ui::InputSubmitSettings> {
+		return _sendSubmitWay.value();
 	}
 	void setSoundOverride(const QString &key, const QString &path) {
 		_soundOverrides.emplace(key, path);
@@ -322,11 +443,12 @@ public:
 	}
 	[[nodiscard]] QString getSoundPath(const QString &key) const;
 
-	[[nodiscard]] bool exeLaunchWarning() const {
-		return _exeLaunchWarning;
+	[[nodiscard]] auto noWarningExtensions() const
+	-> const base::flat_set<QString> & {
+		return _noWarningExtensions;
 	}
-	void setExeLaunchWarning(bool warning) {
-		_exeLaunchWarning = warning;
+	void setNoWarningExtensions(base::flat_set<QString> extensions) {
+		_noWarningExtensions = std::move(extensions);
 	}
 	[[nodiscard]] bool ipRevealWarning() const {
 		return _ipRevealWarning;
@@ -364,6 +486,18 @@ public:
 	[[nodiscard]] rpl::producer<bool> replaceEmojiChanges() const {
 		return _replaceEmoji.changes();
 	}
+	void setSystemTextReplace(bool value) {
+		_systemTextReplace = value;
+	}
+	[[nodiscard]] bool systemTextReplace() const {
+		return _systemTextReplace.current();
+	}
+	[[nodiscard]] rpl::producer<bool> systemTextReplaceValue() const {
+		return _systemTextReplace.value();
+	}
+	[[nodiscard]] rpl::producer<bool> systemTextReplaceChanges() const {
+		return _systemTextReplace.changes();
+	}
 	[[nodiscard]] bool suggestEmoji() const {
 		return _suggestEmoji;
 	}
@@ -375,6 +509,36 @@ public:
 	}
 	void setSuggestStickersByEmoji(bool value) {
 		_suggestStickersByEmoji = value;
+	}
+	[[nodiscard]] bool suggestAnimatedEmoji() const {
+		return _suggestAnimatedEmoji;
+	}
+	void setSuggestAnimatedEmoji(bool value) {
+		_suggestAnimatedEmoji = value;
+	}
+	void setCornerReaction(bool value) {
+		_cornerReaction = value;
+	}
+	[[nodiscard]] bool cornerReaction() const {
+		return _cornerReaction.current();
+	}
+	[[nodiscard]] rpl::producer<bool> cornerReactionValue() const {
+		return _cornerReaction.value();
+	}
+	void setCornerReply(bool value) {
+		_cornerReply = value;
+	}
+	[[nodiscard]] bool cornerReply() const {
+		return _cornerReply.current();
+	}
+	[[nodiscard]] rpl::producer<bool> cornerReplyValue() const {
+		return _cornerReply.value();
+	}
+	void setPullToNextChannel(bool value) {
+		_pullToNextChannel = value;
+	}
+	[[nodiscard]] bool pullToNextChannel() const {
+		return _pullToNextChannel.current();
 	}
 
 	void setSpellcheckerEnabled(bool value) {
@@ -415,23 +579,56 @@ public:
 		return _autoDownloadDictionaries.changes();
 	}
 
-	[[nodiscard]] float64 videoPlaybackSpeed() const {
-		return _videoPlaybackSpeed.current();
+	[[nodiscard]] float64 videoPlaybackSpeed(
+			bool lastNonDefault = false) const {
+		return (_videoPlaybackSpeed.enabled || lastNonDefault)
+			? _videoPlaybackSpeed.value
+			: 1.;
 	}
 	void setVideoPlaybackSpeed(float64 speed) {
-		_videoPlaybackSpeed = speed;
+		if ((_videoPlaybackSpeed.enabled = !Media::EqualSpeeds(speed, 1.))) {
+			_videoPlaybackSpeed.value = speed;
+		}
 	}
 	[[nodiscard]] float64 voicePlaybackSpeed(
 			bool lastNonDefault = false) const {
-		return (_nonDefaultVoicePlaybackSpeed || lastNonDefault)
-			? _voicePlaybackSpeed
-			: 1.0;
+		const auto &s = _voicePlaybackSpeed.current();
+		return (s.enabled || lastNonDefault) ? s.value : 1.;
+	}
+	[[nodiscard]] float64 audioPlaybackSpeed(
+			bool lastNonDefault = false) const {
+		const auto &s = _audioPlaybackSpeed.current();
+		return (s.enabled || lastNonDefault) ? s.value : 1.;
 	}
 	void setVoicePlaybackSpeed(float64 speed) {
-		if ((_nonDefaultVoicePlaybackSpeed = (speed != 1.0))) {
-			_voicePlaybackSpeed = speed;
-		}
+		const auto enabled = !Media::EqualSpeeds(speed, 1.0);
+		_voicePlaybackSpeed = PlaybackSpeed{
+			.value = enabled ? speed : _voicePlaybackSpeed.current().value,
+			.enabled = enabled,
+		};
 	}
+	void setAudioPlaybackSpeed(float64 speed) {
+		const auto enabled = !Media::EqualSpeeds(speed, 1.0);
+		_audioPlaybackSpeed = PlaybackSpeed{
+			.value = enabled ? speed : _audioPlaybackSpeed.current().value,
+			.enabled = enabled,
+		};
+	}
+	[[nodiscard]] auto voicePlaybackSpeedChanges() const {
+		return _voicePlaybackSpeed.changes();
+	}
+	[[nodiscard]] auto audioPlaybackSpeedChanges() const {
+		return _audioPlaybackSpeed.changes();
+	}
+
+	// For legacy values read-write outside of Settings.
+	[[nodiscard]] qint32 videoPlaybackSpeedSerialized() const {
+		return SerializePlaybackSpeed(_videoPlaybackSpeed);
+	}
+	void setVideoPlaybackSpeedSerialized(qint32 value) {
+		_videoPlaybackSpeed = DeserializePlaybackSpeed(value);
+	}
+
 	[[nodiscard]] QByteArray videoPipGeometry() const {
 		return _videoPipGeometry;
 	}
@@ -473,26 +670,11 @@ public:
 	void setMainMenuAccountsShown(bool value) {
 		_mainMenuAccountsShown = value;
 	}
-	[[nodiscard]] bool tabbedSelectorSectionEnabled() const {
-		return _tabbedSelectorSectionEnabled;
-	}
 	void setTabbedSelectorSectionEnabled(bool enabled);
-	[[nodiscard]] bool thirdSectionInfoEnabled() const {
-		return _thirdSectionInfoEnabled;
-	}
 	void setThirdSectionInfoEnabled(bool enabled);
-	[[nodiscard]] rpl::producer<bool> thirdSectionInfoEnabledValue() const;
-	[[nodiscard]] int thirdSectionExtendedBy() const {
-		return _thirdSectionExtendedBy;
-	}
 	void setThirdSectionExtendedBy(int savedValue) {
 		_thirdSectionExtendedBy = savedValue;
 	}
-	[[nodiscard]] bool tabbedReplacedWithInfo() const {
-		return _tabbedReplacedWithInfo;
-	}
-	void setTabbedReplacedWithInfo(bool enabled);
-	[[nodiscard]] rpl::producer<bool> tabbedReplacedWithInfoValue() const;
 	void setFloatPlayerColumn(Window::Column column) {
 		_floatPlayerColumn = column;
 	}
@@ -505,12 +687,18 @@ public:
 	[[nodiscard]] RectPart floatPlayerCorner() const {
 		return _floatPlayerCorner;
 	}
-	void setDialogsWidthRatio(float64 ratio);
-	[[nodiscard]] float64 dialogsWidthRatio() const;
-	[[nodiscard]] rpl::producer<float64> dialogsWidthRatioChanges() const;
+
+	[[nodiscard]] bool recordVideoMessages() const {
+		return _recordVideoMessages;
+	}
+	void setRecordVideoMessages(bool value) {
+		_recordVideoMessages = value;
+	}
+
+	void updateDialogsWidthRatio(float64 ratio);
 	void setThirdColumnWidth(int width);
-	[[nodiscard]] int thirdColumnWidth() const;
-	[[nodiscard]] rpl::producer<int> thirdColumnWidthChanges() const;
+	[[nodiscard]] WindowColumns windowColumns() const;
+	void setWindowColumns(const WindowColumns &columns);
 	void setNotifyFromAll(bool value) {
 		_notifyFromAll = value;
 	}
@@ -550,6 +738,21 @@ public:
 	[[nodiscard]] rpl::producer<bool> systemDarkModeEnabledChanges() const {
 		return _systemDarkModeEnabled.changes();
 	}
+	void setSystemAccentColorEnabled(bool value) {
+		_systemAccentColorEnabled = value;
+	}
+	[[nodiscard]] bool systemAccentColorEnabled() const {
+		return _systemAccentColorEnabled;
+	}
+	[[nodiscard]] WindowTitleContent windowTitleContent() const {
+		return _windowTitleContent.current();
+	}
+	[[nodiscard]] rpl::producer<WindowTitleContent> windowTitleContentChanges() const {
+		return _windowTitleContent.changes();
+	}
+	void setWindowTitleContent(WindowTitleContent content) {
+		_windowTitleContent = content;
+	}
 	[[nodiscard]] const WindowPosition &windowPosition() const {
 		return _windowPosition;
 	}
@@ -569,13 +772,10 @@ public:
 		return _workMode.changes();
 	}
 
-	struct RecentEmoji {
-		EmojiPtr emoji = nullptr;
-		ushort rating = 0;
-	};
 	[[nodiscard]] const std::vector<RecentEmoji> &recentEmoji() const;
-	[[nodiscard]] EmojiPack recentEmojiSection() const;
-	void incrementRecentEmoji(EmojiPtr emoji);
+	void incrementRecentEmoji(RecentEmojiId id);
+	void hideRecentEmoji(RecentEmojiId id);
+	void resetRecentEmoji();
 	void setLegacyRecentEmojiPreload(QVector<QPair<QString, ushort>> data);
 	[[nodiscard]] rpl::producer<> recentEmojiUpdated() const {
 		return _recentEmojiUpdated.events();
@@ -584,7 +784,10 @@ public:
 	[[nodiscard]] const base::flat_map<QString, uint8> &emojiVariants() const {
 		return _emojiVariants;
 	}
+	[[nodiscard]] EmojiPtr lookupEmojiVariant(EmojiPtr emoji) const;
+	[[nodiscard]] bool hasChosenEmojiVariant(EmojiPtr emoji) const;
 	void saveEmojiVariant(EmojiPtr emoji);
+	void saveAllEmojiVariants(EmojiPtr emoji);
 	void setLegacyEmojiVariants(QMap<QString, int> data);
 
 	[[nodiscard]] bool disableOpenGL() const {
@@ -601,18 +804,245 @@ public:
 		_hiddenGroupCallTooltips |= value;
 	}
 
+	void setCloseBehavior(CloseBehavior value) {
+		_closeBehavior = value;
+	}
+	[[nodiscard]] CloseBehavior closeBehavior() const {
+		return _closeBehavior;
+	}
+	void setTrayIconMonochrome(bool value) {
+		_trayIconMonochrome = value;
+	}
+	[[nodiscard]] bool trayIconMonochrome() const {
+		return _trayIconMonochrome.current();
+	}
+	[[nodiscard]] rpl::producer<bool> trayIconMonochromeChanges() const {
+		return _trayIconMonochrome.changes();
+	}
+
+	void setCustomDeviceModel(const QString &model) {
+		_customDeviceModel = model;
+	}
+	[[nodiscard]] QString customDeviceModel() const {
+		return _customDeviceModel.current();
+	}
+	[[nodiscard]] rpl::producer<QString> customDeviceModelChanges() const {
+		return _customDeviceModel.changes();
+	}
+	[[nodiscard]] QString deviceModel() const;
+	[[nodiscard]] rpl::producer<QString> deviceModelChanges() const;
+
+	void setPlayerRepeatMode(Media::RepeatMode mode) {
+		_playerRepeatMode = mode;
+	}
+	[[nodiscard]] Media::RepeatMode playerRepeatMode() const {
+		return _playerRepeatMode.current();
+	}
+	[[nodiscard]] rpl::producer<Media::RepeatMode> playerRepeatModeValue() const {
+		return _playerRepeatMode.value();
+	}
+	[[nodiscard]] rpl::producer<Media::RepeatMode> playerRepeatModeChanges() const {
+		return _playerRepeatMode.changes();
+	}
+	void setPlayerOrderMode(Media::OrderMode mode) {
+		_playerOrderMode = mode;
+	}
+	[[nodiscard]] Media::OrderMode playerOrderMode() const {
+		return _playerOrderMode.current();
+	}
+	[[nodiscard]] rpl::producer<Media::OrderMode> playerOrderModeValue() const {
+		return _playerOrderMode.value();
+	}
+	[[nodiscard]] rpl::producer<Media::OrderMode> playerOrderModeChanges() const {
+		return _playerOrderMode.changes();
+	}
+	[[nodiscard]] std::vector<uint64> accountsOrder() const {
+		return _accountsOrder;
+	}
+	void setAccountsOrder(const std::vector<uint64> &order) {
+		_accountsOrder = order;
+	}
+
+	[[nodiscard]] bool hardwareAcceleratedVideo() const {
+		return _hardwareAcceleratedVideo;
+	}
+	void setHardwareAcceleratedVideo(bool value) {
+		_hardwareAcceleratedVideo = value;
+	}
+
+	void setMacWarnBeforeQuit(bool value) {
+		_macWarnBeforeQuit = value;
+	}
+	[[nodiscard]] bool macWarnBeforeQuit() const {
+		return _macWarnBeforeQuit;
+	}
+	void setChatQuickAction(HistoryView::DoubleClickQuickAction value) {
+		_chatQuickAction = value;
+	}
+	[[nodiscard]] HistoryView::DoubleClickQuickAction chatQuickAction() const {
+		return _chatQuickAction;
+	}
+
+	void setTranslateButtonEnabled(bool value);
+	[[nodiscard]] bool translateButtonEnabled() const;
+	void setUsePlatformTranslation(bool value);
+	[[nodiscard]] bool usePlatformTranslation() const;
+	void setTranslateChatEnabled(bool value);
+	[[nodiscard]] bool translateChatEnabled() const;
+	[[nodiscard]] rpl::producer<bool> translateChatEnabledValue() const;
+	void setTranslateTo(LanguageId id);
+	[[nodiscard]] LanguageId translateTo() const;
+	[[nodiscard]] rpl::producer<LanguageId> translateToValue() const;
+	void setSkipTranslationLanguages(std::vector<LanguageId> languages);
+	[[nodiscard]] std::vector<LanguageId> skipTranslationLanguages() const;
+	[[nodiscard]] auto skipTranslationLanguagesValue() const
+		-> rpl::producer<std::vector<LanguageId>>;
+
+	void setRememberedDeleteMessageOnlyForYou(bool value);
+	[[nodiscard]] bool rememberedDeleteMessageOnlyForYou() const;
+
+	[[nodiscard]] const WindowPosition &mediaViewPosition() const {
+		return _mediaViewPosition;
+	}
+	void setMediaViewPosition(const WindowPosition &position) {
+		_mediaViewPosition = position;
+	}
+	[[nodiscard]] bool ignoreBatterySaving() const {
+		return _ignoreBatterySaving.current();
+	}
+	[[nodiscard]] rpl::producer<bool> ignoreBatterySavingValue() const {
+		return _ignoreBatterySaving.value();
+	}
+	void setIgnoreBatterySavingValue(bool value) {
+		_ignoreBatterySaving = value;
+	}
+	void setMacRoundIconDigest(std::optional<uint64> value) {
+		_macRoundIconDigest = value;
+	}
+	[[nodiscard]] std::optional<uint64> macRoundIconDigest() const {
+		return _macRoundIconDigest;
+	}
+	[[nodiscard]] bool storiesClickTooltipHidden() const {
+		return _storiesClickTooltipHidden.current();
+	}
+	[[nodiscard]] rpl::producer<bool> storiesClickTooltipHiddenValue() const {
+		return _storiesClickTooltipHidden.value();
+	}
+	void setStoriesClickTooltipHidden(bool value) {
+		_storiesClickTooltipHidden = value;
+	}
+	[[nodiscard]] bool ttlVoiceClickTooltipHidden() const {
+		return _ttlVoiceClickTooltipHidden.current();
+	}
+	[[nodiscard]] rpl::producer<bool> ttlVoiceClickTooltipHiddenValue() const {
+		return _ttlVoiceClickTooltipHidden.value();
+	}
+	void setTtlVoiceClickTooltipHidden(bool value) {
+		_ttlVoiceClickTooltipHidden = value;
+	}
+	[[nodiscard]] const WindowPosition &ivPosition() const {
+		return _ivPosition;
+	}
+	void setIvPosition(const WindowPosition &position) {
+		_ivPosition = position;
+	}
+
+	[[nodiscard]] const WindowPosition &callPanelPosition() const {
+		return _callPanelPosition;
+	}
+	void setCallPanelPosition(const WindowPosition &position) {
+		_callPanelPosition = position;
+	}
+
+	[[nodiscard]] QString customFontFamily() const {
+		return _customFontFamily;
+	}
+	void setCustomFontFamily(const QString &value) {
+		_customFontFamily = value;
+	}
+
+	[[nodiscard]] bool systemUnlockEnabled() const {
+		return _systemUnlockEnabled;
+	}
+	void setSystemUnlockEnabled(bool enabled) {
+		_systemUnlockEnabled = enabled;
+	}
+
+	[[nodiscard]] std::optional<bool> weatherInCelsius() const {
+		return _weatherInCelsius;
+	}
+	void setWeatherInCelsius(bool value) {
+		_weatherInCelsius = value;
+	}
+
+	[[nodiscard]] QByteArray tonsiteStorageToken() const {
+		return _tonsiteStorageToken;
+	}
+	void setTonsiteStorageToken(const QByteArray &value) {
+		_tonsiteStorageToken = value;
+	}
+
+	[[nodiscard]] int ivZoom() const;
+	[[nodiscard]] rpl::producer<int> ivZoomValue() const;
+	void setIvZoom(int value);
+	bool normalizeIvZoom();
+
+	[[nodiscard]] bool chatFiltersHorizontal() const;
+	[[nodiscard]] rpl::producer<bool> chatFiltersHorizontalChanges() const;
+	void setChatFiltersHorizontal(bool value);
+
+	[[nodiscard]] Ui::ChatsFiltersTabsMode chatFiltersTabsMode() const;
+	[[nodiscard]] auto chatFiltersTabsModeValue() const
+	-> rpl::producer<Ui::ChatsFiltersTabsMode>;
+	void setChatFiltersTabsMode(Ui::ChatsFiltersTabsMode value);
+
+	[[nodiscard]] Media::VideoQuality videoQuality() const;
+	void setVideoQuality(Media::VideoQuality quality);
+
 	[[nodiscard]] static bool ThirdColumnByDefault();
 	[[nodiscard]] static float64 DefaultDialogsWidthRatio();
-	[[nodiscard]] static qint32 SerializePlaybackSpeed(float64 speed) {
-		return int(std::round(std::clamp(speed, 0.5, 2.0) * 100));
+
+	struct PlaybackSpeed {
+		float64 value = Media::kSpedUpDefault;
+		bool enabled = false;
+
+		friend bool operator==(
+			const PlaybackSpeed &,
+			const PlaybackSpeed &) = default;
+	};
+	[[nodiscard]] static qint32 SerializePlaybackSpeed(PlaybackSpeed speed);
+	[[nodiscard]] static PlaybackSpeed DeserializePlaybackSpeed(
+		qint32 speed);
+
+	[[nodiscard]] Dialogs::Ui::QuickDialogAction quickDialogAction() const;
+	void setQuickDialogAction(Dialogs::Ui::QuickDialogAction);
+
+	[[nodiscard]] ushort notificationsVolume() const {
+		return _notificationsVolume;
 	}
-	[[nodiscard]] static float64 DeserializePlaybackSpeed(qint32 speed) {
-		if (speed < 10) {
-			// The old values in settings.
-			return (std::clamp(speed, 0, 6) + 2) / 4.;
-		} else {
-			return std::clamp(speed, 50, 200) / 100.;
-		}
+	void setNotificationsVolume(ushort value) {
+		_notificationsVolume = value;
+	}
+
+	[[nodiscard]] int mediaGridZoomStep() const {
+		return _mediaGridZoomStep;
+	}
+	void setMediaGridZoomStep(int value) {
+		_mediaGridZoomStep = value;
+	}
+
+	template <typename Type, typename Other>
+	void writePref(std::string_view key, Other &&value) {
+		writePrefImpl<Type>(key, std::forward<Other>(value));
+	}
+	void clearPref(std::string_view key);
+
+	template <typename Type, typename Other = Type>
+	[[nodiscard]] Type readPref(
+			std::string_view key,
+			Other &&fallback = Type()) {
+		return readPrefImpl<Type>(key).value_or(
+			std::forward<Other>(fallback));
 	}
 
 	void resetOnLastLogout();
@@ -620,11 +1050,21 @@ public:
 private:
 	void resolveRecentEmoji() const;
 
+	template <typename Type>
+	void writePrefImpl(std::string_view key, Type value);
+
+	template <typename Type>
+	[[nodiscard]] std::optional<Type> readPrefImpl(std::string_view key);
+
+	void writePrefGeneric(std::string_view key, const QByteArray &value);
+	[[nodiscard]] std::optional<QByteArray> readPrefGeneric(
+		std::string_view key);
+
 	static constexpr auto kDefaultThirdColumnWidth = 0;
 	static constexpr auto kDefaultDialogsWidthRatio = 5. / 14;
 	static constexpr auto kDefaultBigDialogsWidthRatio = 0.275;
 
-	struct RecentEmojiId {
+	struct RecentEmojiPreload {
 		QString emoji;
 		ushort rating = 0;
 	};
@@ -643,19 +1083,24 @@ private:
 	bool _flashBounceNotify = true;
 	NotifyView _notifyView = NotifyView::ShowPreview;
 	std::optional<bool> _nativeNotifications;
+	bool _skipToastsInFocus = false;
 	int _notificationsCount = 3;
 	ScreenCorner _notificationsCorner = ScreenCorner::BottomRight;
+	int32 _notificationsDisplayChecksum = 0;
 	bool _includeMutedCounter = true;
+	bool _includeMutedCounterFolders = true;
 	bool _countUnreadMessages = true;
 	rpl::variable<bool> _notifyAboutPinned = true;
 	int _autoLock = 3600;
-	QString _callOutputDeviceId = u"default"_q;
-	QString _callInputDeviceId = u"default"_q;
-	QString _callVideoInputDeviceId = u"default"_q;
+	rpl::variable<QString> _playbackDeviceId;
+	rpl::variable<QString> _captureDeviceId;
+	rpl::variable<QString> _cameraDeviceId;
+	rpl::variable<QString> _callPlaybackDeviceId;
+	rpl::variable<QString> _callCaptureDeviceId;
 	int _callOutputVolume = 100;
 	int _callInputVolume = 100;
 	bool _callAudioDuckingEnabled = true;
-	bool _disableCalls = false;
+	bool _disableCallsLegacy = false;
 	bool _groupCallPushToTalk = false;
 	bool _groupCallNoiseSuppression = false;
 	QByteArray _groupCallPushToTalkShortcut;
@@ -663,51 +1108,105 @@ private:
 	Window::Theme::AccentColors _themesAccentColors;
 	bool _lastSeenWarningSeen = false;
 	Ui::SendFilesWay _sendFilesWay = Ui::SendFilesWay();
-	Ui::InputSubmitSettings _sendSubmitWay = Ui::InputSubmitSettings();
+	rpl::variable<Ui::InputSubmitSettings> _sendSubmitWay
+		= Ui::InputSubmitSettings();
 	base::flat_map<QString, QString> _soundOverrides;
-	bool _exeLaunchWarning = true;
+	base::flat_set<QString> _noWarningExtensions;
 	bool _ipRevealWarning = true;
 	bool _loopAnimatedStickers = true;
 	rpl::variable<bool> _largeEmoji = true;
 	rpl::variable<bool> _replaceEmoji = true;
+	rpl::variable<bool> _systemTextReplace = true;
 	bool _suggestEmoji = true;
 	bool _suggestStickersByEmoji = true;
+	bool _suggestAnimatedEmoji = true;
+	rpl::variable<bool> _cornerReply = true;
+	rpl::variable<bool> _cornerReaction = true;
+	rpl::variable<bool> _pullToNextChannel = true;
 	rpl::variable<bool> _spellcheckerEnabled = true;
-	rpl::variable<float64> _videoPlaybackSpeed = 1.;
-	float64 _voicePlaybackSpeed = 2.;
-	bool _nonDefaultVoicePlaybackSpeed = false;
+	PlaybackSpeed _videoPlaybackSpeed;
+	rpl::variable<PlaybackSpeed> _voicePlaybackSpeed;
+	rpl::variable<PlaybackSpeed> _audioPlaybackSpeed;
 	QByteArray _videoPipGeometry;
 	rpl::variable<std::vector<int>> _dictionariesEnabled;
 	rpl::variable<bool> _autoDownloadDictionaries = true;
 	rpl::variable<bool> _mainMenuAccountsShown = true;
-	mutable std::vector<RecentEmojiId> _recentEmojiPreload;
+	mutable std::vector<RecentEmojiPreload> _recentEmojiPreload;
 	mutable std::vector<RecentEmoji> _recentEmoji;
+	base::flat_set<QString> _recentEmojiSkip;
+	mutable bool _recentEmojiResolved = false;
 	base::flat_map<QString, uint8> _emojiVariants;
 	rpl::event_stream<> _recentEmojiUpdated;
 	bool _tabbedSelectorSectionEnabled = false; // per-window
 	Window::Column _floatPlayerColumn = Window::Column(); // per-window
 	RectPart _floatPlayerCorner = RectPart(); // per-window
 	bool _thirdSectionInfoEnabled = true; // per-window
-	rpl::event_stream<bool> _thirdSectionInfoEnabledValue; // per-window
 	int _thirdSectionExtendedBy = -1; // per-window
-	rpl::variable<float64> _dialogsWidthRatio; // per-window
+	rpl::variable<float64> _dialogsWithChatWidthRatio; // per-window
+	rpl::variable<float64> _dialogsNoChatWidthRatio; // per-window
 	rpl::variable<int> _thirdColumnWidth = kDefaultThirdColumnWidth; // p-w
 	bool _notifyFromAll = true;
 	rpl::variable<bool> _nativeWindowFrame = false;
 	rpl::variable<std::optional<bool>> _systemDarkMode = std::nullopt;
-	rpl::variable<bool> _systemDarkModeEnabled = false;
+	rpl::variable<bool> _systemDarkModeEnabled = true;
+	bool _systemAccentColorEnabled = false;
+	rpl::variable<WindowTitleContent> _windowTitleContent;
 	WindowPosition _windowPosition; // per-window
 	bool _disableOpenGL = false;
 	rpl::variable<WorkMode> _workMode = WorkMode::WindowAndTray;
 	base::flags<Calls::Group::StickedTooltip> _hiddenGroupCallTooltips;
-
-	bool _tabbedReplacedWithInfo = false; // per-window
-	rpl::event_stream<bool> _tabbedReplacedWithInfoValue; // per-window
+	CloseBehavior _closeBehavior = CloseBehavior::Quit;
+	rpl::variable<bool> _trayIconMonochrome = true;
+	rpl::variable<QString> _customDeviceModel;
+	rpl::variable<Media::RepeatMode> _playerRepeatMode;
+	rpl::variable<Media::OrderMode> _playerOrderMode;
+	bool _macWarnBeforeQuit = true;
+	std::vector<uint64> _accountsOrder;
+#ifdef Q_OS_MAC
+	bool _hardwareAcceleratedVideo = true;
+#else // Q_OS_MAC
+	bool _hardwareAcceleratedVideo = false;
+#endif // Q_OS_MAC
+	HistoryView::DoubleClickQuickAction _chatQuickAction
+		= HistoryView::DoubleClickQuickAction();
+	bool _translateButtonEnabled = false;
+	bool _usePlatformTranslation = false;
+	rpl::variable<bool> _translateChatEnabled = true;
+	rpl::variable<int> _translateToRaw = 0;
+	rpl::variable<std::vector<LanguageId>> _skipTranslationLanguages;
+	rpl::event_stream<> _skipTranslationLanguagesChanges;
+	bool _rememberedDeleteMessageOnlyForYou = false;
+	WindowPosition _mediaViewPosition = { .maximized = 2 };
+	rpl::variable<bool> _ignoreBatterySaving = false;
+	std::optional<uint64> _macRoundIconDigest;
+	rpl::variable<bool> _storiesClickTooltipHidden = false;
+	rpl::variable<bool> _ttlVoiceClickTooltipHidden = false;
+	WindowPosition _ivPosition;
+	WindowPosition _callPanelPosition;
+	QString _customFontFamily;
+	bool _systemUnlockEnabled = false;
+	std::optional<bool> _weatherInCelsius;
+	QByteArray _tonsiteStorageToken;
+	rpl::variable<int> _ivZoom = 0;
+	Media::VideoQuality _videoQuality;
+	rpl::variable<bool> _chatFiltersHorizontal = false;
+	rpl::variable<Ui::ChatsFiltersTabsMode> _chatFiltersTabsMode
+		= Ui::ChatsFiltersTabsMode::Default;
+	base::flat_map<QByteArray, QByteArray> _prefs;
 
 	rpl::event_stream<> _saveDelayed;
 	float64 _rememberedSongVolume = kDefaultVolume;
 	bool _rememberedSoundNotifyFromTray = false;
 	bool _rememberedFlashBounceNotifyFromTray = false;
+
+	bool _recordVideoMessages = false;
+
+	Dialogs::Ui::QuickDialogAction _quickDialogAction
+		= Dialogs::Ui::QuickDialogAction::Disabled;
+
+	ushort _notificationsVolume = 100;
+
+	int _mediaGridZoomStep = 0;
 
 	QByteArray _photoEditorBrush;
 

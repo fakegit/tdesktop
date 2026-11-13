@@ -11,7 +11,9 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "info/info_controller.h"
 #include "ui/widgets/scroll_area.h"
 #include "ui/ui_utility.h"
-#include "styles/style_info.h"
+#include "data/data_peer.h"
+#include "data/data_channel.h"
+#include "lang/lang_keys.h"
 
 namespace Info {
 namespace Members {
@@ -23,7 +25,7 @@ Memento::Memento(not_null<Controller*> controller)
 }
 
 Memento::Memento(not_null<PeerData*> peer, PeerId migratedPeerId)
-: ContentMemento(peer, migratedPeerId) {
+: ContentMemento(peer, nullptr, nullptr, migratedPeerId) {
 }
 
 Section Memento::section() const {
@@ -77,6 +79,15 @@ void Widget::setInternalState(
 	setGeometry(geometry);
 	Ui::SendPendingMoveResizeEvents(this);
 	restoreState(memento);
+}
+
+rpl::producer<QString> Widget::title() {
+	if (const auto channel = controller()->key().peer()->asChannel()) {
+		return channel->isMegagroup()
+			? tr::lng_profile_participants_section()
+			: tr::lng_profile_subscribers_section();
+	}
+	return tr::lng_profile_participants_section();
 }
 
 std::shared_ptr<ContentMemento> Widget::doCreateMemento() {

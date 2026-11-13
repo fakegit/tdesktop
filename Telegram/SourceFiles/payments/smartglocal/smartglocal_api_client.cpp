@@ -7,6 +7,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "smartglocal/smartglocal_api_client.h"
 
+#include "base/basic_types.h"
+#include "base/debug_log.h"
 #include "smartglocal/smartglocal_error.h"
 #include "smartglocal/smartglocal_token.h"
 
@@ -44,10 +46,37 @@ namespace {
 	}).toJson(QJsonDocument::Compact);
 }
 
+[[nodiscard]] QString ComputeApiUrl(PaymentConfiguration configuration) {
+	const auto url = QUrl(configuration.tokenizeUrl, QUrl::StrictMode);
+	const auto host = url.host();
+	const auto hostSuffix = u".smart-glocal.com"_q;
+	const auto encoded = url.toString(QUrl::FullyEncoded);
+	if (url.isValid()
+		&& url.scheme() == u"https"_q
+		&& host.size() > hostSuffix.size()
+		&& host.endsWith(hostSuffix)
+		&& url.authority(QUrl::FullyEncoded)
+			== url.host(QUrl::FullyEncoded)
+		&& url.path(QUrl::FullyEncoded)
+			== u"/cds/v1/tokenize/card"_q
+		&& !url.hasQuery()
+		&& !url.hasFragment()
+		&& encoded == configuration.tokenizeUrl) {
+		return encoded;
+	}
+	if (!configuration.tokenizeUrl.isEmpty()) {
+		LOG(("Payments Error: Discarding invalid tokenize_url: %1"
+			).arg(configuration.tokenizeUrl));
+	}
+	return QString("https://%1/%2")
+		.arg(APIURLBase(configuration.isTest))
+		.arg(TokenEndpoint());
+}
+
 } // namespace
 
 APIClient::APIClient(PaymentConfiguration configuration)
-: _apiUrl("https://" + APIURLBase(configuration.isTest))
+: _apiUrl(ComputeApiUrl(configuration))
 , _configuration(configuration) {
 	_additionalHttpHeaders = {
 		{ "X-PUBLIC-TOKEN", _configuration.publicToken },
@@ -67,7 +96,7 @@ void APIClient::createTokenWithCard(
 void APIClient::createTokenWithData(
 		QByteArray data,
 		TokenCompletionCallback completion) {
-	const auto url = QUrl(_apiUrl + '/' + TokenEndpoint());
+	const auto url = QUrl(_apiUrl);
 	auto request = QNetworkRequest(url);
 	request.setHeader(
 		QNetworkRequest::ContentTypeHeader,

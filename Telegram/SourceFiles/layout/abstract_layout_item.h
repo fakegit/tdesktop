@@ -16,8 +16,8 @@ public:
 	: ms(ms)
 	, selecting(selecting) {
 	}
-	crl::time ms;
-	bool selecting;
+	crl::time ms = 0;
+	bool selecting = false;
 
 };
 
@@ -41,6 +41,10 @@ public:
 	virtual void setPosition(int position);
 	[[nodiscard]] int position() const;
 
+	void setShiftX(int x);
+	void setShiftY(int y);
+	[[nodiscard]] QPoint shift() const;
+
 	[[nodiscard]] bool hasPoint(QPoint point) const;
 
 	virtual ~AbstractLayoutItem();
@@ -51,5 +55,7 @@ protected:
 	int _maxw = 0;
 	int _minh = 0;
 	int _position = 0; // < 0 means removed from layout
+	int _shiftX = 0;
+	int _shiftY = 0;
 
 };

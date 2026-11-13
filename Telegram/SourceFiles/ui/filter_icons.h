@@ -20,30 +20,44 @@ class ChatFilter;
 namespace Ui {
 
 enum class FilterIcon : uchar {
+	Cat,
+	Book,
+	Money,
+	// Camera,
+	Game,
+	// House,
+	Light,
+	Like,
+	// Plus,
+	Note,
+	Palette,
+	Travel,
+	Sport,
+	Favorite,
+	Study,
+	Airplane,
+	// Microbe,
+	// Worker,
+	Private,
+	Groups,
 	All,
 	Unread,
-	Unmuted,
+	// Check,
 	Bots,
-	Channels,
-	Groups,
-	Private,
-	Custom,
-	Setup,
-
-	Cat,
+	// Folders,
 	Crown,
-	Favorite,
 	Flower,
-	Game,
 	Home,
 	Love,
 	Mask,
 	Party,
-	Sport,
-	Study,
 	Trade,
-	Travel,
 	Work,
+	Unmuted,
+	Channels,
+	Custom,
+	Setup,
+	// Poo,
 
 	Edit,
 };
@@ -51,6 +65,8 @@ enum class FilterIcon : uchar {
 struct FilterIcons {
 	not_null<const style::internal::Icon*> normal;
 	not_null<const style::internal::Icon*> active;
+	not_null<const style::internal::Icon*> tabs;
+	not_null<const style::internal::Icon*> userpic;
 	QString emoji;
 };
 

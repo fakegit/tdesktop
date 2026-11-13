@@ -20,10 +20,6 @@ namespace MTP {
 struct ProxyData;
 } // namespace MTP
 
-namespace Core {
-class Launcher;
-} // namespace Core
-
 class PreLaunchWindow : public QWidget {
 public:
 	PreLaunchWindow(QString title = QString());
@@ -45,6 +41,9 @@ class PreLaunchLabel : public QLabel {
 public:
 	PreLaunchLabel(QWidget *parent);
 	void setText(const QString &text);
+
+protected:
+	void contextMenuEvent(QContextMenuEvent *e) override;
 
 };
 
@@ -94,10 +93,7 @@ private:
 class LastCrashedWindow : public PreLaunchWindow {
 
 public:
-	LastCrashedWindow(
-		not_null<Core::Launcher*> launcher,
-		const QByteArray &crashdump,
-		Fn<void()> launch);
+	LastCrashedWindow(const QByteArray &crashdump, Fn<void()> launch);
 
 	rpl::producer<MTP::ProxyData> proxyChanges() const;
 

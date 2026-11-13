@@ -16,16 +16,16 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "ui/wrap/slide_wrap.h"
 #include "ui/wrap/vertical_layout.h"
 #include "ui/chat/attach/attach_prepare.h"
-#include "ui/text/text_utilities.h" // Ui::Text::ToUpper
 #include "ui/text/text_options.h"
 #include "ui/image/image_prepare.h"
+#include "ui/painter.h"
 #include "core/file_utilities.h"
 #include "lang/lang_keys.h"
 #include "boxes/abstract_box.h"
 #include "storage/storage_media_prepare.h"
 #include "storage/file_upload.h" // For Storage::kUseBigFilesFrom.
-#include "styles/style_layers.h"
 #include "styles/style_passport.h"
+#include "styles/style_widgets.h"
 
 #include <QtCore/QBuffer>
 
@@ -167,6 +167,12 @@ EditScans::List::List(
 }
 
 EditScans::List::List(
+	not_null<PanelController*> controller)
+: List(controller, std::nullopt)
+{
+}
+
+EditScans::List::List(
 	not_null<PanelController*> controller,
 	std::optional<ScanListData> &&data)
 : controller(controller)
@@ -218,7 +224,7 @@ Ui::SlideWrap<ScanButton> *EditScans::List::nonDeletedErrorRow() const {
 rpl::producer<QString> EditScans::List::uploadButtonText() const {
 	return (files.empty()
 		? tr::lng_passport_upload_scans
-		: tr::lng_passport_upload_more)() | Ui::Text::ToUpper();
+		: tr::lng_passport_upload_more)(tr::upper);
 }
 
 void EditScans::List::hideError() {
@@ -284,12 +290,12 @@ void EditScans::List::pushScan(const ScanInfo &info) {
 	const auto scan = rows.back()->entity();
 
 	scan->deleteClicks(
-	) | rpl::start_with_next([=] {
+	) | rpl::on_next([=] {
 		controller->deleteScan(type, index);
 	}, scan->lifetime());
 
 	scan->restoreClicks(
-	) | rpl::start_with_next([=] {
+	) | rpl::on_next([=] {
 		controller->restoreScan(type, index);
 	}, scan->lifetime());
 
@@ -321,6 +327,7 @@ ScanButton::ScanButton(
 		this,
 		tr::lng_passport_delete_scan_undo(),
 		_st.restore)) {
+	_restore->entity()->setTextTransform(Ui::RoundButtonTextTransform::ToUpper);
 	_delete->toggle(!deleted, anim::type::instant);
 	_restore->toggle(deleted, anim::type::instant);
 }
@@ -677,9 +684,8 @@ void EditScans::setupSpecialScans(
 		}
 		auto label = scan.rowCreated.value(
 		) | rpl::map([=, type = type](bool created) {
-			return uploadText(type, created)();
-		}) | rpl::flatten_latest(
-		) | Ui::Text::ToUpper();
+			return uploadText(type, created)(tr::upper);
+		}) | rpl::flatten_latest();
 		scan.upload = inner->add(
 			object_ptr<Ui::SettingsButton>(
 				inner,
@@ -706,17 +712,17 @@ void EditScans::setupSpecialScans(
 
 void EditScans::init() {
 	_controller->scanUpdated(
-	) | rpl::start_with_next([=](ScanInfo &&info) {
+	) | rpl::on_next([=](ScanInfo &&info) {
 		updateScan(std::move(info));
 	}, lifetime());
 
 	widthValue(
-	) | rpl::start_with_next([=](int width) {
+	) | rpl::on_next([=](int width) {
 		_content->resizeToWidth(width);
 	}, _content->lifetime());
 
 	_content->heightValue(
-	) | rpl::start_with_next([=](int height) {
+	) | rpl::on_next([=](int height) {
 		resize(width(), height);
 	}, _content->lifetime());
 }
@@ -739,7 +745,7 @@ void EditScans::scanFieldsChanged(bool changed) {
 
 void EditScans::updateErrorLabels() {
 	const auto updateList = [&](FileType type) {
-		auto &list = this->list(type);
+		const auto &list = this->list(type);
 		if (list.uploadMoreError) {
 			list.uploadMoreError->toggle(
 				!list.uploadedSomeMore(),
@@ -815,12 +821,12 @@ void EditScans::createSpecialScanRow(
 	const auto row = scan.row->entity();
 
 	row->deleteClicks(
-	) | rpl::start_with_next([=] {
+	) | rpl::on_next([=] {
 		_controller->deleteScan(type, std::nullopt);
 	}, row->lifetime());
 
 	row->restoreClicks(
-	) | rpl::start_with_next([=] {
+	) | rpl::on_next([=] {
 		_controller->restoreScan(type, std::nullopt);
 	}, row->lifetime());
 
@@ -957,7 +963,7 @@ void EditScans::toggleSpecialScanError(FileType type, bool shown) {
 }
 
 void EditScans::specialScanErrorAnimationCallback(FileType type) {
-	auto &scan = findSpecialScan(type);
+	const auto &scan = findSpecialScan(type);
 	const auto error = scan.errorAnimation.value(
 		scan.errorShown ? 1. : 0.);
 	if (error == 0.) {

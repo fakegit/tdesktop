@@ -8,7 +8,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "storage/file_download_web.h"
 
 #include "storage/cache/storage_cache_types.h"
-#include "base/qt_adapters.h"
+#include "base/timer.h"
 #include "base/weak_ptr.h"
 
 #include <QtNetwork/QAuthenticator>
@@ -18,6 +18,7 @@ namespace {
 constexpr auto kMaxWebFileQueries = 8;
 constexpr auto kMaxHttpRedirects = 5;
 constexpr auto kResetDownloadPrioritiesTimeout = crl::time(200);
+constexpr auto kMaxWebFile = 4000 * int64(1024 * 1024);
 
 std::weak_ptr<WebLoadManager> GlobalLoadManager;
 
@@ -41,6 +42,7 @@ enum class Error {
 struct Progress {
 	qint64 ready = 0;
 	qint64 total = 0;
+	QByteArray streamed;
 };
 
 using Update = std::variant<Progress, QByteArray, Error>;
@@ -49,6 +51,17 @@ struct UpdateForLoader {
 	not_null<webFileLoader*> loader;
 	Update data;
 };
+
+// Only http(s) requests are ever performed by this loader. Otherwise a
+// web content URL (or a redirect target chosen by some server) could be
+// a file: URL, which on Windows opens UNC paths like \\host\share\file
+// and discloses the user's NTLM credentials to that host.
+[[nodiscard]] bool IsSupportedWebUrl(const QUrl &url) {
+	const auto scheme = url.scheme();
+	return url.isValid()
+		&& (scheme == QLatin1String("http")
+			|| scheme == QLatin1String("https"));
+}
 
 } // namespace
 
@@ -67,10 +80,12 @@ private:
 	struct Enqueued {
 		int id = 0;
 		QString url;
+		bool stream = false;
 	};
 	struct Sent {
 		QString url;
 		not_null<QNetworkReply*> reply;
+		bool stream = false;
 		QByteArray data;
 		int64 ready = 0;
 		int64 total = 0;
@@ -81,7 +96,7 @@ private:
 	void handleNetworkErrors();
 
 	// Worker thread.
-	void enqueue(int id, const QString &url);
+	void enqueue(int id, const QString &url, bool stream);
 	void remove(int id);
 	void resetGeneration();
 	void checkSendNext();
@@ -107,7 +122,11 @@ private:
 	void failed(int id, not_null<QNetworkReply*> reply);
 	void finished(int id, not_null<QNetworkReply*> reply);
 	void deleteDeferred(not_null<QNetworkReply*> reply);
-	void queueProgressUpdate(int id, int64 ready, int64 total);
+	void queueProgressUpdate(
+		int id,
+		int64 ready,
+		int64 total,
+		QByteArray streamed);
 	void queueFailedUpdate(int id);
 	void queueFinishedUpdate(int id, const QByteArray &data);
 	void clear();
@@ -135,6 +154,10 @@ private:
 WebLoadManager::WebLoadManager()
 : _network(std::make_unique<QNetworkAccessManager>())
 , _resetGenerationTimer(&_thread, [=] { resetGeneration(); }) {
+	// Follow redirects in Qt itself (the default in Qt 6, but not in Qt 5),
+	// so that unsafe targets (scheme changes or https -> http downgrades)
+	// are rejected by the HTTP layer, not re-issued by redirect() below.
+	_network->setRedirectPolicy(QNetworkRequest::NoLessSafeRedirectPolicy);
 	handleNetworkErrors();
 
 	_network->moveToThread(&_thread);
@@ -187,8 +210,9 @@ void WebLoadManager::enqueue(not_null<webFileLoader*> loader) {
 			: _ids.emplace(loader, ++_autoincrement).first->second;
 	}();
 	const auto url = loader->url();
+	const auto stream = loader->streamLoading();
 	InvokeQueued(_network.get(), [=] {
-		enqueue(id, url);
+		enqueue(id, url, stream);
 	});
 }
 
@@ -204,15 +228,22 @@ void WebLoadManager::remove(not_null<webFileLoader*> loader) {
 	});
 }
 
-void WebLoadManager::enqueue(int id, const QString &url) {
+void WebLoadManager::enqueue(int id, const QString &url, bool stream) {
 	const auto i = ranges::find(_queue, id, &Enqueued::id);
 	if (i != end(_queue)) {
+		return;
+	}
+	if (!IsSupportedWebUrl(QUrl(url))) {
+		LOG(("Network Error: "
+			"Bad url requested in WebLoadManager::enqueue(): '%1'"
+			).arg(url));
+		queueFailedUpdate(id);
 		return;
 	}
 	_previousGeneration.erase(
 		ranges::remove(_previousGeneration, id, &Enqueued::id),
 		end(_previousGeneration));
-	_queue.push_back(Enqueued{ id, url });
+	_queue.push_back(Enqueued{ id, url, stream });
 	if (!_resetGenerationTimer.isActive()) {
 		_resetGenerationTimer.callOnce(kResetDownloadPrioritiesTimeout);
 	}
@@ -253,7 +284,7 @@ void WebLoadManager::checkSendNext() {
 void WebLoadManager::send(const Enqueued &entry) {
 	const auto id = entry.id;
 	const auto url = entry.url;
-	_sent.emplace(id, Sent{ url, send(id, url) });
+	_sent.emplace(id, Sent{ url, send(id, url), entry.stream });
 }
 
 void WebLoadManager::removeSent(int id) {
@@ -276,7 +307,7 @@ not_null<QNetworkReply*> WebLoadManager::send(int id, const QString &url) {
 		result,
 		&QNetworkReply::downloadProgress,
 		handleProgress);
-	QObject::connect(result, base::QNetworkReply_error, handleError);
+	QObject::connect(result, &QNetworkReply::errorOccurred, handleError);
 	return result;
 }
 
@@ -294,6 +325,13 @@ void WebLoadManager::progress(
 		not_null<QNetworkReply*> reply,
 		int64 ready,
 		int64 total) {
+	if (total <= 0) {
+		const auto originalContentLength = reply->attribute(
+			QNetworkRequest::OriginalContentLengthAttribute);
+		if (originalContentLength.isValid()) {
+			total = originalContentLength.toLongLong();
+		}
+	}
 	const auto statusCode = reply->attribute(
 		QNetworkRequest::HttpStatusCodeAttribute);
 	const auto status = statusCode.isValid() ? statusCode.toInt() : 200;
@@ -305,28 +343,38 @@ void WebLoadManager::progress(
 			).arg(status));
 		failed(id, reply);
 	} else {
-		notify(id, reply, ready, total);
+		notify(id, reply, ready, std::max(ready, total));
 	}
 }
 
 void WebLoadManager::redirect(int id, not_null<QNetworkReply*> reply) {
-	const auto header = reply->header(QNetworkRequest::LocationHeader);
-	const auto url = header.toString();
-	if (url.isEmpty()) {
-		return;
+	// The cooked LocationHeader value is empty for relative targets,
+	// because Qt parses it into a QUrl only when it carries a scheme.
+	const auto raw = reply->rawHeader("Location");
+	auto url = QUrl(QString::fromUtf8(raw));
+	if (!url.isValid()) {
+		url = QUrl(QString::fromLatin1(raw));
 	}
 
 	if (const auto sent = findSent(id, reply)) {
-		if (!sent->redirectsLeft--) {
+		const auto next = reply->url().resolved(url);
+		if (raw.isEmpty() || !IsSupportedWebUrl(next)) {
+			LOG(("Network Error: "
+				"Bad redirect target in WebLoadManager::redirect() "
+				"for web file loader: %1").arg(QString::fromUtf8(raw)));
+			failed(id, reply);
+			return;
+		} else if (!sent->redirectsLeft--) {
 			LOG(("Network Error: "
 				"Too many HTTP redirects in onFinished() "
-				"for web file loader: %1").arg(url));
+				"for web file loader: %1").arg(next.toString()));
 			failed(id, reply);
 			return;
 		}
+		const auto target = next.toString();
 		deleteDeferred(reply);
-		sent->url = url;
-		sent->reply = send(id, url);
+		sent->url = target;
+		sent->reply = send(id, target);
 	}
 }
 
@@ -338,10 +386,7 @@ void WebLoadManager::notify(
 	if (const auto sent = findSent(id, reply)) {
 		sent->ready = ready;
 		sent->total = std::max(total, int64(0));
-		sent->data.append(reply->readAll());
-		if (total == 0
-			|| total > Storage::kMaxFileInMemory
-			|| sent->data.size() > Storage::kMaxFileInMemory) {
+		if (total <= 0) {
 			LOG(("Network Error: "
 				"Bad size received for HTTP download progress "
 				"in WebLoadManager::onProgress(): %1 / %2 (bytes %3)"
@@ -349,10 +394,43 @@ void WebLoadManager::notify(
 				).arg(total
 				).arg(sent->data.size()));
 			failed(id, reply);
-		} else if (total > 0 && ready >= total) {
-			finished(id, reply);
+			return;
+		}
+		auto bytes = reply->readAll();
+		if (sent->stream) {
+			if (total > kMaxWebFile) {
+				LOG(("Network Error: "
+					"Bad size received for HTTP download progress "
+					"in WebLoadManager::onProgress(): %1 / %2"
+					).arg(ready
+					).arg(total));
+				failed(id, reply);
+			} else {
+				queueProgressUpdate(
+					id,
+					sent->ready,
+					sent->total,
+					std::move(bytes));
+				if (ready >= total) {
+					finished(id, reply);
+				}
+			}
 		} else {
-			queueProgressUpdate(id, sent->ready, sent->total);
+			sent->data.append(std::move(bytes));
+			if (total > Storage::kMaxFileInMemory
+				|| sent->data.size() > Storage::kMaxFileInMemory) {
+				LOG(("Network Error: "
+					"Bad size received for HTTP download progress "
+					"in WebLoadManager::onProgress(): %1 / %2 (bytes %3)"
+					).arg(ready
+					).arg(total
+					).arg(sent->data.size()));
+				failed(id, reply);
+			} else if (ready >= total) {
+				finished(id, reply);
+			} else {
+				queueProgressUpdate(id, sent->ready, sent->total, {});
+			}
 		}
 	}
 }
@@ -372,7 +450,7 @@ void WebLoadManager::failed(
 }
 
 void WebLoadManager::failed(int id, not_null<QNetworkReply*> reply) {
-	if (const auto sent = findSent(id, reply)) {
+	if ([[maybe_unused]] const auto sent = findSent(id, reply)) {
 		removeSent(id);
 		queueFailedUpdate(id);
 	}
@@ -406,9 +484,13 @@ void WebLoadManager::clear() {
 	}
 }
 
-void WebLoadManager::queueProgressUpdate(int id, int64 ready, int64 total) {
-	crl::on_main(this, [=] {
-		sendUpdate(id, Progress{ ready, total });
+void WebLoadManager::queueProgressUpdate(
+		int id,
+		int64 ready,
+		int64 total,
+		QByteArray streamed) {
+	crl::on_main(this, [=, bytes = std::move(streamed)]() mutable {
+		sendUpdate(id, Progress{ ready, total, std::move(bytes) });
 	});
 }
 
@@ -458,6 +540,25 @@ webFileLoader::webFileLoader(
 , _url(url) {
 }
 
+webFileLoader::webFileLoader(
+	not_null<Main::Session*> session,
+	const QString &url,
+	const QString &path,
+	WebRequestType type)
+: FileLoader(
+	session,
+	path,
+	0,
+	0,
+	UnknownFileLocation,
+	LoadToFileOnly,
+	LoadFromCloudOrLocal,
+	false,
+	0)
+, _url(url)
+, _requestType(type) {
+}
+
 webFileLoader::~webFileLoader() {
 	if (!_finished) {
 		cancel();
@@ -468,6 +569,14 @@ QString webFileLoader::url() const {
 	return _url;
 }
 
+WebRequestType webFileLoader::requestType() const {
+	return _requestType;
+}
+
+bool webFileLoader::streamLoading() const {
+	return (_toCache == LoadToFileOnly);
+}
+
 void webFileLoader::startLoading() {
 	if (_finished) {
 		return;
@@ -475,9 +584,12 @@ void webFileLoader::startLoading() {
 		_manager = GetManager();
 		_manager->updates(
 			this
-		) | rpl::start_with_next([=](const Update &data) {
+		) | rpl::on_next([=](const Update &data) {
 			if (const auto progress = std::get_if<Progress>(&data)) {
-				loadProgress(progress->ready, progress->total);
+				loadProgress(
+					progress->ready,
+					progress->total,
+					progress->streamed);
 			} else if (const auto bytes = std::get_if<QByteArray>(&data)) {
 				loadFinished(*bytes);
 			} else {
@@ -488,14 +600,23 @@ void webFileLoader::startLoading() {
 	_manager->enqueue(this);
 }
 
-int webFileLoader::currentOffset() const {
+int64 webFileLoader::currentOffset() const {
 	return _ready;
 }
 
-void webFileLoader::loadProgress(qint64 ready, qint64 total) {
+void webFileLoader::loadProgress(
+		qint64 ready,
+		qint64 total,
+		const QByteArray &streamed) {
 	_fullSize = _loadSize = total;
 	_ready = ready;
-	notifyAboutProgress();
+	if (!streamed.isEmpty()
+		&& !writeResultPart(_streamedOffset, bytes::make_span(streamed))) {
+		loadFailed();
+	} else {
+		_streamedOffset += streamed.size();
+		notifyAboutProgress();
+	}
 }
 
 void webFileLoader::loadFinished(const QByteArray &data) {
@@ -506,7 +627,7 @@ void webFileLoader::loadFinished(const QByteArray &data) {
 }
 
 void webFileLoader::loadFailed() {
-	cancel(true);
+	cancel(FailureReason::OtherFailure);
 }
 
 Storage::Cache::Key webFileLoader::cacheKey() const {

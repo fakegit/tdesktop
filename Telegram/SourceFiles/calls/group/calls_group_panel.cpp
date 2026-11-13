@@ -8,34 +8,44 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "calls/group/calls_group_panel.h"
 
 #include "calls/group/calls_group_common.h"
-#include "calls/group/calls_group_members.h"
-#include "calls/group/calls_group_settings.h"
-#include "calls/group/calls_group_menu.h"
-#include "calls/group/calls_group_viewport.h"
-#include "calls/group/calls_group_toasts.h"
 #include "calls/group/calls_group_invite_controller.h"
+#include "calls/group/calls_group_members.h"
+#include "calls/group/calls_group_menu.h"
+#include "calls/group/calls_group_message_field.h"
+#include "calls/group/calls_group_messages.h"
+#include "calls/group/calls_group_messages_ui.h"
+#include "calls/group/calls_group_settings.h"
+#include "calls/group/calls_group_toasts.h"
+#include "calls/group/calls_group_viewport.h"
 #include "calls/group/ui/calls_group_scheduled_labels.h"
 #include "calls/group/ui/desktop_capture_choose_source.h"
-#include "ui/platform/ui_platform_window_title.h"
+#include "calls/calls_emoji_fingerprint.h"
+#include "calls/calls_window.h"
+#include "base/platform/base_platform_info.h"
+#include "platform/platform_window_title.h"
+#include "chat_helpers/compose/compose_show.h"
+#include "data/data_file_origin.h"
+#include "ui/platform/ui_platform_window_title.h" // TitleLayout
 #include "ui/platform/ui_platform_utility.h"
 #include "ui/controls/call_mute_button.h"
 #include "ui/widgets/buttons.h"
-#include "ui/widgets/call_button.h"
+#include "ui/controls/call_button.h"
 #include "ui/widgets/checkbox.h"
 #include "ui/widgets/dropdown_menu.h"
-#include "ui/widgets/input_fields.h"
+#include "ui/widgets/fields/input_field.h"
 #include "ui/widgets/tooltip.h"
 #include "ui/widgets/rp_window.h"
 #include "ui/chat/group_call_bar.h"
-#include "ui/layers/layer_manager.h"
 #include "ui/layers/generic_box.h"
 #include "ui/text/text_utilities.h"
 #include "ui/toast/toast.h"
-#include "ui/toasts/common_toasts.h"
+#include "ui/image/image_prepare.h"
+#include "ui/integration.h"
+#include "ui/painter.h"
 #include "ui/round_rect.h"
-#include "ui/special_buttons.h"
 #include "info/profile/info_profile_values.h" // Info::Profile::Value.
 #include "core/application.h"
+#include "core/core_settings.h"
 #include "lang/lang_keys.h"
 #include "data/data_channel.h"
 #include "data/data_chat.h"
@@ -43,19 +53,25 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "data/data_group_call.h"
 #include "data/data_session.h"
 #include "data/data_changes.h"
+#include "main/session/session_show.h"
+#include "main/main_app_config.h"
 #include "main/main_session.h"
+#include "menu/menu_send.h"
 #include "base/event_filter.h"
 #include "base/unixtime.h"
 #include "base/qt_signal_producer.h"
 #include "base/timer_rpl.h"
-#include "apiwrap.h" // api().kickParticipant.
+#include "apiwrap.h" // api().kick.
+#include "api/api_chat_participants.h" // api().kick.
+#include "webrtc/webrtc_environment.h"
 #include "webrtc/webrtc_video_track.h"
-#include "webrtc/webrtc_media_devices.h" // UniqueDesktopCaptureSource.
 #include "webrtc/webrtc_audio_input_tester.h"
+#include "webrtc/webrtc_create_adm.h"
+#include "window/window_unlock_passcode_box.h"
 #include "styles/style_calls.h"
+#include "styles/style_chat_helpers.h"
 #include "styles/style_layers.h"
 
-#include <QtWidgets/QDesktopWidget>
 #include <QtWidgets/QApplication>
 #include <QtGui/QWindow>
 #include <QtGui/QScreen>
@@ -69,6 +85,98 @@ constexpr auto kRecordingOpacity = 0.6;
 constexpr auto kStartNoConfirmation = TimeId(10);
 constexpr auto kControlsBackgroundOpacity = 0.8;
 constexpr auto kOverrideActiveColorBgAlpha = 172;
+constexpr auto kHideControlsTimeout = 5 * crl::time(1000);
+constexpr auto kMembersColumnSlideDuration = crl::time(200);
+
+class Show final : public ChatHelpers::Show {
+public:
+	Show(not_null<Panel*> panel, std::shared_ptr<Ui::Show> base)
+	: _panel(panel)
+	, _base(std::move(base)) {
+	}
+
+	void activate() override {
+		if (const auto panel = _panel.get()) {
+			if (!panel->window()->isHidden()) {
+				panel->window()->activateWindow();
+			}
+		}
+	}
+
+	void showOrHideBoxOrLayer(
+			std::variant<
+				v::null_t,
+				object_ptr<Ui::BoxContent>,
+				std::unique_ptr<Ui::LayerWidget>> &&layer,
+			Ui::LayerOptions options,
+			anim::type animated) const override {
+		_base->showOrHideBoxOrLayer(
+			std::move(layer),
+			options,
+			anim::type::normal);
+	}
+	not_null<QWidget*> toastParent() const override {
+		return _base->toastParent();
+	}
+	bool valid() const override {
+		return _panel.get() != nullptr;
+	}
+	operator bool() const override {
+		return valid();
+	}
+
+	Main::Session &session() const override {
+		const auto panel = _panel.get();
+		Assert(panel != nullptr);
+
+		return panel->call()->peer()->session();
+	}
+	bool paused(ChatHelpers::PauseReason reason) const override {
+		const auto panel = _panel.get();
+		if (!panel) {
+			return false;
+		} else if (panel->window()->isHidden()
+			|| (!panel->window()->isFullScreen()
+				&& !panel->window()->isActiveWindow())) {
+			return true;
+		} else if (reason < ChatHelpers::PauseReason::Layer
+			&& panel->callWindow()->topShownLayer() != nullptr) {
+			return true;
+		}
+		return false;
+	}
+	rpl::producer<> pauseChanged() const override {
+		return rpl::never<>();
+	}
+
+	rpl::producer<bool> adjustShadowLeft() const override {
+		return rpl::single(false);
+	}
+	SendMenu::Details sendMenuDetails() const override {
+		return { SendMenu::Type::Disabled };
+	}
+
+	bool showMediaPreview(
+			Data::FileOrigin origin,
+			not_null<DocumentData*> document) const override {
+		return false; // #TODO stories
+	}
+	bool showMediaPreview(
+			Data::FileOrigin origin,
+			not_null<PhotoData*> photo) const override {
+		return false; // #TODO stories
+	}
+
+	void processChosenSticker(
+			ChatHelpers::FileChosen &&chosen) const override {
+		//_panel->emojiChosen(std::move(chosen));
+	}
+
+private:
+	const base::weak_ptr<Panel> _panel;
+	const std::shared_ptr<Ui::Show> _base;
+
+};
 
 } // namespace
 
@@ -80,19 +188,22 @@ struct Panel::ControlsBackgroundNarrow {
 
 	Ui::RpWidget shadow;
 	Ui::RpWidget blocker;
+	int shadowHeight = 0;
 };
 
 Panel::Panel(not_null<GroupCall*> call)
+: Panel(call, ConferencePanelMigration()) {
+}
+
+Panel::Panel(not_null<GroupCall*> call, ConferencePanelMigration info)
 : _call(call)
 , _peer(call->peer())
-, _layerBg(std::make_unique<Ui::LayerManager>(widget()))
-#ifndef Q_OS_MAC
-, _controls(std::make_unique<Ui::Platform::TitleControls>(
-	widget(),
-	st::groupCallTitle))
-#endif // !Q_OS_MAC
+, _window(info.window ? info.window : std::make_shared<Window>())
 , _viewport(
-	std::make_unique<Viewport>(widget(), PanelMode::Wide, _window.backend()))
+	std::make_unique<Viewport>(
+		widget(),
+		PanelMode::Wide,
+		_window->backend()))
 , _mute(std::make_unique<Ui::CallMuteButton>(
 	widget(),
 	st::callMuteButton,
@@ -108,14 +219,33 @@ Panel::Panel(not_null<GroupCall*> call)
 			: _call->scheduleStartSubscribed()
 			? Ui::CallMuteButtonType::ScheduledNotify
 			: Ui::CallMuteButtonType::ScheduledSilent),
+		.expandType = ((_call->scheduleDate() || !_call->rtmp())
+			? Ui::CallMuteButtonExpandType::None
+			: Ui::CallMuteButtonExpandType::Normal),
 	}))
 , _hangup(widget(), st::groupCallHangup)
 , _stickedTooltipsShown(Core::App().settings().hiddenGroupCallTooltips()
 	& ~StickedTooltip::Microphone) // Always show tooltip about mic.
-, _toasts(std::make_unique<Toasts>(this)) {
-	_layerBg->setStyleOverrides(&st::groupCallBox, &st::groupCallLayerBox);
-	_layerBg->setHideByBackgroundClick(true);
-
+, _messages(std::make_unique<MessagesUi>(
+	widget(),
+	uiShow(),
+	MessagesMode::GroupCall,
+	_call->messages()->listValue(),
+	nullptr,
+	_call->messages()->idUpdates(),
+	_call->canManageValue(),
+	_call->messagesEnabledValue(),
+	[=](QPoint globalPosition) {
+		return _messageField
+			&& _messageField->ownsReactionPanelInput(globalPosition);
+	}))
+, _toasts(std::make_unique<Toasts>(this))
+, _controlsBackgroundColor([] {
+	auto result = st::groupCallBg->c;
+	result.setAlphaF(kControlsBackgroundOpacity);
+	return result;
+})
+, _hideControlsTimer([=] { toggleWideControls(false); }) {
 	_viewport->widget()->hide();
 	if (!_viewport->requireARGB32()) {
 		_call->setNotRequireARGB32();
@@ -130,7 +260,7 @@ Panel::Panel(not_null<GroupCall*> call)
 	initWindow();
 	initWidget();
 	initControls();
-	initLayout();
+	initLayout(info);
 	showAndActivate();
 }
 
@@ -141,7 +271,7 @@ Panel::~Panel() {
 
 void Panel::setupRealCallViewers() {
 	_call->real(
-	) | rpl::start_with_next([=](not_null<Data::GroupCall*> real) {
+	) | rpl::on_next([=](not_null<Data::GroupCall*> real) {
 		subscribeToChanges(real);
 	}, lifetime());
 }
@@ -150,21 +280,20 @@ not_null<GroupCall*> Panel::call() const {
 	return _call;
 }
 
-bool Panel::isActive() const {
-	return window()->isActiveWindow()
-		&& window()->isVisible()
+bool Panel::isVisible() const {
+	return window()->isVisible()
 		&& !(window()->windowState() & Qt::WindowMinimized);
 }
 
-void Panel::showToast(TextWithEntities &&text, crl::time duration) {
-	if (const auto strong = _lastToast.get()) {
-		strong->hideAnimated();
+bool Panel::isActive() const {
+	return window()->isActiveWindow() && isVisible();
+}
+
+std::shared_ptr<ChatHelpers::Show> Panel::uiShow() {
+	if (!_cachedShow) {
+		_cachedShow = std::make_shared<Show>(this, _window->uiShow());
 	}
-	_lastToast = Ui::ShowMultilineToast({
-		.parentOverride = widget(),
-		.text = std::move(text),
-		.duration = duration,
-	});
+	return _cachedShow;
 }
 
 void Panel::minimize() {
@@ -193,14 +322,16 @@ void Panel::migrate(not_null<ChannelData*> channel) {
 	_peerLifetime.destroy();
 	subscribeToPeerChanges();
 	_title.destroy();
+	_titleSeparator.destroy();
+	_viewers.destroy();
 	refreshTitle();
 }
 
 void Panel::subscribeToPeerChanges() {
 	Info::Profile::NameValue(
 		_peer
-	) | rpl::start_with_next([=](const TextWithEntities &name) {
-		window()->setTitle(name.text);
+	) | rpl::on_next([=](const QString &name) {
+		window()->setTitle(name);
 	}, _peerLifetime);
 }
 
@@ -217,11 +348,7 @@ bool Panel::chooseSourceActiveWithAudio() {
 }
 
 bool Panel::chooseSourceWithAudioSupported() {
-#ifdef Q_OS_WIN
-	return true;
-#else // Q_OS_WIN
-	return false;
-#endif // Q_OS_WIN
+	return Webrtc::LoopbackAudioCaptureSupported();
 }
 
 rpl::lifetime &Panel::chooseSourceInstanceLifetime() {
@@ -243,68 +370,163 @@ void Panel::initWindow() {
 	window()->setAttribute(Qt::WA_NoSystemBackground);
 	window()->setTitleStyle(st::groupCallTitle);
 
-	subscribeToPeerChanges();
+	if (_call->conference()) {
+		titleText() | rpl::on_next([=](const QString &text) {
+			window()->setTitle(text);
+		}, lifetime());
+	} else {
+		subscribeToPeerChanges();
+	}
 
+	const auto updateFullScreen = [=] {
+		const auto state = window()->windowState();
+		const auto full = (state & Qt::WindowFullScreen)
+			|| (state & Qt::WindowMaximized);
+		_rtmpFull = _call->rtmp() && full;
+		_fullScreenOrMaximized = full;
+	};
 	base::install_event_filter(window().get(), [=](not_null<QEvent*> e) {
-		if (e->type() == QEvent::Close && handleClose()) {
+		const auto type = e->type();
+		if (type == QEvent::Close && handleClose()) {
 			e->ignore();
 			return base::EventFilterResult::Cancel;
-		} else if (e->type() == QEvent::KeyPress
-			|| e->type() == QEvent::KeyRelease) {
-			if (static_cast<QKeyEvent*>(e.get())->key() == Qt::Key_Space) {
+		} else if (_call->rtmp()
+			&& (type == QEvent::KeyPress || type == QEvent::KeyRelease)) {
+			const auto key = static_cast<QKeyEvent*>(e.get())->key();
+			if (key == Qt::Key_Space) {
 				_call->pushToTalk(
 					e->type() == QEvent::KeyPress,
 					kSpacePushToTalkDelay);
+			} else if (key == Qt::Key_Escape
+				&& _fullScreenOrMaximized.current()) {
+				toggleFullScreen();
+			}
+		} else if (type == QEvent::WindowStateChange) {
+			const auto was = static_cast<QWindowStateChangeEvent*>(
+				e.get())->oldState();
+			updateFullScreen();
+			if ((was & Qt::WindowFullScreen)
+				!= (window()->windowState() & Qt::WindowFullScreen)) {
+				updateControlsGeometry();
 			}
 		}
 		return base::EventFilterResult::Continue;
-	});
+	}, lifetime());
+	updateFullScreen();
 
+	const auto guard = base::make_weak(this);
 	window()->setBodyTitleArea([=](QPoint widgetPoint) {
 		using Flag = Ui::WindowTitleHitTestFlag;
+		if (!guard) {
+			return (Flag::None | Flag(0));
+		}
 		const auto titleRect = QRect(
 			0,
 			0,
 			widget()->width(),
-			st::groupCallMembersTop);
+			(mode() == PanelMode::Wide
+				? st::groupCallWideContentTop
+				: st::groupCallMembersTop));
 		const auto moveable = (titleRect.contains(widgetPoint)
 			&& (!_menuToggle || !_menuToggle->geometry().contains(widgetPoint))
 			&& (!_menu || !_menu->geometry().contains(widgetPoint))
 			&& (!_recordingMark || !_recordingMark->geometry().contains(widgetPoint))
-			&& (!_joinAsToggle || !_joinAsToggle->geometry().contains(widgetPoint)));
+			&& ranges::none_of(titleButtons(), [&](not_null<Ui::IconButton*> button) {
+				return titleButtonRect(button).contains(widgetPoint);
+			}));
 		if (!moveable) {
 			return (Flag::None | Flag(0));
 		}
-		const auto shown = _layerBg->topShownLayer();
+		const auto shown = _window->topShownLayer();
 		return (!shown || !shown->geometry().contains(widgetPoint))
-			? (Flag::Move | Flag::Maximize)
+			? (Flag::Move | Flag::Menu | Flag::Maximize)
 			: Flag::None;
 	});
 
 	_call->hasVideoWithFramesValue(
-	) | rpl::start_with_next([=] {
+	) | rpl::on_next([=] {
 		updateMode();
 	}, lifetime());
+
+	_window->maximizeRequests() | rpl::on_next([=](bool maximized) {
+		if (_call->rtmp()) {
+			toggleFullScreen(maximized);
+		} else {
+			window()->setWindowState(maximized
+				? Qt::WindowMaximized
+				: Qt::WindowNoState);
+		}
+	}, lifetime());
+
+	_window->showingLayer() | rpl::on_next([=] {
+		hideStickedTooltip(StickedTooltipHide::Unavailable);
+	}, lifetime());
+
+	_window->setControlsStyle(st::groupCallTitle);
+	_window->togglePowerSaveBlocker(true);
+
+	uiShow()->hideLayer(anim::type::instant);
 }
 
 void Panel::initWidget() {
 	widget()->setMouseTracking(true);
 
 	widget()->paintRequest(
-	) | rpl::start_with_next([=](QRect clip) {
+	) | rpl::on_next([=](QRect clip) {
 		paint(clip);
 	}, lifetime());
 
 	widget()->sizeValue(
-	) | rpl::skip(1) | rpl::start_with_next([=](QSize size) {
+	) | rpl::skip(1) | rpl::on_next([=](QSize size) {
 		if (!updateMode()) {
 			updateControlsGeometry();
 		}
 
-		// title geometry depends on _controls->geometry,
+		// some geometries depends on _controls->controls.geometry,
 		// which is not updated here yet.
-		crl::on_main(widget(), [=] { refreshTitle(); });
+		crl::on_main(this, [=] { updateControlsGeometry(); });
 	}, lifetime());
+}
+
+void Panel::toggleMessageTyping() {
+	const auto typing = !_messageTyping.current();
+	if (_messageField) {
+		_messageField->toggle(typing);
+	} else if (typing) {
+		_messageField = std::make_unique<MessageField>(
+			widget(),
+			uiShow(),
+			_call->conference() ? nullptr : _call->peer().get());
+
+		updateButtonsGeometry();
+		_messageField->toggle(true);
+
+		_messageField->submitted(
+		) | rpl::on_next([=](TextWithTags text) {
+			_call->sendMessage(std::move(text));
+
+			_messageField->toggle(false);
+			_messageTyping = false;
+			updateWideControlsVisibility();
+		}, _messageField->lifetime());
+
+		_messageField->heightValue() | rpl::on_next([=] {
+			updateButtonsGeometry();
+		}, _messageField->lifetime());
+
+		_messageField->closeRequests() | rpl::on_next([=] {
+			if (_messageTyping.current()) {
+				toggleMessageTyping();
+			}
+		}, _messageField->lifetime());
+
+		_messageField->closed() | rpl::on_next([=] {
+			_messageField = nullptr;
+			updateButtonsGeometry();
+		}, _messageField->lifetime());
+	}
+	_messageTyping = typing;
+	updateWideControlsVisibility();
 }
 
 void Panel::endCall() {
@@ -312,7 +534,7 @@ void Panel::endCall() {
 		_call->hangup();
 		return;
 	}
-	showBox(Box(
+	uiShow()->showBox(Box(
 		LeaveBox,
 		_call,
 		false,
@@ -327,7 +549,7 @@ void Panel::startScheduledNow() {
 	} else if (now + kStartNoConfirmation >= date) {
 		_call->startScheduledNow();
 	} else {
-		const auto box = std::make_shared<QPointer<Ui::GenericBox>>();
+		const auto box = std::make_shared<base::weak_qptr<Ui::GenericBox>>();
 		const auto done = [=] {
 			if (*box) {
 				(*box)->closeBox();
@@ -335,14 +557,14 @@ void Panel::startScheduledNow() {
 			_call->startScheduledNow();
 		};
 		auto owned = ConfirmBox({
-			.text = { (_call->peer()->isBroadcast()
+			.text = (_call->peer()->isBroadcast()
 				? tr::lng_group_call_start_now_sure_channel
-				: tr::lng_group_call_start_now_sure)(tr::now) },
-			.button = tr::lng_group_call_start_now(),
-			.callback = done,
+				: tr::lng_group_call_start_now_sure)(),
+			.confirmed = done,
+			.confirmText = tr::lng_group_call_start_now(),
 		});
 		*box = owned.data();
-		showBox(std::move(owned));
+		uiShow()->showBox(std::move(owned));
 	}
 }
 
@@ -350,7 +572,7 @@ void Panel::initControls() {
 	_mute->clicks(
 	) | rpl::filter([=](Qt::MouseButton button) {
 		return (button == Qt::LeftButton);
-	}) | rpl::start_with_next([=] {
+	}) | rpl::on_next([=] {
 		if (_call->scheduleDate()) {
 			if (_call->canManage()) {
 				startScheduledNow();
@@ -359,10 +581,16 @@ void Panel::initControls() {
 					!real->scheduleStartSubscribed());
 			}
 			return;
+		} else if (_call->rtmp()) {
+			toggleFullScreen();
+			return;
 		}
+
 		const auto oldState = _call->muted();
 		const auto newState = (oldState == MuteState::ForceMuted)
-			? MuteState::RaisedHand
+			? (_call->conference()
+				? MuteState::ForceMuted
+				: MuteState::RaisedHand)
 			: (oldState == MuteState::RaisedHand)
 			? MuteState::RaisedHand
 			: (oldState == MuteState::Muted)
@@ -372,17 +600,19 @@ void Panel::initControls() {
 	}, _mute->lifetime());
 
 	initShareAction();
+	createMessageButton();
 	refreshLeftButton();
 	refreshVideoButtons();
 
 	rpl::combine(
 		_mode.value(),
 		_call->canManageValue()
-	) | rpl::start_with_next([=] {
+	) | rpl::on_next([=] {
 		refreshTopButton();
 	}, lifetime());
 
 	_hangup->setClickedCallback([=] { endCall(); });
+	_hangup->setAccessibleName(tr::lng_group_call_leave(tr::now));
 
 	const auto scheduleDate = _call->scheduleDate();
 	if (scheduleDate) {
@@ -405,12 +635,12 @@ void Panel::initControls() {
 				_peer,
 				Data::PeerUpdate::Flag::Username
 			) | rpl::skip(1) | rpl::to_empty
-		) | rpl::start_with_next([=] {
+		) | rpl::on_next([=] {
 			refreshLeftButton();
 			updateControlsGeometry();
 		}, _callLifetime);
 
-		std::move(started) | rpl::start_with_next([=] {
+		std::move(started) | rpl::on_next([=] {
 			refreshVideoButtons();
 			updateButtonsStyles();
 			setupMembers();
@@ -425,23 +655,36 @@ void Panel::initControls() {
 			|| (state == State::Ended)
 			|| (state == State::FailedHangingUp)
 			|| (state == State::Failed);
-	}) | rpl::start_with_next([=] {
+	}) | rpl::on_next([=] {
 		closeBeforeDestroy();
 	}, _callLifetime);
 
 	_call->levelUpdates(
 	) | rpl::filter([=](const LevelUpdate &update) {
 		return update.me;
-	}) | rpl::start_with_next([=](const LevelUpdate &update) {
+	}) | rpl::on_next([=](const LevelUpdate &update) {
 		_mute->setLevel(update.value);
 	}, _callLifetime);
 
 	_call->real(
-	) | rpl::start_with_next([=](not_null<Data::GroupCall*> real) {
+	) | rpl::on_next([=](not_null<Data::GroupCall*> real) {
 		setupRealMuteButtonState(real);
 	}, _callLifetime);
 
 	refreshControlsBackground();
+}
+
+void Panel::toggleFullScreen() {
+	toggleFullScreen(
+		!_fullScreenOrMaximized.current() && !window()->isFullScreen());
+}
+
+void Panel::toggleFullScreen(bool fullscreen) {
+	if (fullscreen) {
+		window()->showFullScreen();
+	} else {
+		window()->showNormal();
+	}
 }
 
 void Panel::refreshLeftButton() {
@@ -455,17 +698,33 @@ void Panel::refreshLeftButton() {
 		_settings.destroy();
 		_callShare.create(widget(), st::groupCallShare);
 		_callShare->setClickedCallback(_callShareLinkCallback);
+		_callShare->setAccessibleName(tr::lng_group_call_invite(tr::now));
 	} else {
 		_callShare.destroy();
 		_settings.create(widget(), st::groupCallSettings);
 		_settings->setClickedCallback([=] {
-			showBox(Box(SettingsBox, _call));
+			uiShow()->showBox(Box(SettingsBox, _call));
 		});
+		_settings->setAccessibleName(tr::lng_group_call_settings_title(tr::now));
+		trackControls(_trackControls, true);
 	}
 	const auto raw = _callShare ? _callShare.data() : _settings.data();
 	raw->show();
 	raw->setColorOverrides(_mute->colorOverrides());
 	updateButtonsStyles();
+}
+
+rpl::producer<Ui::CallButtonColors> Panel::toggleableOverrides(
+		rpl::producer<bool> active) {
+	return rpl::combine(
+		std::move(active),
+		_mute->colorOverrides()
+	) | rpl::map([](bool active, Ui::CallButtonColors colors) {
+		if (active && colors.bg) {
+			colors.bg->setAlpha(kOverrideActiveColorBgAlpha);
+		}
+		return colors;
+	});
 }
 
 void Panel::refreshVideoButtons(std::optional<bool> overrideWideMode) {
@@ -482,17 +741,6 @@ void Panel::refreshVideoButtons(std::optional<bool> overrideWideMode) {
 		}
 		return;
 	}
-	auto toggleableOverrides = [&](rpl::producer<bool> active) {
-		return rpl::combine(
-			std::move(active),
-			_mute->colorOverrides()
-		) | rpl::map([](bool active, Ui::CallButtonColors colors) {
-			if (active && colors.bg) {
-				colors.bg->setAlpha(kOverrideActiveColorBgAlpha);
-			}
-			return colors;
-		});
-	};
 	if (!_video) {
 		_video.create(
 			widget(),
@@ -505,41 +753,70 @@ void Panel::refreshVideoButtons(std::optional<bool> overrideWideMode) {
 				StickedTooltipHide::Activated);
 			_call->toggleVideo(!_call->isSharingCamera());
 		});
+		_video->setAccessibleName(tr::lng_call_start_video(tr::now));
 		_video->setColorOverrides(
 			toggleableOverrides(_call->isSharingCameraValue()));
 		_call->isSharingCameraValue(
-		) | rpl::start_with_next([=](bool sharing) {
+		) | rpl::on_next([=](bool sharing) {
 			if (sharing) {
 				hideStickedTooltip(
 					StickedTooltip::Camera,
 					StickedTooltipHide::Activated);
 			}
 			_video->setProgress(sharing ? 1. : 0.);
+			_video->setAccessibleName(sharing
+				? tr::lng_call_stop_video(tr::now)
+				: tr::lng_call_start_video(tr::now));
 		}, _video->lifetime());
 	}
 	if (!_screenShare) {
 		_screenShare.create(widget(), st::groupCallScreenShareSmall);
 		_screenShare->show();
 		_screenShare->setClickedCallback([=] {
-			chooseShareScreenSource();
+			const auto narrow = (mode() == PanelMode::Default);
+			// the wide row keeps the chooser while sharing
+			if (narrow && _call->isSharingScreen()) {
+				_call->toggleScreenSharing(std::nullopt);
+			} else {
+				chooseShareScreenSource();
+			}
 		});
+		_screenShare->setAccessibleName(tr::lng_group_call_screen_share_start(tr::now));
 		_screenShare->setColorOverrides(
 			toggleableOverrides(_call->isSharingScreenValue()));
 		_call->isSharingScreenValue(
-		) | rpl::start_with_next([=](bool sharing) {
+		) | rpl::on_next([=](bool sharing) {
 			_screenShare->setProgress(sharing ? 1. : 0.);
+			_screenShare->setAccessibleName(sharing
+				? tr::lng_group_call_screen_share_stop(tr::now)
+				: tr::lng_group_call_screen_share_start(tr::now));
 		}, _screenShare->lifetime());
 	}
-	if (!_wideMenu) {
+	if (!_wideMenu && _call->rtmp()) {
 		_wideMenu.create(widget(), st::groupCallMenuToggleSmall);
 		_wideMenu->show();
 		_wideMenu->setClickedCallback([=] { showMainMenu(); });
+		_wideMenu->setAccessibleName(tr::lng_sr_group_call_menu(tr::now));
 		_wideMenu->setColorOverrides(
 			toggleableOverrides(_wideMenuShown.value()));
 	}
 	updateButtonsStyles();
 	updateButtonsGeometry();
 	raiseControls();
+}
+
+void Panel::createMessageButton() {
+	if (!_message) {
+		_message.create(
+			widget(),
+			st::groupCallMessageSmall,
+			&st::groupCallMessageActiveSmall);
+		_message->show();
+		_message->setClickedCallback([=] { toggleMessageTyping(); });
+		_message->setAccessibleName(tr::lng_group_call_message(tr::now));
+		_message->setColorOverrides(
+			toggleableOverrides(_messageTyping.value()));
+	}
 }
 
 void Panel::hideStickedTooltip(StickedTooltipHide hide) {
@@ -583,17 +860,16 @@ void Panel::hideNiceTooltip() {
 }
 
 void Panel::initShareAction() {
-	const auto showBoxCallback = [=](object_ptr<Ui::BoxContent> next) {
-		showBox(std::move(next));
-	};
-	const auto showToastCallback = [=](QString text) {
-		showToast({ text });
-	};
 	auto [shareLinkCallback, shareLinkLifetime] = ShareInviteLinkAction(
 		_peer,
-		showBoxCallback,
-		showToastCallback);
+		uiShow());
 	_callShareLinkCallback = [=, callback = std::move(shareLinkCallback)] {
+		if (::Window::ShowUnlockPasscodeBox(
+				uiShow(),
+				DarkUnlockPasscodeBoxStyle(),
+				crl::guard(this, [=] { _callShareLinkCallback(); }))) {
+			return;
+		}
 		if (_call->lookupReal()) {
 			callback();
 		}
@@ -609,21 +885,23 @@ void Panel::setupRealMuteButtonState(not_null<Data::GroupCall*> real) {
 		real->scheduleDateValue(),
 		real->scheduleStartSubscribedValue(),
 		_call->canManageValue(),
-		_mode.value()
+		_mode.value(),
+		_fullScreenOrMaximized.value()
 	) | rpl::distinct_until_changed(
 	) | rpl::filter(
 		_2 != GroupCall::InstanceState::TransitionToRtc
-	) | rpl::start_with_next([=](
+	) | rpl::on_next([=](
 			MuteState mute,
 			GroupCall::InstanceState state,
 			TimeId scheduleDate,
 			bool scheduleStartSubscribed,
 			bool canManage,
-			PanelMode mode) {
+			PanelMode mode,
+			bool fullScreenOrMaximized) {
 		const auto wide = (mode == PanelMode::Wide);
 		using Type = Ui::CallMuteButtonType;
-		_mute->setState(Ui::CallMuteButtonState{
-			.text = (wide
+		using ExpandType = Ui::CallMuteButtonExpandType;
+		const auto text = (wide
 				? QString()
 				: scheduleDate
 				? (canManage
@@ -639,7 +917,10 @@ void Panel::setupRealMuteButtonState(not_null<Data::GroupCall*> real) {
 				? tr::lng_group_call_raised_hand(tr::now)
 				: mute == MuteState::Muted
 				? tr::lng_group_call_unmute(tr::now)
-				: tr::lng_group_call_you_are_live(tr::now)),
+				: tr::lng_group_call_you_are_live(tr::now));
+		_mute->outer()->setAccessibleName(text);
+		_mute->setState(Ui::CallMuteButtonState{
+			.text = text,
 			.tooltip = ((!scheduleDate && mute == MuteState::Muted)
 				? tr::lng_group_call_unmute_sub(tr::now)
 				: QString()),
@@ -652,12 +933,19 @@ void Panel::setupRealMuteButtonState(not_null<Data::GroupCall*> real) {
 				: state == GroupCall::InstanceState::Disconnected
 				? Type::Connecting
 				: mute == MuteState::ForceMuted
-				? Type::ForceMuted
+				? (_call->conference()
+					? Type::ConferenceForceMuted
+					: Type::ForceMuted)
 				: mute == MuteState::RaisedHand
 				? Type::RaisedHand
 				: mute == MuteState::Muted
 				? Type::Muted
 				: Type::Active),
+			.expandType = ((scheduleDate || !_call->rtmp())
+				? ExpandType::None
+				: fullScreenOrMaximized
+				? ExpandType::Expanded
+				: ExpandType::Normal),
 		});
 	}, _callLifetime);
 }
@@ -673,7 +961,7 @@ void Panel::setupScheduledLabels(rpl::producer<TimeId> date) {
 		date
 	) | rpl::map([=](TimeId date) {
 		_countdownData = std::make_shared<Ui::GroupCallScheduledLeft>(date);
-		return rpl::empty_value();
+		return rpl::empty;
 	}) | rpl::start_spawning(lifetime());
 
 	_countdown = Ui::CreateGradientLabel(widget(), rpl::duplicate(
@@ -704,7 +992,7 @@ void Panel::setupScheduledLabels(rpl::producer<TimeId> date) {
 	rpl::combine(
 		widget()->sizeValue(),
 		_startsIn->widthValue()
-	) | rpl::start_with_next([=](QSize size, int width) {
+	) | rpl::on_next([=](QSize size, int width) {
 		_startsIn->move(
 			(size.width() - width) / 2,
 			top() + st::groupCallStartsInTop);
@@ -713,7 +1001,7 @@ void Panel::setupScheduledLabels(rpl::producer<TimeId> date) {
 	rpl::combine(
 		widget()->sizeValue(),
 		_startsWhen->widthValue()
-	) | rpl::start_with_next([=](QSize size, int width) {
+	) | rpl::on_next([=](QSize size, int width) {
 		_startsWhen->move(
 			(size.width() - width) / 2,
 			top() + st::groupCallStartsWhenTop);
@@ -722,7 +1010,7 @@ void Panel::setupScheduledLabels(rpl::producer<TimeId> date) {
 	rpl::combine(
 		widget()->sizeValue(),
 		_countdown->widthValue()
-	) | rpl::start_with_next([=](QSize size, int width) {
+	) | rpl::on_next([=](QSize size, int width) {
 		_countdown->move(
 			(size.width() - width) / 2,
 			top() + st::groupCallCountdownTop);
@@ -742,48 +1030,49 @@ void Panel::setupMembers() {
 	_countdown.destroy();
 	_startsWhen.destroy();
 
-	_members.create(widget(), _call, mode(), _window.backend());
+	_members.create(widget(), _call, mode(), _window->backend());
 
 	setupVideo(_viewport.get());
 	setupVideo(_members->viewport());
 	_viewport->mouseInsideValue(
-	) | rpl::start_with_next([=](bool inside) {
+	) | rpl::filter([=] {
+		return !_rtmpFull;
+	}) | rpl::on_next([=](bool inside) {
 		toggleWideControls(inside);
 	}, _viewport->lifetime());
 
 	_members->show();
 
+	setupEmptyRtmp();
 	refreshControlsBackground();
 	raiseControls();
 
 	_members->desiredHeightValue(
-	) | rpl::start_with_next([=] {
+	) | rpl::on_next([=] {
 		updateMembersGeometry();
 	}, _members->lifetime());
 
 	_members->toggleMuteRequests(
-	) | rpl::start_with_next([=](MuteRequest request) {
-		if (_call) {
-			_call->toggleMute(request);
-		}
+	) | rpl::on_next([=](MuteRequest request) {
+		_call->toggleMute(request);
 	}, _callLifetime);
 
 	_members->changeVolumeRequests(
-	) | rpl::start_with_next([=](VolumeRequest request) {
-		if (_call) {
-			_call->changeVolume(request);
-		}
+	) | rpl::on_next([=](VolumeRequest request) {
+		_call->changeVolume(request);
 	}, _callLifetime);
 
 	_members->kickParticipantRequests(
-	) | rpl::start_with_next([=](not_null<PeerData*> participantPeer) {
+	) | rpl::on_next([=](not_null<PeerData*> participantPeer) {
 		kickParticipant(participantPeer);
 	}, _callLifetime);
 
 	_members->addMembersRequests(
-	) | rpl::start_with_next([=] {
-		if (!_peer->isBroadcast()
-			&& _peer->canWrite()
+	) | rpl::on_next([=] {
+		if (_call->conference()) {
+			addMembers();
+		} else if (!_peer->isBroadcast()
+			&& Data::CanSend(_peer, ChatRestriction::SendOther, false)
 			&& _call->joinAs()->isSelf()) {
 			addMembers();
 		} else if (const auto channel = _peer->asChannel()) {
@@ -793,8 +1082,11 @@ void Panel::setupMembers() {
 		}
 	}, _callLifetime);
 
+	_members->shareLinkRequests(
+	) | rpl::on_next(shareConferenceLinkCallback(), _callLifetime);
+
 	_call->videoEndpointLargeValue(
-	) | rpl::start_with_next([=](const VideoEndpoint &large) {
+	) | rpl::on_next([=](const VideoEndpoint &large) {
 		if (large && mode() != PanelMode::Wide) {
 			enlargeVideo();
 		}
@@ -802,10 +1094,49 @@ void Panel::setupMembers() {
 	}, _callLifetime);
 }
 
+Fn<void()> Panel::shareConferenceLinkCallback() {
+	return crl::guard(this, [=] { shareConferenceLink(); });
+}
+
+void Panel::shareConferenceLink() {
+	Expects(_call->conference());
+
+	if (::Window::ShowUnlockPasscodeBox(
+			uiShow(),
+			DarkUnlockPasscodeBoxStyle(),
+			crl::guard(this, [=] { shareConferenceLink(); }))) {
+		return;
+	}
+	ShowConferenceCallLinkBox(uiShow(), _call->sharedCall(), {
+		.st = DarkConferenceCallLinkStyle(),
+	});
+}
+
+void Panel::migrationShowShareLink() {
+	ShowConferenceCallLinkBox(
+		uiShow(),
+		_call->sharedCall(),
+		{ .st = DarkConferenceCallLinkStyle() });
+}
+
+void Panel::migrationInviteUsers(std::vector<InviteRequest> users) {
+	const auto done = [=](InviteResult result) {
+		uiShow()->showToast({ ComposeInviteResultToast(result) });
+	};
+	_call->inviteUsers(std::move(users), crl::guard(this, done));
+}
+
 void Panel::enlargeVideo() {
+	// This is called from videoEndpointLargeValue(), so it can happen at any
+	// moment - including while the last monitor is being removed, when
+	// QGuiApplication has no screens at all and screen() is nullptr.
+	const auto screen = window()->screen();
+	if (!screen) {
+		return;
+	}
 	_lastSmallGeometry = window()->geometry();
 
-	const auto available = window()->screen()->availableGeometry();
+	const auto available = screen->availableGeometry();
 	const auto width = std::max(
 		window()->width(),
 		std::max(
@@ -843,29 +1174,6 @@ void Panel::enlargeVideo() {
 	}
 }
 
-void Panel::minimizeVideo() {
-	if (window()->windowState() & Qt::WindowMaximized) {
-		_lastLargeMaximized = true;
-		window()->setWindowState(
-			window()->windowState() & ~Qt::WindowMaximized);
-	} else {
-		_lastLargeMaximized = false;
-		_lastLargeGeometry = window()->geometry();
-	}
-	const auto available = window()->screen()->availableGeometry();
-	const auto width = st::groupCallWidth;
-	const auto height = st::groupCallHeight;
-	auto geometry = QRect(
-		window()->x() + (window()->width() - width) / 2,
-		window()->y() + (window()->height() - height) / 2,
-		width,
-		height);
-	window()->setGeometry((_lastSmallGeometry
-		&& available.intersects(*_lastSmallGeometry))
-		? *_lastSmallGeometry
-		: geometry);
-}
-
 void Panel::raiseControls() {
 	if (_controlsBackgroundWide) {
 		_controlsBackgroundWide->raise();
@@ -880,6 +1188,7 @@ void Panel::raiseControls() {
 		&_screenShare,
 		&_wideMenu,
 		&_video,
+		&_message,
 		&_hangup
 	};
 	for (const auto button : buttons) {
@@ -888,7 +1197,36 @@ void Panel::raiseControls() {
 		}
 	}
 	_mute->raise();
-	_layerBg->raise();
+	if (_titleBackground) {
+		_titleBackground->raise();
+	}
+	if (_title) {
+		_title->raise();
+	}
+	if (_viewers) {
+		_titleSeparator->raise();
+		_viewers->raise();
+	}
+	if (_menuToggle) {
+		_menuToggle->raise();
+	}
+	if (_recordingMark) {
+		_recordingMark->raise();
+	}
+	if (_pinOnTop) {
+		_pinOnTop->raise();
+	}
+	if (_titleColumn) {
+		_titleColumn->raise();
+	}
+	if (_titleMenu) {
+		_titleMenu->raise();
+	}
+	_messages->raise();
+	if (_messageField) {
+		_messageField->raise();
+	}
+	_window->raiseLayers();
 	if (_niceTooltip) {
 		_niceTooltip->raise();
 	}
@@ -899,23 +1237,29 @@ void Panel::setupVideo(not_null<Viewport*> viewport) {
 			const VideoEndpoint &endpoint,
 			const std::unique_ptr<GroupCall::VideoTrack> &track) {
 		using namespace rpl::mappers;
-		const auto row = _members->lookupRow(GroupCall::TrackPeer(track));
+		const auto row = endpoint.rtmp()
+			? _members->rtmpFakeRow(GroupCall::TrackPeer(track)).get()
+			: _members->lookupRow(GroupCall::TrackPeer(track));
 		Assert(row != nullptr);
+
 		auto pinned = rpl::combine(
 			_call->videoEndpointLargeValue(),
 			_call->videoEndpointPinnedValue()
 		) | rpl::map(_1 == endpoint && _2);
+		const auto self = (endpoint.peer == _call->joinAs());
 		viewport->add(
 			endpoint,
 			VideoTileTrack{ GroupCall::TrackPointer(track), row },
 			GroupCall::TrackSizeValue(track),
-			std::move(pinned));
+			std::move(pinned),
+			self,
+			_call->shownVideoTracks().contains(endpoint));
 	};
 	for (const auto &[endpoint, track] : _call->activeVideoTracks()) {
 		setupTile(endpoint, track);
 	}
 	_call->videoStreamActiveUpdates(
-	) | rpl::start_with_next([=](const VideoStateToggle &update) {
+	) | rpl::on_next([=](const VideoStateToggle &update) {
 		if (update.value) {
 			// Add async (=> the participant row is definitely in Members).
 			const auto endpoint = update.endpoint;
@@ -932,15 +1276,23 @@ void Panel::setupVideo(not_null<Viewport*> viewport) {
 		}
 	}, viewport->lifetime());
 
+	// Tiles keep a raw row pointer and the members list deletes the rows
+	// of participants missing after a full reload before the call marks
+	// their endpoints inactive, so drop such tiles while the row lives.
+	_members->rowRemoved(
+	) | rpl::on_next([=](not_null<MembersRow*> row) {
+		viewport->removeByRow(row);
+	}, viewport->lifetime());
+
 	viewport->pinToggled(
-	) | rpl::start_with_next([=](bool pinned) {
+	) | rpl::on_next([=](bool pinned) {
 		_call->pinVideoEndpoint(pinned
 			? _call->videoEndpointLarge()
 			: VideoEndpoint{});
 	}, viewport->lifetime());
 
 	viewport->clicks(
-	) | rpl::start_with_next([=](VideoEndpoint &&endpoint) {
+	) | rpl::on_next([=](VideoEndpoint &&endpoint) {
 		if (_call->videoEndpointLarge() == endpoint) {
 			_call->showVideoEndpointLarge({});
 		} else if (_call->videoEndpointPinned()) {
@@ -951,7 +1303,7 @@ void Panel::setupVideo(not_null<Viewport*> viewport) {
 	}, viewport->lifetime());
 
 	viewport->qualityRequests(
-	) | rpl::start_with_next([=](const VideoQualityRequest &request) {
+	) | rpl::on_next([=](const VideoQualityRequest &request) {
 		_call->requestVideoQuality(request.endpoint, request.quality);
 	}, viewport->lifetime());
 }
@@ -961,17 +1313,19 @@ void Panel::toggleWideControls(bool shown) {
 		return;
 	}
 	_showWideControls = shown;
-	crl::on_main(widget(), [=] {
+	crl::on_main(this, [=] {
 		updateWideControlsVisibility();
 	});
 }
 
 void Panel::updateWideControlsVisibility() {
 	const auto shown = _showWideControls
-		|| (_stickedTooltipClose != nullptr);
+		|| (_stickedTooltipClose != nullptr)
+		|| _messageTyping.current();
 	if (_wideControlsShown == shown) {
 		return;
 	}
+	_viewport->setCursorShown(!_rtmpFull || shown);
 	_wideControlsShown = shown;
 	_wideControlsAnimation.start(
 		[=] { updateButtonsGeometry(); },
@@ -998,8 +1352,10 @@ void Panel::subscribeToChanges(not_null<Data::GroupCall*> real) {
 			const auto skip = st::groupCallRecordingMarkSkip;
 			_recordingMark->resize(size + 2 * skip, size + 2 * skip);
 			_recordingMark->setClickedCallback([=] {
-				showToast({ (livestream
+				uiShow()->showToast({ (livestream
 					? tr::lng_group_call_is_recorded_channel
+					: real->recordVideo()
+					? tr::lng_group_call_is_recorded_video
 					: tr::lng_group_call_is_recorded)(tr::now) });
 			});
 			const auto animate = [=] {
@@ -1016,7 +1372,7 @@ void Panel::subscribeToChanges(not_null<Data::GroupCall*> real) {
 			animate();
 
 			_recordingMark->paintRequest(
-			) | rpl::start_with_next([=] {
+			) | rpl::on_next([=] {
 				auto p = QPainter(_recordingMark.data());
 				auto hq = PainterHighQualityEnabler(p);
 				p.setPen(Qt::NoPen);
@@ -1035,14 +1391,15 @@ void Panel::subscribeToChanges(not_null<Data::GroupCall*> real) {
 	) | rpl::map(
 		_1 != 0
 	) | rpl::distinct_until_changed(
-	) | rpl::start_with_next([=](bool recorded) {
+	) | rpl::on_next([=](bool recorded) {
 		const auto livestream = _call->peer()->isBroadcast();
 		const auto isVideo = real->recordVideo();
 		if (recorded) {
 			*startedAsVideo = isVideo;
+			_call->playSoundRecordingStarted();
 		}
 		validateRecordingMark(recorded);
-		showToast((recorded
+		uiShow()->showToast((recorded
 			? (livestream
 				? tr::lng_group_call_recording_started_channel
 				: isVideo
@@ -1056,27 +1413,25 @@ void Panel::subscribeToChanges(not_null<Data::GroupCall*> real) {
 				? tr::lng_group_call_recording_stopped_channel
 				: tr::lng_group_call_recording_stopped))(
 				tr::now,
-				Ui::Text::RichLangValue));
+				tr::rich));
 	}, lifetime());
 	validateRecordingMark(real->recordStartDate() != 0);
 
 	rpl::combine(
 		_call->videoIsWorkingValue(),
 		_call->isSharingCameraValue()
-	) | rpl::start_with_next([=] {
+	) | rpl::on_next([=] {
 		refreshVideoButtons();
 		showStickedTooltip();
 	}, lifetime());
 
-	rpl::combine(
-		_call->videoIsWorkingValue(),
-		_call->isSharingScreenValue()
-	) | rpl::start_with_next([=] {
-		refreshTopButton();
+	_call->messagesEnabledValue() | rpl::on_next([=] {
+		updateButtonsGeometry();
+		raiseControls();
 	}, lifetime());
 
 	_call->mutedValue(
-	) | rpl::skip(1) | rpl::start_with_next([=](MuteState state) {
+	) | rpl::skip(1) | rpl::on_next([=](MuteState state) {
 		updateButtonsGeometry();
 		if (state == MuteState::Active
 			|| state == MuteState::PushToTalk) {
@@ -1090,55 +1445,225 @@ void Panel::subscribeToChanges(not_null<Data::GroupCall*> real) {
 	updateControlsGeometry();
 }
 
+std::vector<not_null<Ui::IconButton*>> Panel::titleButtons() const {
+	auto result = std::vector<not_null<Ui::IconButton*>>();
+	// Ordered from the system buttons outward; the placement walk relies on it.
+	const auto buttons = {
+		_pinOnTop.data(),
+		_titleColumn.data(),
+		_titleMenu.data()
+	};
+	for (const auto button : buttons) {
+		if (button && !button->isHidden()) {
+			result.push_back(button);
+		}
+	}
+	return result;
+}
+
+QRect Panel::titleButtonRect(not_null<Ui::IconButton*> button) const {
+	return QRect(button->mapTo(widget().get(), QPoint()), button->size());
+}
+
+void Panel::createPinOnTop() {
+	const auto wrap = _window->controlsWrap();
+	_pinOnTop.create(
+		wrap ? wrap : widget().get(),
+		wrap ? st::groupCallTitlePinOnTop : st::groupCallPinOnTop);
+	const auto pinnedIcon = wrap
+		? &st::groupCallTitlePinnedIcon
+		: &st::groupCallPinnedOnTop;
+	const auto pinnedIconOver = wrap
+		? &st::groupCallTitlePinnedIconOver
+		: &st::groupCallPinnedOnTop;
+	const auto updateIcon = [=](bool pinned) {
+		_pinOnTop->setIconOverride(
+			pinned ? pinnedIcon : nullptr,
+			pinned ? pinnedIconOver : nullptr);
+	};
+	const auto pin = [=](bool pin) {
+		_window->setPinnedOnTop(pin);
+		updateIcon(pin);
+	};
+	updateIcon(_window->pinnedOnTop());
+
+	_fullScreenOrMaximized.value(
+	) | rpl::on_next([=](bool fullScreenOrMaximized) {
+		_pinOnTop->setVisible(!fullScreenOrMaximized);
+		if (!fullScreenOrMaximized) {
+			if (_unpinnedMaximized) {
+				_unpinnedMaximized = false;
+				pin(false);
+			}
+		} else if (_window->pinnedOnTop()) {
+			if (_window->unpinFromTopMaximized()) {
+				_unpinnedMaximized = true;
+			} else {
+				pin(false);
+			}
+		}
+	}, _pinOnTop->lifetime());
+
+	_pinOnTop->setClickedCallback([=] {
+		const auto now = !_window->pinnedOnTop();
+		pin(now);
+		uiShow()->showToast({
+			.text = { _call->rtmp()
+				? (now
+					? tr::lng_group_call_pinned_on_top(tr::now)
+					: tr::lng_group_call_unpinned_on_top(tr::now))
+				: (now
+					? tr::lng_call_window_pinned_on_top(tr::now)
+					: tr::lng_call_window_unpinned_on_top(tr::now)) },
+			.iconLottie = now ? u"toast/pin"_q : u"toast/unpin"_q,
+			.iconLottieSize = st::toastLottieIconSize,
+		});
+	});
+
+	updateControlsGeometry();
+}
+
+void Panel::createTitleMenu() {
+	const auto wrap = _window->controlsWrap();
+	_titleMenu.create(
+		wrap ? wrap : widget().get(),
+		wrap ? st::groupCallTitleMenu : st::groupCallMenuOnTop);
+	_titleMenu->show();
+	_titleMenu->setAccessibleName(tr::lng_sr_group_call_menu(tr::now));
+	_titleMenu->setClickedCallback([=] { showMainMenu(); });
+
+	_fullScreenOrMaximized.changes(
+	) | rpl::on_next([=] {
+		crl::on_main(this, [=] { updateControlsGeometry(); });
+	}, _titleMenu->lifetime());
+
+	updateControlsGeometry();
+	raiseControls();
+}
+
+void Panel::createTitleColumn() {
+	const auto wrap = _window->controlsWrap();
+	_titleColumn.create(
+		wrap ? wrap : widget().get(),
+		wrap ? st::groupCallTitleColumn : st::groupCallColumnOnTop);
+	_titleColumn->show();
+	const auto shownIcon = wrap
+		? &st::groupCallTitleColumnShownIcon
+		: &st::groupCallColumnShownOnTop;
+	const auto shownIconOver = wrap
+		? &st::groupCallTitleColumnShownIconOver
+		: &st::groupCallColumnShownOnTop;
+	const auto updateLook = [=](bool shown) {
+		_titleColumn->setIconOverride(
+			shown ? shownIcon : nullptr,
+			shown ? shownIconOver : nullptr);
+		_titleColumn->setAccessibleName(shown
+			? tr::lng_sr_group_call_column_hide(tr::now)
+			: tr::lng_sr_group_call_column_show(tr::now));
+	};
+	updateLook(_membersColumnShown);
+	_titleColumn->setClickedCallback([=] {
+		toggleMembersColumn();
+		updateLook(_membersColumnShown);
+	});
+
+	updateControlsGeometry();
+	raiseControls();
+}
+
+void Panel::toggleMembersColumn() {
+	const auto from = _membersColumnAnimation.value(
+		_membersColumnShown ? 1. : 0.);
+	_membersColumnShown = !_membersColumnShown;
+	const auto shown = _membersColumnShown;
+	_membersColumnAnimation.start(
+		[=] {
+			updateMembersGeometry();
+			updateButtonsGeometry();
+		},
+		from,
+		shown ? 1. : 0.,
+		kMembersColumnSlideDuration,
+		shown ? anim::easeOutCirc : anim::easeInCirc);
+}
+
+int Panel::membersColumnReserve() const {
+	if (_call->rtmp()) {
+		return 0;
+	}
+	const auto shown = _membersColumnAnimation.value(
+		_membersColumnShown ? 1. : 0.);
+	return anim::interpolate(
+		0,
+		st::groupCallNarrowSkip + st::groupCallNarrowMembersWidth,
+		shown);
+}
+
+void Panel::setupFullScreenBehavior() {
+	Expects(_call->rtmp());
+
+	_fullScreenOrMaximized.value(
+	) | rpl::on_next([=](bool fullScreenOrMaximized) {
+		_window->setControlsStyle(fullScreenOrMaximized
+			? st::callTitle
+			: st::groupCallTitle);
+
+		if (fullScreenOrMaximized) {
+			_viewport->rp()->events(
+			) | rpl::filter([](not_null<QEvent*> event) {
+				return (event->type() == QEvent::MouseMove);
+			}) | rpl::on_next([=] {
+				_hideControlsTimer.callOnce(kHideControlsTimeout);
+				toggleWideControls(true);
+			}, _hideControlsTimerLifetime);
+
+			_hideControlsTimer.callOnce(kHideControlsTimeout);
+		} else {
+			_hideControlsTimerLifetime.destroy();
+			_hideControlsTimer.cancel();
+			refreshTitleGeometry();
+		}
+		refreshTitleBackground();
+		updateMembersGeometry();
+	}, lifetime());
+}
+
 void Panel::refreshTopButton() {
+	if (!_pinOnTop) {
+		createPinOnTop();
+		if (_call->rtmp()) {
+			setupFullScreenBehavior();
+		}
+	}
 	if (_mode.current() == PanelMode::Wide) {
 		_menuToggle.destroy();
-		_joinAsToggle.destroy();
+		if (!_call->rtmp()) {
+			if (!_titleColumn) {
+				createTitleColumn();
+			}
+			if (!_titleMenu) {
+				createTitleMenu();
+			}
+		}
 		updateButtonsGeometry(); // _wideMenu <-> _settings
-		return;
-	}
-	const auto hasJoinAs = _call->showChooseJoinAs();
-	const auto showNarrowMenu = _call->canManage()
-		|| _call->videoIsWorking();
-	const auto showNarrowUserpic = !showNarrowMenu && hasJoinAs;
-	if (showNarrowMenu) {
-		_joinAsToggle.destroy();
+	} else {
+		_titleColumn.destroy();
+		_titleMenu.destroy();
 		if (!_menuToggle) {
 			_menuToggle.create(widget(), st::groupCallMenuToggle);
 			_menuToggle->show();
+			_menuToggle->setAccessibleName(
+				tr::lng_sr_group_call_menu(tr::now));
 			_menuToggle->setClickedCallback([=] { showMainMenu(); });
 			updateControlsGeometry();
+			raiseControls();
 		}
-	} else if (showNarrowUserpic) {
-		_menuToggle.destroy();
-		rpl::single(
-			_call->joinAs()
-		) | rpl::then(_call->rejoinEvents(
-		) | rpl::map([](const RejoinEvent &event) {
-			return event.nowJoinAs;
-		})) | rpl::start_with_next([=](not_null<PeerData*> joinAs) {
-			auto joinAsToggle = object_ptr<Ui::UserpicButton>(
-				widget(),
-				joinAs,
-				Ui::UserpicButton::Role::Custom,
-				st::groupCallJoinAsToggle);
-			_joinAsToggle.destroy();
-			_joinAsToggle = std::move(joinAsToggle);
-			_joinAsToggle->show();
-			_joinAsToggle->setClickedCallback([=] {
-				chooseJoinAs();
-			});
-			updateControlsGeometry();
-		}, lifetime());
-	} else {
-		_menuToggle.destroy();
-		_joinAsToggle.destroy();
 	}
 }
 
 void Panel::screenSharingPrivacyRequest() {
 	if (auto box = ScreenSharingPrivacyRequestBox()) {
-		showBox(std::move(box));
+		uiShow()->showBox(std::move(box));
 	}
 }
 
@@ -1147,11 +1672,19 @@ void Panel::chooseShareScreenSource() {
 		return;
 	}
 	const auto choose = [=] {
-		if (!Webrtc::DesktopCaptureAllowed()) {
+		const auto env = &Core::App().mediaDevices();
+		if (!env->desktopCaptureAllowed()) {
 			screenSharingPrivacyRequest();
-		} else if (const auto source = Webrtc::UniqueDesktopCaptureSource()) {
+		} else if (const auto source = env->uniqueDesktopCaptureSource()) {
 			if (_call->isSharingScreen()) {
 				_call->toggleScreenSharing(std::nullopt);
+			} else if (chooseSourceWithAudioSupported()) {
+				const auto sourceId = *source;
+				ShowUniqueCaptureOptions(
+					uiShow(),
+					crl::guard(this, [=](bool audio) {
+						chooseSourceAccepted(sourceId, audio);
+					}));
 			} else {
 				chooseSourceAccepted(*source, false);
 			}
@@ -1175,7 +1708,7 @@ void Panel::chooseShareScreenSource() {
 		tr::now,
 		lt_user,
 		screencastFromPeer->shortName());
-	const auto shared = std::make_shared<QPointer<Ui::GenericBox>>();
+	const auto shared = std::make_shared<base::weak_qptr<Ui::GenericBox>>();
 	const auto done = [=] {
 		if (*shared) {
 			base::take(*shared)->closeBox();
@@ -1183,12 +1716,12 @@ void Panel::chooseShareScreenSource() {
 		choose();
 	};
 	auto box = ConfirmBox({
-		.text = { text },
-		.button = tr::lng_continue(),
-		.callback = done,
+		.text = text,
+		.confirmed = done,
+		.confirmText = tr::lng_continue(),
 	});
 	*shared = box.data();
-	showBox(std::move(box));
+	uiShow()->showBox(std::move(box));
 }
 
 void Panel::chooseJoinAs() {
@@ -1196,17 +1729,10 @@ void Panel::chooseJoinAs() {
 	const auto callback = [=](JoinInfo info) {
 		_call->rejoinAs(info);
 	};
-	const auto showBoxCallback = [=](object_ptr<Ui::BoxContent> next) {
-		showBox(std::move(next));
-	};
-	const auto showToastCallback = [=](QString text) {
-		showToast({ text });
-	};
 	_joinAsProcess.start(
 		_peer,
 		context,
-		showBoxCallback,
-		showToastCallback,
+		uiShow(),
 		callback,
 		_call->joinAs());
 }
@@ -1215,8 +1741,11 @@ void Panel::showMainMenu() {
 	if (_menu) {
 		return;
 	}
-	const auto wide = (_mode.current() == PanelMode::Wide) && _wideMenu;
-	if (!wide && !_menuToggle) {
+	const auto wide = (_mode.current() == PanelMode::Wide);
+	const auto title = wide ? _titleMenu.data() : nullptr;
+	const auto row = (wide && !title) ? _wideMenu.data() : nullptr;
+	const auto toggle = wide ? nullptr : _menuToggle.data();
+	if (!title && !row && !toggle) {
 		return;
 	}
 	_menu.create(widget(), st::groupCallDropdownMenu);
@@ -1224,10 +1753,8 @@ void Panel::showMainMenu() {
 		_menu.data(),
 		_peer,
 		_call,
-		wide,
 		[=] { chooseJoinAs(); },
-		[=] { chooseShareScreenSource(); },
-		[=](auto box) { showBox(std::move(box)); });
+		[=](auto box) { uiShow()->showBox(std::move(box)); });
 	if (_menu->empty()) {
 		_wideMenuShown = false;
 		_menu.destroy();
@@ -1235,44 +1762,57 @@ void Panel::showMainMenu() {
 	}
 
 	const auto raw = _menu.data();
+	const auto fromRow = (row != nullptr);
+	const auto fromToggle = (toggle != nullptr);
+	const auto markSource = [=](bool shown) {
+		if (_menu != raw) {
+			return;
+		}
+		_wideMenuShown = shown && fromRow;
+		if (_menuToggle) {
+			_menuToggle->setForceRippled(shown && fromToggle);
+		}
+		if (_titleMenu) {
+			const auto over = shown ? &_titleMenu->st().iconOver : nullptr;
+			_titleMenu->setIconOverride(over, over);
+		}
+	};
 	raw->setHiddenCallback([=] {
 		raw->deleteLater();
 		if (_menu == raw) {
+			markSource(false);
 			_menu = nullptr;
-			_wideMenuShown = false;
 			_trackControlsMenuLifetime.destroy();
-			if (_menuToggle) {
-				_menuToggle->setForceRippled(false);
-			}
 		}
 	});
-	raw->setShowStartCallback([=] {
-		if (_menu == raw) {
-			if (wide) {
-				_wideMenuShown = true;
-			} else if (_menuToggle) {
-				_menuToggle->setForceRippled(true);
-			}
-		}
-	});
-	raw->setHideStartCallback([=] {
-		if (_menu == raw) {
-			_wideMenuShown = false;
-			if (_menuToggle) {
-				_menuToggle->setForceRippled(false);
-			}
-		}
-	});
+	raw->setShowStartCallback([=] { markSource(true); });
+	raw->setHideStartCallback([=] { markSource(false); });
 
-	if (wide) {
+	if (title) {
+		title->installEventFilter(_menu);
+
+		const auto rect = titleButtonRect(title);
+		const auto &padding = st::groupCallDropdownMenu.wrap.padding;
+		const auto top = rect.y() + rect.height() - padding.top();
+		if (rect.center().x() > widget()->width() / 2) {
+			_menu->move(
+				rect.x() + rect.width() + padding.right() - _menu->width(),
+				top);
+			_menu->showAnimated(Ui::PanelAnimation::Origin::TopRight);
+		} else {
+			_menu->move(rect.x() - padding.left(), top);
+			_menu->showAnimated(Ui::PanelAnimation::Origin::TopLeft);
+		}
+	} else if (row) {
 		_wideMenu->installEventFilter(_menu);
+		trackControl(_menu, _trackControlsMenuLifetime);
+
 		const auto x = st::groupCallWideMenuPosition.x();
 		const auto y = st::groupCallWideMenuPosition.y();
 		_menu->moveToLeft(
 			_wideMenu->x() + x,
 			_wideMenu->y() - _menu->height() + y);
 		_menu->showAnimated(Ui::PanelAnimation::Origin::BottomLeft);
-		trackControl(_menu, _trackControlsMenuLifetime);
 	} else {
 		_menuToggle->installEventFilter(_menu);
 		const auto x = st::groupCallMenuPosition.x();
@@ -1288,16 +1828,31 @@ void Panel::showMainMenu() {
 }
 
 void Panel::addMembers() {
+	if (::Window::ShowUnlockPasscodeBox(
+			uiShow(),
+			DarkUnlockPasscodeBoxStyle(),
+			crl::guard(this, [=] { addMembers(); }))) {
+		return;
+	}
+	const auto &appConfig = _call->peer()->session().appConfig();
+	const auto conferenceLimit = appConfig.confcallSizeLimit();
+	if (_call->conference()
+		&& _call->sharedCall()->fullCount() >= conferenceLimit) {
+		uiShow()->showToast({ tr::lng_group_call_invite_limit(tr::now) });
+	}
 	const auto showToastCallback = [=](TextWithEntities &&text) {
-		showToast(std::move(text));
+		uiShow()->showToast(std::move(text));
 	};
-	if (auto box = PrepareInviteBox(_call, showToastCallback)) {
-		showBox(std::move(box));
+	const auto link = _call->conference()
+		? shareConferenceLinkCallback()
+		: nullptr;
+	if (auto box = PrepareInviteBox(_call, showToastCallback, link)) {
+		uiShow()->showBox(std::move(box));
 	}
 }
 
 void Panel::kickParticipant(not_null<PeerData*> participantPeer) {
-	showBox(Box([=](not_null<Ui::GenericBox*> box) {
+	uiShow()->showBox(Box([=](not_null<Ui::GenericBox*> box) {
 		box->addRow(
 			object_ptr<Ui::FlatLabel>(
 				box.get(),
@@ -1307,8 +1862,10 @@ void Panel::kickParticipant(not_null<PeerData*> participantPeer) {
 						: tr::lng_group_call_remove_channel)(
 							tr::now,
 							lt_channel,
-							participantPeer->name)
-					: (_peer->isBroadcast()
+							participantPeer->name())
+					: (_call->conference()
+						? tr::lng_confcall_sure_remove
+						: _peer->isBroadcast()
 						? tr::lng_profile_sure_kick_channel
 						: tr::lng_profile_sure_kick)(
 							tr::now,
@@ -1328,21 +1885,13 @@ void Panel::kickParticipant(not_null<PeerData*> participantPeer) {
 	}));
 }
 
-void Panel::showBox(object_ptr<Ui::BoxContent> box) {
-	showBox(std::move(box), Ui::LayerOption::KeepOther, anim::type::normal);
-}
-
-void Panel::showBox(
-		object_ptr<Ui::BoxContent> box,
-		Ui::LayerOptions options,
-		anim::type animated) {
-	hideStickedTooltip(StickedTooltipHide::Unavailable);
-	_layerBg->showBox(std::move(box), options, animated);
-}
-
 void Panel::kickParticipantSure(not_null<PeerData*> participantPeer) {
-	if (const auto chat = _peer->asChat()) {
-		chat->session().api().kickParticipant(chat, participantPeer);
+	if (_call->conference()) {
+		if (const auto user = participantPeer->asUser()) {
+			_call->removeConferenceParticipants({ peerToUser(user->id) });
+		}
+	} else if (const auto chat = _peer->asChat()) {
+		chat->session().api().chatParticipants().kick(chat, participantPeer);
 	} else if (const auto channel = _peer->asChannel()) {
 		const auto currentRestrictedRights = [&] {
 			const auto user = participantPeer->asUser();
@@ -1354,26 +1903,26 @@ void Panel::kickParticipantSure(not_null<PeerData*> participantPeer) {
 				? i->second.rights
 				: ChatRestrictionsInfo();
 		}();
-		channel->session().api().kickParticipant(
+		channel->session().api().chatParticipants().kick(
 			channel,
 			participantPeer,
 			currentRestrictedRights);
 	}
 }
 
-void Panel::initLayout() {
-	initGeometry();
+void Panel::initLayout(ConferencePanelMigration info) {
+	initGeometry(info);
 
-#ifndef Q_OS_MAC
-	_controls->raise();
+	_window->raiseControls();
 
-	Ui::Platform::TitleControlsLayoutChanged(
-	) | rpl::start_with_next([=] {
+	_window->controlsLayoutChanges(
+	) | rpl::on_next([=] {
 		// _menuToggle geometry depends on _controls arrangement.
-		crl::on_main(widget(), [=] { updateControlsGeometry(); });
+		crl::on_main(this, [=] { updateControlsGeometry(); });
 	}, lifetime());
 
-#endif // !Q_OS_MAC
+	raiseControls();
+	updateControlsGeometry();
 }
 
 void Panel::showControls() {
@@ -1388,33 +1937,61 @@ void Panel::closeBeforeDestroy() {
 }
 
 rpl::lifetime &Panel::lifetime() {
-	return window()->lifetime();
+	return _lifetime;
 }
 
-void Panel::initGeometry() {
-	const auto center = Core::App().getPointForCallPanelCenter();
-	const auto rect = QRect(0, 0, st::groupCallWidth, st::groupCallHeight);
-	window()->setGeometry(rect.translated(center - rect.center()));
-	window()->setMinimumSize(rect.size());
+void Panel::initGeometry(ConferencePanelMigration info) {
+	const auto minWidth = _call->rtmp()
+		? st::groupCallWidthRtmpMin
+		: st::groupCallWidth;
+	const auto minHeight = _call->rtmp()
+		? st::groupCallHeightRtmpMin
+		: st::groupCallHeight;
+	if (!info.window) {
+		const auto center = Core::App().getPointForCallPanelCenter();
+		const auto width = _call->rtmp()
+			? st::groupCallWidthRtmp
+			: st::groupCallWidth;
+		const auto height = _call->rtmp()
+			? st::groupCallHeightRtmp
+			: st::groupCallHeight;
+		const auto rect = QRect(0, 0, width, height);
+		window()->setGeometry(rect.translated(center - rect.center()));
+	}
+	window()->setMinimumSize({ minWidth, minHeight });
 	window()->show();
 }
 
 QRect Panel::computeTitleRect() const {
-	const auto skip = st::groupCallTitleTop;
-	const auto remove = skip + (_menuToggle
-		? (_menuToggle->width() + st::groupCallMenuTogglePosition.x())
-		: 0) + (_joinAsToggle
-			? (_joinAsToggle->width() + st::groupCallMenuTogglePosition.x())
-			: 0);
+	const auto skip = st::groupCallTitleSeparator;
+	auto custom = 0;
+	if (!_window->controlsWrap()) {
+		for (const auto &button : titleButtons()) {
+			custom += button->width();
+		}
+	}
+	const auto remove = skip + ((mode() == PanelMode::Wide)
+		? custom
+		: (st::groupCallMenuTogglePosition.x()
+			+ (_menuToggle ? _menuToggle->width() : 0)
+			+ custom));
 	const auto width = widget()->width();
 #ifdef Q_OS_MAC
-	return QRect(70, 0, width - remove - 70, 28);
+	const auto left = window()->isFullScreen()
+		? st::groupCallNarrowSkip
+		: st::groupCallTitleLeftMac;
+	return QRect(left, 0, width - remove - left, 28);
 #else // Q_OS_MAC
-	const auto controls = _controls->geometry();
-	const auto right = controls.x() + controls.width() + skip;
-	return (controls.center().x() < width / 2)
-		? QRect(right, 0, width - right - remove, controls.height())
-		: QRect(remove, 0, controls.x() - skip - remove, controls.height());
+	const auto controls = _window->controlsGeometry();
+	const auto onTheLeft = (controls.center().x() < width / 2);
+	auto band = controls;
+	for (const auto &button : titleButtons()) {
+		band = band.united(button->geometry());
+	}
+	const auto right = band.x() + band.width() + skip;
+	return onTheLeft
+		? QRect(right, 0, width - right - remove, band.height())
+		: QRect(remove, 0, band.x() - skip - remove, band.height());
 #endif // !Q_OS_MAC
 }
 
@@ -1422,8 +1999,9 @@ bool Panel::updateMode() {
 	if (!_viewport) {
 		return false;
 	}
-	const auto wide = _call->hasVideoWithFrames()
-		&& (widget()->width() >= st::groupCallWideModeWidthMin);
+	const auto wide = _call->rtmp()
+		|| (_call->hasVideoWithFrames()
+			&& (widget()->width() >= st::groupCallWideModeWidthMin));
 	const auto mode = wide ? PanelMode::Wide : PanelMode::Default;
 	if (_mode.current() == mode) {
 		return false;
@@ -1437,18 +2015,17 @@ bool Panel::updateMode() {
 		_niceTooltip.destroy();
 	}
 	_mode = mode;
-	if (_title) {
-		_title->setTextColorOverride(wide
-			? std::make_optional(st::groupCallMemberNotJoinedStatus->c)
-			: std::nullopt);
-	}
+	refreshTitleColors();
 	if (wide && _subtitle) {
 		_subtitle.destroy();
 	} else if (!wide && !_subtitle) {
 		refreshTitle();
+	} else if (!_members) {
+		setupMembers();
 	}
 	_wideControlsShown = _showWideControls = true;
 	_wideControlsAnimation.stop();
+	_membersColumnAnimation.stop();
 	_viewport->widget()->setVisible(wide);
 	if (_members) {
 		_members->setMode(mode);
@@ -1473,6 +2050,24 @@ void Panel::updateButtonsStyles() {
 			? rpl::single(QString())
 			: tr::lng_group_call_video());
 	}
+	if (_message) {
+		_message->setStyle(
+			wide ? st::groupCallMessageSmall : st::groupCallMessage,
+			(wide
+				? &st::groupCallMessageActiveSmall
+				: &st::groupCallMessageActive));
+		_message->setText(wide
+			? rpl::single(QString())
+			: tr::lng_group_call_message());
+	}
+	if (_screenShare) {
+		_screenShare->setStyle(wide
+			? st::groupCallScreenShareSmall
+			: st::groupCallScreenShare);
+		_screenShare->setText(wide
+			? rpl::single(QString())
+			: tr::lng_group_call_screen());
+	}
 	if (_settings) {
 		_settings->setText(wide
 			? rpl::single(QString())
@@ -1489,6 +2084,65 @@ void Panel::updateButtonsStyles() {
 	_hangup->setStyle(wide
 		? st::groupCallHangupSmall
 		: st::groupCallHangup);
+}
+
+void Panel::setupEmptyRtmp() {
+	_call->emptyRtmpValue(
+	) | rpl::on_next([=](bool empty) {
+		if (!empty) {
+			_emptyRtmp.destroy();
+			return;
+		} else if (_emptyRtmp) {
+			return;
+		}
+		struct Label {
+			Label(
+				QWidget *parent,
+				rpl::producer<QString> text,
+				const style::color &color)
+			: widget(parent, std::move(text), st::groupCallVideoLimitLabel)
+			, corners(st::groupCallControlsBackRadius, color) {
+			}
+
+			Ui::FlatLabel widget;
+			Ui::RoundRect corners;
+		};
+		_emptyRtmp.create(widget());
+		const auto label = _emptyRtmp->lifetime().make_state<Label>(
+			_emptyRtmp.data(),
+			(_call->rtmpInfo().url.isEmpty()
+				? tr::lng_group_call_no_stream(
+					lt_group,
+					rpl::single(_peer->name()))
+				: tr::lng_group_call_no_stream_admin()),
+			_controlsBackgroundColor.color());
+		_emptyRtmp->setAttribute(Qt::WA_TransparentForMouseEvents);
+		_emptyRtmp->show();
+		_emptyRtmp->paintRequest(
+		) | rpl::on_next([=] {
+			auto p = QPainter(_emptyRtmp.data());
+			label->corners.paint(p, _emptyRtmp->rect());
+		}, _emptyRtmp->lifetime());
+
+		widget()->sizeValue(
+		) | rpl::on_next([=](QSize size) {
+			const auto padding = st::groupCallWidth / 30;
+			const auto width = std::min(
+				size.width() - padding * 4,
+				st::groupCallWidth);
+			label->widget.resizeToWidth(width);
+			label->widget.move(padding, padding);
+			_emptyRtmp->resize(
+				width + 2 * padding,
+				label->widget.height() + 2 * padding);
+			_emptyRtmp->move(
+				(size.width() - _emptyRtmp->width()) / 2,
+				(size.height() - _emptyRtmp->height()) / 3);
+		}, _emptyRtmp->lifetime());
+
+		raiseControls();
+	}, lifetime());
+
 }
 
 void Panel::refreshControlsBackground() {
@@ -1513,6 +2167,31 @@ void Panel::refreshControlsBackground() {
 	updateButtonsGeometry();
 }
 
+void Panel::refreshTitleBackground() {
+	if (!_rtmpFull) {
+		_titleBackground.destroy();
+		return;
+	} else if (_titleBackground) {
+		return;
+	}
+	_titleBackground.create(widget());
+	_titleBackground->show();
+	raiseControls();
+	auto &lifetime = _titleBackground->lifetime();
+	const auto corners = lifetime.make_state<Ui::RoundRect>(
+		st::roundRadiusLarge,
+		_controlsBackgroundColor.color());
+	_titleBackground->paintRequest(
+	) | rpl::on_next([=] {
+		auto p = QPainter(_titleBackground.data());
+		corners->paintSomeRounded(
+			p,
+			_titleBackground->rect(),
+			RectPart::FullBottom);
+	}, lifetime);
+	refreshTitleGeometry();
+}
+
 void Panel::setupControlsBackgroundNarrow() {
 	_controlsBackgroundNarrow = std::make_unique<ControlsBackgroundNarrow>(
 		widget());
@@ -1520,18 +2199,17 @@ void Panel::setupControlsBackgroundNarrow() {
 	_controlsBackgroundNarrow->blocker.show();
 	auto &lifetime = _controlsBackgroundNarrow->shadow.lifetime();
 
-	const auto factor = cIntRetinaFactor();
+	const auto factor = style::DevicePixelRatio();
 	const auto height = std::max(
 		st::groupCallMembersShadowHeight,
 		st::groupCallMembersFadeSkip + st::groupCallMembersFadeHeight);
+	_controlsBackgroundNarrow->shadowHeight = height;
 	const auto full = lifetime.make_state<QImage>(
 		QSize(1, height * factor),
 		QImage::Format_ARGB32_Premultiplied);
-	rpl::single(
-		rpl::empty_value()
-	) | rpl::then(
+	rpl::single(rpl::empty) | rpl::then(
 		style::PaletteChanged()
-	) | rpl::start_with_next([=] {
+	) | rpl::on_next([=] {
 		full->fill(Qt::transparent);
 
 		auto p = QPainter(full);
@@ -1548,7 +2226,7 @@ void Panel::setupControlsBackgroundNarrow() {
 				bottom - (st::groupCallMembersFadeHeight * factor),
 				full->width(),
 				st::groupCallMembersFadeHeight * factor),
-			GenerateShadow(
+			Images::GenerateShadow(
 				st::groupCallMembersFadeHeight,
 				0,
 				255,
@@ -1559,7 +2237,7 @@ void Panel::setupControlsBackgroundNarrow() {
 				(height - st::groupCallMembersShadowHeight) * factor,
 				full->width(),
 				st::groupCallMembersShadowHeight * factor),
-			GenerateShadow(
+			Images::GenerateShadow(
 				st::groupCallMembersShadowHeight,
 				0,
 				255,
@@ -1572,15 +2250,17 @@ void Panel::setupControlsBackgroundNarrow() {
 			- st::groupCallMembersMargin.right()),
 		height);
 	_controlsBackgroundNarrow->shadow.paintRequest(
-	) | rpl::start_with_next([=](QRect clip) {
+	) | rpl::on_next([=](QRect clip) {
 		auto p = QPainter(&_controlsBackgroundNarrow->shadow);
 		clip = clip.intersected(_controlsBackgroundNarrow->shadow.rect());
 		const auto inner = _members->getInnerGeometry().translated(
 			_members->x() - _controlsBackgroundNarrow->shadow.x(),
 			_members->y() - _controlsBackgroundNarrow->shadow.y());
-		const auto faded = clip.intersected(inner);
+		const auto bottom = _controlsBackgroundNarrow->shadowHeight;
+		const auto faded = clip.intersected(inner).intersected(
+			QRect(clip.x(), 0, clip.width(), bottom));
 		if (!faded.isEmpty()) {
-			const auto factor = cIntRetinaFactor();
+			const auto factor = style::DevicePixelRatio();
 			p.drawImage(
 				faded,
 				*full,
@@ -1590,9 +2270,8 @@ void Panel::setupControlsBackgroundNarrow() {
 					full->width(),
 					faded.height() * factor));
 		}
-		const auto bottom = inner.y() + inner.height();
 		const auto after = clip.intersected(QRect(
-			0,
+			inner.x(),
 			bottom,
 			inner.width(),
 			_controlsBackgroundNarrow->shadow.height() - bottom));
@@ -1609,16 +2288,11 @@ void Panel::setupControlsBackgroundWide() {
 	_controlsBackgroundWide.create(widget());
 	_controlsBackgroundWide->show();
 	auto &lifetime = _controlsBackgroundWide->lifetime();
-	const auto color = lifetime.make_state<style::complex_color>([] {
-		auto result = st::groupCallBg->c;
-		result.setAlphaF(kControlsBackgroundOpacity);
-		return result;
-	});
 	const auto corners = lifetime.make_state<Ui::RoundRect>(
 		st::groupCallControlsBackRadius,
-		color->color());
+		_controlsBackgroundColor.color());
 	_controlsBackgroundWide->paintRequest(
-	) | rpl::start_with_next([=] {
+	) | rpl::on_next([=] {
 		auto p = QPainter(_controlsBackgroundWide.data());
 		corners->paint(p, _controlsBackgroundWide->rect());
 	}, lifetime);
@@ -1630,18 +2304,37 @@ void Panel::trackControl(Ui::RpWidget *widget, rpl::lifetime &lifetime) {
 	if (!widget) {
 		return;
 	}
+	const auto over = std::make_shared<bool>();
 	widget->events(
-	) | rpl::start_with_next([=](not_null<QEvent*> e) {
-		if (e->type() == QEvent::Enter) {
-			trackControlOver(widget, true);
-		} else if (e->type() == QEvent::Leave) {
-			trackControlOver(widget, false);
+	) | rpl::on_next([=](not_null<QEvent*> e) {
+		const auto type = e->type();
+		if (type == QEvent::Enter) {
+			// Enter events may come from widget destructors,
+			// in that case sync-showing tooltip (calling Grab)
+			// crashes the whole thing.
+			*over = true;
+			crl::on_main(widget, [=] {
+				if (*over) {
+					trackControlOver(widget, true);
+				}
+			});
+			toggleWideControls(true);
+		} else if (type == QEvent::Leave) {
+			*over = false;
+			crl::on_main(widget, [=] {
+				if (!*over) {
+					trackControlOver(widget, false);
+				}
+			});
+			toggleWideControls(false);
 		}
 	}, lifetime);
 }
 
 void Panel::trackControlOver(not_null<Ui::RpWidget*> control, bool over) {
-	if (_stickedTooltipClose) {
+	if (_rtmpFull) {
+		return;
+	} else if (_stickedTooltipClose) {
 		if (!over) {
 			return;
 		}
@@ -1654,11 +2347,11 @@ void Panel::trackControlOver(not_null<Ui::RpWidget*> control, bool over) {
 	} else {
 		Ui::Integration::Instance().unregisterLeaveSubscription(control);
 	}
-	toggleWideControls(over);
 }
 
 void Panel::showStickedTooltip() {
-	static const auto kHasCamera = !Webrtc::GetVideoInputList().empty();
+	static const auto kHasCamera = !Core::App().mediaDevices().defaultId(
+		Webrtc::DeviceType::Camera).isEmpty();
 	const auto callReady = (_call->state() == State::Joined
 		|| _call->state() == State::Connecting);
 	if (!(_stickedTooltipsShown & StickedTooltip::Camera)
@@ -1679,7 +2372,7 @@ void Panel::showStickedTooltip() {
 		&& callReady
 		&& _mute
 		&& !_call->mutedByAdmin()
-		&& !_layerBg->topShownLayer()) {
+		&& !_window->topShownLayer()) {
 		if (_stickedTooltipClose) {
 			// Showing already.
 			return;
@@ -1726,6 +2419,8 @@ void Panel::showNiceTooltip(
 			return MuteButtonTooltip(_call);
 		} else if (control == _hangup.data()) {
 			return tr::lng_group_call_leave();
+		} else if (control == _message.data()) {
+			return tr::lng_group_call_message();
 		}
 		return rpl::producer<QString>();
 	}();
@@ -1745,6 +2440,7 @@ void Panel::showNiceTooltip(
 			(normal ? widget().get() : container),
 			std::move(text),
 			st::groupCallNiceTooltipLabel);
+		label->resizeToWidth(label->textMaxWidth());
 		if (normal) {
 			return label;
 		}
@@ -1754,7 +2450,7 @@ void Panel::showNiceTooltip(
 		rpl::combine(
 			label->sizeValue(),
 			button->sizeValue()
-		) | rpl::start_with_next([=](QSize text, QSize close) {
+		) | rpl::on_next([=](QSize text, QSize close) {
 			const auto height = std::max(text.height(), close.height());
 			container->resize(text.width() + close.width(), height);
 			label->move(0, (height - text.height()) / 2);
@@ -1774,9 +2470,9 @@ void Panel::showNiceTooltip(
 			? st::groupCallStickedTooltip
 			: st::groupCallNiceTooltip));
 	const auto tooltip = _niceTooltip.data();
-	const auto weak = QPointer<QWidget>(tooltip);
+	const auto weak = base::make_weak(tooltip);
 	const auto destroy = [=] {
-		delete weak.data();
+		delete weak.get();
 	};
 	if (type != NiceTooltipType::Sticked) {
 		tooltip->setAttribute(Qt::WA_TransparentForMouseEvents);
@@ -1785,7 +2481,7 @@ void Panel::showNiceTooltip(
 	base::qt_signal_producer(
 		control.get(),
 		&QObject::destroyed
-	) | rpl::start_with_next(destroy, tooltip->lifetime());
+	) | rpl::on_next(destroy, tooltip->lifetime());
 
 	_niceTooltipControl = control;
 	updateTooltipGeometry();
@@ -1800,9 +2496,9 @@ void Panel::updateTooltipGeometry() {
 		return;
 	}
 	const auto geometry = _niceTooltipControl->geometry();
-	const auto weak = QPointer<QWidget>(_niceTooltip);
+	const auto weak = base::make_weak(_niceTooltip);
 	const auto countPosition = [=](QSize size) {
-		const auto strong = weak.data();
+		const auto strong = weak.get();
 		const auto wide = (_mode.current() == PanelMode::Wide);
 		const auto top = geometry.y()
 			- (wide ? st::groupCallNiceTooltipTop : 0)
@@ -1840,15 +2536,14 @@ void Panel::updateTooltipGeometry() {
 	_niceTooltip->pointAt(geometry, RectPart::Top, countPosition);
 }
 
-void Panel::trackControls(bool track) {
-	if (_trackControls == track) {
+void Panel::trackControls(bool track, bool force) {
+	if (!force && _trackControls == track) {
 		return;
 	}
 	_trackControls = track;
+	_trackControlsOverStateLifetime.destroy();
+	_trackControlsMenuLifetime.destroy();
 	if (!track) {
-		_trackControlsLifetime.destroy();
-		_trackControlsOverStateLifetime.destroy();
-		_trackControlsMenuLifetime.destroy();
 		toggleWideControls(true);
 		if (_wideControlsAnimation.animating()) {
 			_wideControlsAnimation.stop();
@@ -1862,6 +2557,7 @@ void Panel::trackControls(bool track) {
 	};
 	trackOne(_mute->outer());
 	trackOne(_video);
+	trackOne(_message);
 	trackOne(_screenShare);
 	trackOne(_wideMenu);
 	trackOne(_settings);
@@ -1876,29 +2572,44 @@ void Panel::updateControlsGeometry() {
 	}
 	updateButtonsGeometry();
 	updateMembersGeometry();
-	refreshTitle();
 
-#ifdef Q_OS_MAC
-	const auto controlsOnTheLeft = true;
-#else // Q_OS_MAC
-	const auto controlsOnTheLeft = _controls->geometry().center().x()
-		< widget()->width() / 2;
-#endif // Q_OS_MAC
+	const auto wrap = _window->controlsWrap();
+	const auto controls = _window->controlsGeometry();
+	const auto controlsOnTheLeft = !wrap
+		|| (controls.center().x() < widget()->width() / 2);
 	const auto menux = st::groupCallMenuTogglePosition.x();
 	const auto menuy = st::groupCallMenuTogglePosition.y();
-	if (controlsOnTheLeft) {
-		if (_menuToggle) {
-			_menuToggle->moveToRight(menux, menuy);
-		} else if (_joinAsToggle) {
-			_joinAsToggle->moveToRight(menux, menuy);
+	if (wrap) {
+		auto x = controlsOnTheLeft
+			? (controls.x() + controls.width())
+			: controls.x();
+		for (const auto &button : titleButtons()) {
+			if (controlsOnTheLeft) {
+				button->move(x, controls.y());
+				x += button->width();
+			} else {
+				x -= button->width();
+				button->move(x, controls.y());
+			}
 		}
 	} else {
-		if (_menuToggle) {
-			_menuToggle->moveToLeft(menux, menuy);
-		} else if (_joinAsToggle) {
-			_joinAsToggle->moveToLeft(menux, menuy);
+		const auto toggleWidth = _menuToggle ? _menuToggle->width() : 0;
+		const auto wide = (mode() == PanelMode::Wide);
+		auto right = wide ? 0 : (menux + toggleWidth);
+		for (const auto &button : titleButtons()) {
+			button->moveToRight(right, wide ? 0 : menuy);
+			right += button->width();
 		}
 	}
+	if (_menuToggle) {
+		if (controlsOnTheLeft) {
+			_menuToggle->moveToRight(menux, menuy);
+		} else {
+			_menuToggle->moveToLeft(menux, menuy);
+		}
+	}
+	// computeTitleRect() reads the title buttons placed above.
+	refreshTitle();
 }
 
 void Panel::updateButtonsGeometry() {
@@ -1910,56 +2621,101 @@ void Panel::updateButtonsGeometry() {
 			widget->setVisible(shown);
 		}
 	};
+	const auto messagesEnabled = _call->messagesEnabled();
+	auto messagesBottomSkip = 0;
 	if (mode() == PanelMode::Wide) {
 		Assert(_video != nullptr);
+		Assert(_message != nullptr);
 		Assert(_screenShare != nullptr);
-		Assert(_wideMenu != nullptr);
 		Assert(_settings != nullptr);
 		Assert(_callShare == nullptr);
 
+		const auto rtmp = _call->rtmp();
+		Assert(!rtmp || _wideMenu != nullptr);
 		const auto shown = _wideControlsAnimation.value(
 			_wideControlsShown ? 1. : 0.);
 		const auto hidden = (shown == 0.);
 
 		if (_viewport) {
-			_viewport->setControlsShown(shown);
+			_viewport->setControlsShown(rtmp ? 0. : shown);
 		}
 
-		const auto buttonsTop = widget()->height() - anim::interpolate(
-			0,
-			st::groupCallButtonBottomSkipWide,
-			shown);
 		const auto addSkip = st::callMuteButtonSmall.active.outerRadius;
 		const auto muteSize = _mute->innerSize().width() + 2 * addSkip;
 		const auto skip = st::groupCallButtonSkipSmall;
-		const auto fullWidth = (_video->width() + skip)
-			+ (_screenShare->width() + skip)
+		const auto fullWidth = (rtmp
+			? (_settings->width() + skip)
+			: (_screenShare->width() + skip
+				+ _video->width() + skip
+				+ (messagesEnabled ? (_message->width() + skip) : 0)))
 			+ (muteSize + skip)
-			+ (_settings ->width() + skip)
 			+ _hangup->width();
 		const auto membersSkip = st::groupCallNarrowSkip;
-		const auto membersWidth = st::groupCallNarrowMembersWidth
-			+ 2 * membersSkip;
+		const auto membersWidth = membersSkip + membersColumnReserve();
 		auto left = membersSkip + (widget()->width()
 			- membersWidth
 			- membersSkip
 			- fullWidth) / 2;
-		toggle(_screenShare, !hidden);
-		_screenShare->moveToLeft(left, buttonsTop);
-		left += _screenShare->width() + skip;
-		toggle(_video, !hidden);
-		_video->moveToLeft(left, buttonsTop);
-		left += _video->width() + skip;
-		toggle(_mute, !hidden);
-		_mute->moveInner({ left + addSkip, buttonsTop + addSkip });
-		left += muteSize + skip;
+
+		const auto forMessagesLeft = left
+			- st::groupCallControlsBackMargin.left();
+		const auto forMessagesWidth = fullWidth
+			+ st::groupCallControlsBackMargin.left()
+			+ st::groupCallControlsBackMargin.right();
+		const auto existingBottomSkip = st::groupCallButtonBottomSkipWide
+			- _hangup->height()
+			- st::groupCallControlsBackMargin.bottom();
+		if (_messageField) {
+			_messageField->resizeToWidth(forMessagesWidth);
+			messagesBottomSkip += _messageField->height();
+
+			const auto y = widget()->height()
+				- messagesBottomSkip
+				- (existingBottomSkip / 2);
+			_messageField->move(forMessagesLeft, y);
+		}
+
+		const auto buttonsTop = widget()->height()
+			- messagesBottomSkip
+			- anim::interpolate(0, st::groupCallButtonBottomSkipWide, shown);
+		const auto muteTop = buttonsTop + addSkip;
+
+		const auto forMessagesBottom = buttonsTop
+			- st::groupCallControlsBackMargin.top()
+			- (existingBottomSkip / 6);
+		const auto forMessagesHeight = forMessagesBottom
+			- (st::groupCallWideVideoTop * 1.5);
+
+		_messages->move(
+			forMessagesLeft,
+			forMessagesBottom,
+			forMessagesWidth,
+			forMessagesHeight);
+
+		toggle(_screenShare, !hidden && !rtmp);
+		toggle(_video, !hidden && !rtmp);
+		toggle(_message, !hidden && !rtmp && messagesEnabled);
 		const auto wideMenuShown = _call->canManage()
 			|| _call->showChooseJoinAs();
-		toggle(_settings, !hidden && !wideMenuShown);
-		toggle(_wideMenu, !hidden && wideMenuShown);
-		_wideMenu->moveToLeft(left, buttonsTop);
-		_settings->moveToLeft(left, buttonsTop);
-		left += _settings->width() + skip;
+		toggle(_settings, !hidden && rtmp && !wideMenuShown);
+		toggle(_wideMenu, !hidden && rtmp && wideMenuShown);
+		if (rtmp) {
+			_wideMenu->moveToLeft(left, buttonsTop);
+			_settings->moveToLeft(left, buttonsTop);
+			left += _settings->width() + skip;
+		} else {
+			_screenShare->moveToLeft(left, buttonsTop);
+			left += _screenShare->width() + skip;
+			_video->moveToLeft(left, buttonsTop);
+			left += _video->width() + skip;
+		}
+		toggle(_mute, !hidden);
+		_mute->moveInner({ left + addSkip, muteTop });
+		left += muteSize + skip;
+		if (!rtmp && messagesEnabled) {
+			_message->moveToLeft(left, buttonsTop);
+			left += _message->width() + skip;
+		}
 		toggle(_hangup, !hidden);
 		_hangup->moveToLeft(left, buttonsTop);
 		left += _hangup->width();
@@ -1972,34 +2728,100 @@ void Panel::updateButtonsGeometry() {
 			_controlsBackgroundWide->setGeometry(
 				rect.marginsAdded(st::groupCallControlsBackMargin));
 		}
+		if (_rtmpFull) {
+			refreshTitleGeometry();
+		}
 	} else {
-		const auto muteTop = widget()->height()
-			- st::groupCallMuteBottomSkip;
-		const auto buttonsTop = widget()->height()
-			- st::groupCallButtonBottomSkip;
+		const auto addSkip = st::callMuteButton.active.outerRadius;
 		const auto muteSize = _mute->innerSize().width();
-		const auto fullWidth = muteSize
-			+ 2 * (_settings ? _settings : _callShare)->width()
-			+ 2 * st::groupCallButtonSkip;
+		const auto single = (_settings ? _settings : _callShare)->width();
+		const auto showVideoButton = videoButtonInNarrowMode();
+		const auto five = !_callShare && showVideoButton && messagesEnabled;
+		const auto four = !_callShare
+			&& !five
+			&& (showVideoButton || messagesEnabled);
+		const auto buttonSkip = four
+			? (st::groupCallButtonSkip / 2)
+			: five
+			? ((st::groupCallWidth - 5 * single) / 6)
+			: st::groupCallButtonSkip;
+		const auto fullWidth = five
+			? st::groupCallWidth
+			: four
+			? (4 * single + 3 * buttonSkip)
+			: (muteSize + 2 * (single + st::groupCallButtonSkip));
+		const auto forMessagesWidth = st::groupCallWidth
+			- st::groupCallMembersMargin.left()
+			- st::groupCallMembersMargin.right();
+		const auto forMessagesLeft = (widget()->width() - forMessagesWidth)
+			/ 2;
+		const auto existingBottomSkip = st::groupCallButtonBottomSkip
+			- _mute->innerSize().height();
+		if (_messageField) {
+			_messageField->resizeToWidth(forMessagesWidth);
+
+			const auto height = _messageField->height();
+			messagesBottomSkip += height;
+
+			const auto y = widget()->height()
+				- messagesBottomSkip
+				- (existingBottomSkip / 3);
+			_messageField->move(forMessagesLeft, y);
+		}
+
+		const auto buttonsTop = widget()->height()
+			- messagesBottomSkip
+			- st::groupCallButtonBottomSkip;
+		const auto muteTop = buttonsTop + addSkip;
+		//const auto muteTop = widget()->height()
+		//	- messagesBottomSkip
+		//	- st::groupCallMuteBottomSkip;
+		const auto forMessagesBottom = muteTop
+			- (existingBottomSkip / 3);
+		const auto forMessagesHeight = forMessagesBottom
+			- st::groupCallMembersTop
+			- (st::normalFont->height / 2);
+
+		_messages->move(
+			forMessagesLeft,
+			forMessagesBottom,
+			forMessagesWidth,
+			forMessagesHeight);
+
 		toggle(_mute, true);
-		_mute->moveInner({ (widget()->width() - muteSize) / 2, muteTop });
-		const auto leftButtonLeft = (widget()->width() - fullWidth) / 2;
-		toggle(_screenShare, false);
+		const auto leftButtonLeft = (widget()->width() - fullWidth) / 2
+			+ (five ? buttonSkip : 0);
+		const auto nextButtonLeft = leftButtonLeft
+			+ ((five || four) ? (single + buttonSkip) : 0);
+		const auto muteButtonLeft = !four
+			? ((widget()->width() - muteSize) / 2)
+			: showVideoButton
+			? (nextButtonLeft + single + buttonSkip + addSkip)
+			: (nextButtonLeft + addSkip);
+		_mute->moveInner({ muteButtonLeft, muteTop });
 		toggle(_wideMenu, false);
 		toggle(_callShare, true);
 		if (_callShare) {
 			_callShare->moveToLeft(leftButtonLeft, buttonsTop);
 		}
-		const auto showVideoButton = videoButtonInNarrowMode();
+		toggle(_screenShare, !_callShare && showVideoButton);
+		if (_screenShare) {
+			_screenShare->moveToLeft(leftButtonLeft, buttonsTop);
+		}
 		toggle(_video, !_callShare && showVideoButton);
 		if (_video) {
 			_video->setStyle(st::groupCallVideo, &st::groupCallVideoActive);
-			_video->moveToLeft(leftButtonLeft, buttonsTop);
+			_video->moveToLeft(nextButtonLeft, buttonsTop);
 		}
 		toggle(_settings, !_callShare && !showVideoButton);
 		if (_settings) {
 			_settings->moveToLeft(leftButtonLeft, buttonsTop);
 		}
+		toggle(_message, !_callShare && messagesEnabled);
+		if (_message) {
+			_message->moveToRight(nextButtonLeft, buttonsTop);
+		}
+
 		toggle(_hangup, true);
 		_hangup->moveToRight(leftButtonLeft, buttonsTop);
 	}
@@ -2011,17 +2833,19 @@ void Panel::updateButtonsGeometry() {
 		_controlsBackgroundNarrow->shadow.setGeometry(
 			left,
 			(widget()->height()
+				- messagesBottomSkip
 				- st::groupCallMembersMargin.bottom()
-				- _controlsBackgroundNarrow->shadow.height()),
+				- _controlsBackgroundNarrow->shadowHeight),
 			width,
-			_controlsBackgroundNarrow->shadow.height());
+			messagesBottomSkip + _controlsBackgroundNarrow->shadowHeight);
 		_controlsBackgroundNarrow->blocker.setGeometry(
 			left,
 			(widget()->height()
+				- messagesBottomSkip
 				- st::groupCallMembersMargin.bottom()
 				- st::groupCallMembersBottomSkip),
 			width,
-			st::groupCallMembersBottomSkip);
+			messagesBottomSkip + st::groupCallMembersBottomSkip);
 	}
 	updateTooltipGeometry();
 }
@@ -2034,20 +2858,23 @@ void Panel::updateMembersGeometry() {
 	if (!_members) {
 		return;
 	}
+	_members->setVisible(!_call->rtmp()
+		&& (mode() != PanelMode::Wide || membersColumnReserve() > 0));
 	const auto desiredHeight = _members->desiredHeight();
 	if (mode() == PanelMode::Wide) {
-		const auto skip = st::groupCallNarrowSkip;
+		const auto skip = _rtmpFull ? 0 : st::groupCallNarrowSkip;
 		const auto membersWidth = st::groupCallNarrowMembersWidth;
-		const auto top = st::groupCallWideVideoTop;
+		const auto top = _rtmpFull ? 0 : st::groupCallWideContentTop;
+		const auto reserve = membersColumnReserve();
 		_members->setGeometry(
-			widget()->width() - skip - membersWidth,
+			widget()->width() - reserve,
 			top,
 			membersWidth,
 			std::min(desiredHeight, widget()->height() - top - skip));
-		_viewport->setGeometry({
+		_viewport->setGeometry(_rtmpFull, {
 			skip,
 			top,
-			widget()->width() - membersWidth - 3 * skip,
+			widget()->width() - reserve - 2 * skip,
 			widget()->height() - top - skip,
 		});
 	} else {
@@ -2074,21 +2901,26 @@ void Panel::updateMembersGeometry() {
 	}
 }
 
+rpl::producer<QString> Panel::titleText() {
+	if (_call->conference()) {
+		return tr::lng_confcall_join_title();
+	}
+	return rpl::combine(
+		Info::Profile::NameValue(_peer),
+		rpl::single(
+			QString()
+		) | rpl::then(_call->real(
+		) | rpl::map([=](not_null<Data::GroupCall*> real) {
+		return real->titleValue();
+	}) | rpl::flatten_latest())
+	) | rpl::map([=](const QString &name, const QString &title) {
+		return title.isEmpty() ? name : title;
+	});
+}
+
 void Panel::refreshTitle() {
 	if (!_title) {
-		auto text = rpl::combine(
-			Info::Profile::NameValue(_peer),
-			rpl::single(
-				QString()
-			) | rpl::then(_call->real(
-			) | rpl::map([=](not_null<Data::GroupCall*> real) {
-				return real->titleValue();
-			}) | rpl::flatten_latest())
-		) | rpl::map([=](
-				const TextWithEntities &name,
-				const QString &title) {
-			return title.isEmpty() ? name.text : title;
-		}) | rpl::after_next([=] {
+		auto text = titleText() | rpl::after_next([=] {
 			refreshTitleGeometry();
 		});
 		_title.create(
@@ -2097,6 +2929,38 @@ void Panel::refreshTitle() {
 			st::groupCallTitleLabel);
 		_title->show();
 		_title->setAttribute(Qt::WA_TransparentForMouseEvents);
+		if (_call->rtmp()) {
+			_titleSeparator.create(
+				widget(),
+				rpl::single(Ui::kQBullet),
+				st::groupCallTitleLabel);
+			_titleSeparator->show();
+			_titleSeparator->setAttribute(Qt::WA_TransparentForMouseEvents);
+			auto countText = _call->real(
+			) | rpl::map([=](not_null<Data::GroupCall*> real) {
+				return tr::lng_group_call_rtmp_viewers(
+					lt_count_decimal,
+					real->fullCountValue(
+					) | rpl::map([=](int count) {
+						return std::max(float64(count), 1.);
+					}));
+			}) | rpl::flatten_latest(
+			) | rpl::after_next([=] {
+				refreshTitleGeometry();
+			});
+			_viewers.create(
+				widget(),
+				std::move(countText),
+				st::groupCallTitleLabel);
+			_viewers->show();
+			_viewers->setAttribute(Qt::WA_TransparentForMouseEvents);
+		}
+
+		refreshTitleColors();
+		style::PaletteChanged(
+		) | rpl::on_next([=] {
+			refreshTitleColors();
+		}, _title->lifetime());
 	}
 	refreshTitleGeometry();
 	if (!_subtitle && mode() == PanelMode::Default) {
@@ -2129,9 +2993,10 @@ void Panel::refreshTitle() {
 		const auto top = _title
 			? st::groupCallSubtitleTop
 			: st::groupCallTitleTop;
-		_subtitle->moveToLeft(
-			(widget()->width() - _subtitle->width()) / 2,
-			top);
+		const auto left = Platform::WindowTitleAlignsLeft()
+			? computeTitleRect().x()
+			: (widget()->width() - _subtitle->width()) / 2;
+		_subtitle->moveToLeft(left, top);
 	}
 }
 
@@ -2147,36 +3012,103 @@ void Panel::refreshTitleGeometry() {
 			fullRect.width() - _recordingMark->width(),
 			fullRect.height())
 		: fullRect;
-	const auto best = _title->naturalWidth();
+	const auto sep = st::groupCallTitleSeparator;
+	const auto best = _title->textMaxWidth() + (_viewers
+		? (_titleSeparator->width() + sep * 2 + _viewers->textMaxWidth())
+		: 0);
 	const auto from = (widget()->width() - best) / 2;
-	const auto top = (mode() == PanelMode::Default)
+	const auto shownTop = (mode() == PanelMode::Default)
 		? st::groupCallTitleTop
-		: (st::groupCallWideVideoTop
+		: (st::groupCallWideContentTop
 			- st::groupCallTitleLabel.style.font->height) / 2;
+	const auto shown = _rtmpFull
+		? _wideControlsAnimation.value(_wideControlsShown ? 1. : 0.)
+		: 1.;
+	const auto top = anim::interpolate(
+		-_title->height() - st::boxRadius,
+		shownTop,
+		shown);
 	const auto left = titleRect.x();
-	if (from >= left && from + best <= left + titleRect.width()) {
-		_title->resizeToWidth(best);
-		_title->moveToLeft(from, top);
-	} else if (titleRect.width() < best) {
-		_title->resizeToWidth(titleRect.width());
-		_title->moveToLeft(left, top);
-	} else if (from < left) {
-		_title->resizeToWidth(best);
-		_title->moveToLeft(left, top);
-	} else {
-		_title->resizeToWidth(best);
-		_title->moveToLeft(left + titleRect.width() - best, top);
+
+	const auto notEnough = std::max(0, best - titleRect.width());
+	const auto titleMaxWidth = _title->textMaxWidth();
+	const auto viewersMaxWidth = _viewers ? _viewers->textMaxWidth() : 0;
+	const auto viewersNotEnough = std::clamp(
+		viewersMaxWidth - titleMaxWidth,
+		0,
+		notEnough
+	) + std::max(
+		(notEnough - std::abs(viewersMaxWidth - titleMaxWidth)) / 2,
+		0);
+	_title->resizeToWidth(
+		_title->textMaxWidth() - (notEnough - viewersNotEnough));
+	if (_viewers) {
+		_viewers->resizeToWidth(_viewers->textMaxWidth() - viewersNotEnough);
 	}
-	if (_recordingMark) {
-		const auto markTop = top + st::groupCallRecordingMarkTop;
-		_recordingMark->move(
-			_title->x() + _title->width(),
-			markTop - st::groupCallRecordingMarkSkip);
+	const auto layout = [&](int position) {
+		_title->moveToLeft(position, top);
+		position += _title->width();
+		if (_viewers) {
+			_titleSeparator->moveToLeft(position + sep, top);
+			position += sep + _titleSeparator->width() + sep;
+			_viewers->moveToLeft(position, top);
+			position += _viewers->width();
+		}
+		if (_recordingMark) {
+			const auto markTop = top + st::groupCallRecordingMarkTop;
+			_recordingMark->move(
+				position,
+				markTop - st::groupCallRecordingMarkSkip);
+		}
+		if (_titleBackground) {
+			const auto bottom = _title->y()
+				+ _title->height()
+				+ (st::boxRadius / 2);
+			const auto height = std::max(bottom, st::boxRadius * 2);
+			_titleBackground->setGeometry(
+				_title->x() - st::boxRadius,
+				bottom - height,
+				(position - _title->x()
+					+ st::boxRadius
+					+ (_recordingMark
+						? (_recordingMark->width() + st::boxRadius / 2)
+						: st::boxRadius)),
+				height);
+		}
+	};
+
+	if (Platform::WindowTitleAlignsLeft()) {
+		layout(left);
+	} else if (from >= left && from + best <= left + titleRect.width()) {
+		layout(from);
+	} else if (titleRect.width() < best) {
+		layout(left);
+	} else if (from < left) {
+		layout(left);
+	} else {
+		layout(left + titleRect.width() - best);
+	}
+	_window->setControlsShown(shown);
+}
+
+void Panel::refreshTitleColors() {
+	if (!_title) {
+		return;
+	}
+	auto gray = st::groupCallMemberNotJoinedStatus->c;
+	const auto wide = (_mode.current() == PanelMode::Wide);
+	_title->setTextColorOverride(wide
+		? std::make_optional(gray)
+		: std::nullopt);
+	if (_viewers) {
+		_viewers->setTextColorOverride(gray);
+		gray.setAlphaF(gray.alphaF() * 0.5);
+		_titleSeparator->setTextColorOverride(gray);
 	}
 }
 
 void Panel::paint(QRect clip) {
-	Painter p(widget());
+	auto p = QPainter(widget());
 
 	auto region = QRegion(clip);
 	for (const auto &rect : region) {
@@ -2187,17 +3119,26 @@ void Panel::paint(QRect clip) {
 bool Panel::handleClose() {
 	if (_call) {
 		window()->hide();
+		if (Platform::IsWayland()) {
+			if (const auto handle = window()->windowHandle()) {
+				handle->destroy();
+			}
+		}
 		return true;
 	}
 	return false;
 }
 
+not_null<Window*> Panel::callWindow() const {
+	return _window.get();
+}
+
 not_null<Ui::RpWindow*> Panel::window() const {
-	return _window.window();
+	return _window->window();
 }
 
 not_null<Ui::RpWidget*> Panel::widget() const {
-	return _window.widget();
+	return _window->widget();
 }
 
 } // namespace Calls::Group

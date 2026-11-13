@@ -10,44 +10,43 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "base/unixtime.h"
 #include "base/event_filter.h"
 #include "ui/boxes/calendar_box.h"
+#include "ui/effects/ripple_animation.h"
+#include "ui/painter.h"
+#include "ui/text/text_utilities.h"
 #include "ui/widgets/buttons.h"
-#include "ui/widgets/input_fields.h"
+#include "ui/widgets/fields/input_field.h"
+#include "ui/widgets/labels.h"
+#include "ui/widgets/popup_menu.h"
+#include "ui/widgets/shadow.h"
 #include "ui/widgets/time_input.h"
 #include "ui/ui_utility.h"
 #include "lang/lang_keys.h"
+#include "styles/style_choose_date_time.h"
 #include "styles/style_layers.h"
 #include "styles/style_boxes.h"
+#include "styles/style_passcode_box.h"
+
+#include <QtWidgets/QTextEdit>
 
 namespace Ui {
 namespace {
 
 constexpr auto kMinimalSchedule = TimeId(10);
 
-tr::phrase<> MonthDay(int index) {
-	switch (index) {
-	case 1: return tr::lng_month_day1;
-	case 2: return tr::lng_month_day2;
-	case 3: return tr::lng_month_day3;
-	case 4: return tr::lng_month_day4;
-	case 5: return tr::lng_month_day5;
-	case 6: return tr::lng_month_day6;
-	case 7: return tr::lng_month_day7;
-	case 8: return tr::lng_month_day8;
-	case 9: return tr::lng_month_day9;
-	case 10: return tr::lng_month_day10;
-	case 11: return tr::lng_month_day11;
-	case 12: return tr::lng_month_day12;
-	}
-	Unexpected("Index in MonthDay.");
-}
-
 QString DayString(const QDate &date) {
-	return tr::lng_month_day(
-		tr::now,
-		lt_month,
-		MonthDay(date.month())(tr::now),
-		lt_day,
-		QString::number(date.day()));
+	const auto month = Lang::MonthDay(date.month())(tr::now);
+	const auto day = QString::number(date.day());
+	if (date.year() != QDate::currentDate().year()) {
+		return tr::lng_month_day_year(
+			tr::now,
+			lt_month,
+			month,
+			lt_day,
+			day,
+			lt_year,
+			QString::number(date.year()));
+	}
+	return tr::lng_month_day(tr::now, lt_month, month, lt_day, day);
 }
 
 QString TimeString(QTime time) {
@@ -56,13 +55,101 @@ QString TimeString(QTime time) {
 	).arg(time.minute(), 2, 10, QLatin1Char('0'));
 }
 
+QDate DateFollowingTimeWheel(
+		QDate date,
+		QTime was,
+		QTime now,
+		QDateTime minimum,
+		QDate maxDate) {
+	const auto minDate = minimum.date();
+	if (!was.isValid()) {
+		return date;
+	} else if (was.hour() == 23
+		&& now.hour() == 0
+		&& QDateTime(date, now) < minimum) {
+		return std::clamp(date.addDays(1), minDate, maxDate);
+	} else if (was.hour() == 0
+		&& now.hour() == 23
+		&& date == minDate.addDays(1)
+		&& QDateTime(minDate, now) >= minimum) {
+		return std::clamp(date.addDays(-1), minDate, maxDate);
+	}
+	return date;
+}
+
+class RepeatButton final : public Ui::RippleButton {
+public:
+	explicit RepeatButton(not_null<QWidget*> parent);
+
+	void setMarkedText(TextWithEntities text);
+
+protected:
+	void paintEvent(QPaintEvent *e) override;
+
+	QImage prepareRippleMask() const override;
+
+private:
+	const not_null<Ui::FlatLabel*> _label;
+
+};
+
+RepeatButton::RepeatButton(not_null<QWidget*> parent)
+: RippleButton(parent, st::defaultRippleAnimation)
+, _label(Ui::CreateChild<Ui::FlatLabel>(this, st::scheduleRepeatLabel)) {
+	_label->setAttribute(Qt::WA_TransparentForMouseEvents);
+	setPointerCursor(true);
+
+	_label->naturalWidthValue() | rpl::on_next([=](int natural) {
+		_label->resizeToWidth(natural);
+	}, lifetime());
+
+	_label->sizeValue() | rpl::on_next([=](QSize size) {
+		const auto padding = st::scheduleRepeatTextPadding;
+		const auto height = st::scheduleRepeatHeight;
+		resize(size.width() + 2 * padding, height);
+		_label->moveToLeft(padding, (height - size.height()) / 2);
+	}, lifetime());
+}
+
+void RepeatButton::setMarkedText(TextWithEntities text) {
+	_label->setMarkedText(std::move(text));
+}
+
+void RepeatButton::paintEvent(QPaintEvent *e) {
+	auto p = QPainter(this);
+	const auto radius = st::scheduleRepeatRadius;
+	{
+		auto hq = PainterHighQualityEnabler(p);
+		p.setPen(Qt::NoPen);
+		p.setBrush(st::windowBgOver);
+		p.drawRoundedRect(rect(), radius, radius);
+	}
+	paintRipple(p, QPoint());
+}
+
+QImage RepeatButton::prepareRippleMask() const {
+	return Ui::RippleAnimation::RoundRectMask(
+		size(),
+		st::scheduleRepeatRadius);
+}
+
 } // namespace
+
+ChooseDateTimeStyleArgs::ChooseDateTimeStyleArgs()
+: labelStyle(&st::boxLabel)
+, dateFieldStyle(&st::scheduleDateField)
+, timeFieldStyle(&st::scheduleTimeField)
+, separatorStyle(&st::scheduleTimeSeparator)
+, atStyle(&st::scheduleAtLabel)
+, calendarStyle(&st::defaultCalendarColors) {
+}
 
 ChooseDateTimeBoxDescriptor ChooseDateTimeBox(
 		not_null<GenericBox*> box,
 		ChooseDateTimeBoxArgs &&args) {
 	struct State {
 		rpl::variable<QDate> date;
+		rpl::variable<int> width;
 		not_null<InputField*> day;
 		not_null<TimeInput*> time;
 		not_null<FlatLabel*> at;
@@ -71,38 +158,14 @@ ChooseDateTimeBoxDescriptor ChooseDateTimeBox(
 	box->setWidth(st::boxWideWidth);
 
 	const auto content = box->addRow(
-		object_ptr<FixedHeightWidget>(box, st::scheduleHeight));
+		object_ptr<FixedHeightWidget>(box, st::scheduleHeight),
+		style::al_top);
 	if (args.description) {
 		box->addRow(object_ptr<FlatLabel>(
 			box,
 			std::move(args.description),
-			st::boxLabel));
+			*args.style.labelStyle));
 	}
-	const auto parsed = base::unixtime::parse(args.time);
-	const auto state = box->lifetime().make_state<State>(State{
-		.date = parsed.date(),
-		.day = CreateChild<InputField>(
-			content,
-			st::scheduleDateField),
-		.time = CreateChild<TimeInput>(
-			content,
-			TimeString(parsed.time()),
-			st::scheduleTimeField,
-			st::scheduleDateField,
-			st::scheduleTimeSeparator,
-			st::scheduleTimeSeparatorPadding),
-		.at = CreateChild<FlatLabel>(
-			content,
-			tr::lng_schedule_at(),
-			st::scheduleAtLabel),
-	});
-
-	state->date.value(
-	) | rpl::start_with_next([=](QDate date) {
-		state->day->setText(DayString(date));
-		state->time->setFocusFast();
-	}, state->day->lifetime());
-
 	const auto min = args.min ? args.min : [] {
 		return base::unixtime::now() + kMinimalSchedule;
 	};
@@ -110,6 +173,36 @@ ChooseDateTimeBoxDescriptor ChooseDateTimeBox(
 		return base::unixtime::serialize(
 			QDateTime::currentDateTime().addYears(1)) - 1;
 	};
+	const auto parsed = base::unixtime::parse(
+		std::clamp(args.time, min(), max()));
+	const auto state = box->lifetime().make_state<State>(State{
+		.date = parsed.date(),
+		.day = CreateChild<InputField>(
+			content,
+			*args.style.dateFieldStyle),
+		.time = CreateChild<TimeInput>(
+			content,
+			TimeString(parsed.time()),
+			*args.style.timeFieldStyle,
+			*args.style.dateFieldStyle,
+			*args.style.separatorStyle,
+			st::scheduleTimeSeparatorPadding),
+		.at = CreateChild<FlatLabel>(
+			content,
+			tr::lng_schedule_at(),
+			*args.style.atStyle),
+	});
+
+	const auto dayEdit = state->day->rawTextEdit().get();
+	const auto dayAlign = args.style.dateFieldStyle->textAlign;
+
+	state->date.value(
+	) | rpl::on_next([=](QDate date) {
+		state->day->setText(DayString(date));
+		dayEdit->setAlignment(dayAlign);
+		state->time->setFocusFast();
+	}, state->day->lifetime());
+
 	const auto minDate = [=] {
 		return base::unixtime::parse(min()).date();
 	};
@@ -132,8 +225,39 @@ ChooseDateTimeBoxDescriptor ChooseDateTimeBox(
 		return base::EventFilterResult::Continue;
 	});
 
+	const auto lastTime = box->lifetime().make_state<QTime>(
+		parsed.time());
+	state->time->value(
+	) | rpl::on_next([=](const QString &value) {
+		const auto parts = value.split(':');
+		if (parts.size() != 2) {
+			return;
+		}
+		const auto time = QTime(parts[0].toInt(), parts[1].toInt());
+		if (!time.isValid()) {
+			return;
+		}
+		state->date = DateFollowingTimeWheel(
+			state->date.current(),
+			*lastTime,
+			time,
+			base::unixtime::parse(min()),
+			maxDate());
+		*lastTime = time;
+	}, state->time->lifetime());
+
+	state->at->widthValue() | rpl::on_next([=](int width) {
+		const auto full = st::scheduleDateWidth
+			+ st::scheduleAtSkip
+			+ width
+			+ st::scheduleAtSkip
+			+ st::scheduleTimeWidth;
+		content->setNaturalWidth(full);
+		state->width = full;
+	}, state->at->lifetime());
+
 	content->widthValue(
-	) | rpl::start_with_next([=](int width) {
+	) | rpl::on_next([=](int width) {
 		const auto paddings = width
 			- state->at->width()
 			- 2 * st::scheduleAtSkip
@@ -153,30 +277,35 @@ ChooseDateTimeBoxDescriptor ChooseDateTimeBox(
 			width);
 	}, content->lifetime());
 
-	const auto calendar =
-		content->lifetime().make_state<QPointer<CalendarBox>>();
-	QObject::connect(state->day, &InputField::focused, [=] {
-		if (*calendar) {
+	const auto calendar
+		= content->lifetime().make_state<base::weak_qptr<CalendarBox>>();
+	const auto calendarStyle = args.style.calendarStyle;
+	const auto dynamicImageForDate = std::move(args.dynamicImageForDate);
+	state->day->focusedChanges(
+	) | rpl::on_next([=](bool focused) {
+		if (*calendar || !focused) {
 			return;
 		}
-		const auto chosen = [=](QDate chosen) {
-			state->date = chosen;
-			(*calendar)->closeBox();
-		};
-		const auto finalize = [=](not_null<CalendarBox*> box) {
-			box->setMinDate(minDate());
-			box->setMaxDate(maxDate());
-		};
-		*calendar = box->getDelegate()->show(Box<CalendarBox>(
-			state->date.current(),
-			state->date.current(),
-			crl::guard(box, chosen),
-			finalize));
+		*calendar = box->getDelegate()->show(
+			Box<CalendarBox>(Ui::CalendarBoxArgs{
+				.month = state->date.current(),
+				.highlighted = state->date.current(),
+				.callback = crl::guard(box, [=](
+						QDate chosen,
+						Fn<void()> close) {
+					state->date = chosen;
+					close();
+				}),
+				.minDate = minDate(),
+				.maxDate = maxDate(),
+				.stColors = *calendarStyle,
+				.dynamicImageForDate = dynamicImageForDate,
+			}));
 		(*calendar)->boxClosing(
-		) | rpl::start_with_next(crl::guard(state->time, [=] {
+		) | rpl::on_next(crl::guard(state->time, [=] {
 			state->time->setFocusFast();
 		}), (*calendar)->lifetime());
-	});
+	}, state->day->lifetime());
 
 	const auto collect = [=] {
 		const auto timeValue = state->time->valueCurrent().split(':');
@@ -202,10 +331,11 @@ ChooseDateTimeBoxDescriptor ChooseDateTimeBox(
 		}
 	};
 	state->time->submitRequests(
-	) | rpl::start_with_next(save, state->time->lifetime());
+	) | rpl::on_next(save, state->time->lifetime());
 
 	auto result = ChooseDateTimeBoxDescriptor();
 	box->setFocusCallback([=] { state->time->setFocusFast(); });
+	result.width = state->width.value();
 	result.submit = box->addButton(std::move(args.submit), save);
 	result.collect = [=] {
 		if (const auto result = collect()) {
@@ -219,6 +349,117 @@ ChooseDateTimeBoxDescriptor ChooseDateTimeBox(
 		state->time->value()
 	) | rpl::map(collect);
 	box->addButton(tr::lng_cancel(), [=] { box->closeBox(); });
+
+	return result;
+}
+
+object_ptr<Ui::RpWidget> ChooseRepeatPeriod(
+		not_null<Ui::RpWidget*> parent,
+		ChooseRepeatPeriodArgs &&args) {
+	auto result = object_ptr<Ui::RpWidget>(parent.get());
+	const auto raw = result.data();
+
+	struct Entry {
+		TimeId value = 0;
+		QString text;
+	};
+	auto map = std::vector<Entry>{
+		{ 0, tr::lng_schedule_repeat_never(tr::now) },
+		{ 24 * 60 * 60, tr::lng_schedule_repeat_daily(tr::now) },
+		{ 7 * 24 * 60 * 60, tr::lng_schedule_repeat_weekly(tr::now) },
+		{ 14 * 24 * 60 * 60, tr::lng_schedule_repeat_biweekly(tr::now) },
+		{ 30 * 24 * 60 * 60, tr::lng_schedule_repeat_monthly(tr::now) },
+		{
+			91 * 24 * 60 * 60,
+			tr::lng_schedule_repeat_every_month(tr::now, lt_count, 3)
+		},
+		{
+			182 * 24 * 60 * 60,
+			tr::lng_schedule_repeat_every_month(tr::now, lt_count, 6)
+		},
+		{ 365 * 24 * 60 * 60, tr::lng_schedule_repeat_yearly(tr::now) },
+	};
+	if (args.test) {
+		map.insert(begin(map) + 1, Entry{ 300, u"Every 5 minutes"_q });
+		map.insert(begin(map) + 1, Entry{ 60, u"Every minute"_q });
+	}
+
+	const auto button = Ui::CreateChild<RepeatButton>(raw);
+	rpl::combine(
+		raw->widthValue(),
+		button->sizeValue()
+	) | rpl::on_next([=](int outer, QSize size) {
+		raw->resize(outer, size.height());
+		button->moveToLeft((outer - size.width()) / 2, 0, outer);
+	}, raw->lifetime());
+
+	struct State {
+		rpl::variable<TimeId> value;
+		rpl::variable<bool> locked;
+		std::unique_ptr<Ui::PopupMenu> menu;
+	};
+	const auto state = raw->lifetime().make_state<State>(State{
+		.value = args.value,
+		.locked = std::move(args.locked),
+	});
+
+	rpl::combine(
+		state->value.value(),
+		state->locked.value()
+	) | rpl::on_next([=](TimeId value, bool locked) {
+		auto result = tr::lng_schedule_repeat_label(
+			tr::now,
+			tr::marked);
+
+		const auto text = [&] {
+			const auto i = ranges::lower_bound(
+				map,
+				value,
+				ranges::less{},
+				&Entry::value);
+			return (i != end(map)) ? i->text : map.back().text;
+		}();
+
+		button->setMarkedText(result.append(' ').append(
+			tr::bold(text).append(
+				Ui::Text::IconEmoji(locked
+					? &st::scheduleRepeatDropdownLock
+					: &st::scheduleRepeatDropdownArrow))));
+		return result;
+	}, button->lifetime());
+
+	button->setClickedCallback([=] {
+		if (args.filter && args.filter()) {
+			return;
+		}
+		const auto changed = args.changed;
+
+		state->menu = std::make_unique<Ui::PopupMenu>(button);
+		const auto menu = state->menu.get();
+
+		menu->setDestroyedCallback(crl::guard(button, [=] {
+			if (state->menu.get() == menu) {
+				state->menu.release();
+			}
+		}));
+		for (const auto &entry : map) {
+			const auto value = entry.value;
+			menu->addAction(entry.text, [=] {
+				state->value = value;
+				changed(value);
+			});
+		}
+		menu->setForcedOrigin(Ui::PanelAnimation::Origin::BottomLeft);
+		const auto anchor = button->mapToGlobal(
+			QPoint(button->width() / 2, 0));
+		if (menu->prepareGeometryFor(anchor)) {
+			menu->move(
+				anchor.x() - menu->width() / 2,
+				menu->y()
+					- Ui::BoxShadow::ExtendFor(menu->st().shadow).bottom());
+			menu->popupPrepared();
+		}
+	});
 
 	return result;
 }

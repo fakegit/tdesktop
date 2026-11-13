@@ -7,16 +7,39 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #pragma once
 
-#include "dialogs/dialogs_key.h"
-#include "data/data_messages.h"
-#include "ui/effects/animations.h"
-#include "ui/rp_widget.h"
 #include "base/flags.h"
 #include "base/object_ptr.h"
+#include "base/timer.h"
+#include "data/data_messages.h"
+#include "dialogs/dialogs_archive_slide.h"
+#include "dialogs/dialogs_removed_row_slide.h"
+#include "dialogs/ui/dialogs_quick_action_context.h"
+#include "dialogs/dialogs_community_rows_view.h"
+#include "dialogs/dialogs_inner_widget_accessibility.h"
+#include "dialogs/dialogs_key.h"
+#include "lang/lang_keys.h"
+#include "ui/effects/animations.h"
+#include "ui/dragging_scroll_manager.h"
+#include "ui/rows_scroll_cache.h"
+#include "ui/rp_widget.h"
+#include "ui/userpic_view.h"
+
+namespace style {
+struct DialogRow;
+struct DialogRightButton;
+} // namespace style
+
+namespace Api {
+struct PeerSearchResult;
+} // namespace Api
 
 namespace MTP {
 class Error;
 } // namespace MTP
+
+namespace Lottie {
+class Icon;
+} // namespace Lottie
 
 namespace Main {
 class Session;
@@ -26,6 +49,12 @@ namespace Ui {
 class IconButton;
 class PopupMenu;
 class FlatLabel;
+class VerticalLayout;
+class RoundButton;
+struct ScrollToRequest;
+namespace Controls {
+enum class QuickDialogAction;
+} // namespace Controls
 } // namespace Ui
 
 namespace Window {
@@ -33,28 +62,66 @@ class SessionController;
 } // namespace Window
 
 namespace Data {
-class CloudImageView;
+class ChatFilter;
+class Thread;
+class Folder;
+class Forum;
+class CommunityInfo;
+class SavedMessages;
+struct ReactionId;
 } // namespace Data
+
+namespace Dialogs::Ui {
+using namespace ::Ui;
+class VideoUserpic;
+class MessageView;
+struct PaintContext;
+struct TopicJumpCache;
+} // namespace Dialogs::Ui
 
 namespace Dialogs {
 
 class Row;
 class FakeRow;
 class IndexedList;
+class SearchTags;
+class SearchEmpty;
+class ChatSearchIn;
+class CommunityRequestableList;
+enum class HashOrCashtag : uchar;
+struct RightButton;
+enum class ChatTypeFilter : uchar;
 
 struct ChosenRow {
 	Key key;
 	Data::MessagePosition message;
-	bool filteredRow = false;
+	MsgId topicJumpRootId;
+	PeerId sublistJumpPeerId;
+	QByteArray sponsoredRandomId;
+	bool userpicClick : 1 = false;
+	bool communityBadgeClick : 1 = false;
+	bool filteredRow : 1 = false;
+	bool newWindow : 1 = false;
 };
 
-enum class SearchRequestType {
-	FromStart,
-	FromOffset,
-	PeerFromStart,
-	PeerFromOffset,
-	MigratedFromStart,
-	MigratedFromOffset,
+struct SearchRequestType {
+	bool migrated : 1 = false;
+	bool posts : 1 = false;
+	bool start : 1 = false;
+	bool peer : 1 = false;
+
+	friend inline constexpr auto operator<=>(
+		SearchRequestType a,
+		SearchRequestType b) = default;
+	friend inline constexpr bool operator==(
+		SearchRequestType a,
+		SearchRequestType b) = default;
+};
+
+enum class SearchRequestDelay : uchar {
+	InCache,
+	Instant,
+	Delayed,
 };
 
 enum class WidgetState {
@@ -63,80 +130,148 @@ enum class WidgetState {
 };
 
 class InnerWidget final : public Ui::RpWidget {
-	Q_OBJECT
-
 public:
+	using ChatsFilterTagsKey = int64;
+
+	struct ChildListShown {
+		PeerId peerId = 0;
+		float64 shown = 0.;
+	};
 	InnerWidget(
 		QWidget *parent,
-		not_null<Window::SessionController*> controller);
+		not_null<Window::SessionController*> controller,
+		rpl::producer<ChildListShown> childListShown);
 
-	bool searchReceived(
-		const QVector<MTPMessage> &result,
+	void searchReceived(
+		std::vector<not_null<HistoryItem*>> result,
 		HistoryItem *inject,
 		SearchRequestType type,
 		int fullCount);
-	void peerSearchReceived(
-		const QString &query,
-		const QVector<MTPPeer> &my,
-		const QVector<MTPPeer> &result);
+	void peerSearchReceived(Api::PeerSearchResult result);
 
 	[[nodiscard]] FilterId filterId() const;
+	void switchToFilter(FilterId filterId);
 
 	void clearSelection();
+	[[nodiscard]] bool hasSelection() const;
 
 	void changeOpenedFolder(Data::Folder *folder);
+	void changeOpenedForum(Data::Forum *forum);
+	void changeOpenedCommunity(Data::CommunityInfo *community);
+	void showSavedSublists();
 	void selectSkip(int32 direction);
 	void selectSkipPage(int32 pixels, int32 direction);
 
 	void dragLeft();
+	void setNarrowRatio(float64 narrowRatio);
 
 	void clearFilter();
 	void refresh(bool toTop = false);
-	void refreshEmptyLabel();
-	void resizeEmptyLabel();
+	void refreshEmpty();
+	void resizeEmpty();
 
-	bool chooseRow();
+	void showPeerMenu();
+
+	[[nodiscard]] bool isUserpicPress() const;
+	[[nodiscard]] bool isUserpicPressOnWide() const;
+	[[nodiscard]] bool isCommunityBadgePressOnNarrow() const;
+	void cancelChatPreview();
+	bool scheduleChatPreview(QPoint positionOverride);
+	bool showChatPreview();
+	void chatPreviewShown(bool shown, RowDescriptor row = {});
+	bool chooseRow(
+		Qt::KeyboardModifiers modifiers = {},
+		MsgId pressedTopicRootId = {},
+		PeerId pressedSublistPeerId = {});
+	bool processKeyDispatch(QKeyEvent *e);
 
 	void scrollToEntry(const RowDescriptor &entry);
 
-	Data::Folder *shownFolder() const;
-	int32 lastSearchDate() const;
-	PeerData *lastSearchPeer() const;
-	MsgId lastSearchId() const;
-	MsgId lastSearchMigratedId() const;
+	[[nodiscard]] Data::Folder *shownFolder() const;
+	[[nodiscard]] Data::Forum *shownForum() const;
 
-	WidgetState state() const;
-	bool waitingForSearch() const {
-		return _waitingForSearch;
+	[[nodiscard]] WidgetState state() const;
+	[[nodiscard]] not_null<const style::DialogRow*> st() const {
+		return _st;
 	}
-	bool hasFilteredResults() const;
+	[[nodiscard]] bool hasFilteredResults() const;
 
-	void searchInChat(Key key, PeerData *from);
+	void searchRequested(bool loading);
+	void applySearchState(SearchState state);
+	[[nodiscard]] auto searchTagsChanges() const
+		-> rpl::producer<std::vector<Data::ReactionId>>;
 
-	void applyFilterUpdate(QString newFilter, bool force = false);
-	void onHashtagFilterUpdate(QStringRef newFilter);
+	void onHashtagFilterUpdate(QStringView newFilter);
+	void appendToFiltered(Key key);
 
-	PeerData *updateFromParentDrag(QPoint globalPosition);
+	Data::Thread *updateFromParentDrag(QPoint globalPosition);
 
 	void setLoadMoreCallback(Fn<void()> callback);
+	void setLoadMoreFilteredCallback(Fn<void()> callback);
+	void setSearchResultsOnly(Fn<QString(int count)> title);
+	void setDeselectOnTopUp(bool value);
 	[[nodiscard]] rpl::producer<> listBottomReached() const;
-	[[nodiscard]] rpl::producer<> cancelSearchFromUserRequests() const;
+	[[nodiscard]] auto changeSearchTabRequests() const
+		-> rpl::producer<ChatSearchTab>;
+	[[nodiscard]] auto changeSearchFilterRequests() const
+		-> rpl::producer<ChatTypeFilter>;
+	[[nodiscard]] rpl::producer<bool> changeSearchFromArchiveRequests() const;
+	[[nodiscard]] rpl::producer<> resetSearchRestrictionsRequests() const;
+	[[nodiscard]] rpl::producer<> cancelSearchRequests() const;
+	[[nodiscard]] rpl::producer<> cancelSearchFromRequests() const;
+	[[nodiscard]] rpl::producer<> changeSearchFromRequests() const;
 	[[nodiscard]] rpl::producer<ChosenRow> chosenRow() const;
 	[[nodiscard]] rpl::producer<> updated() const;
 
+	[[nodiscard]] rpl::producer<int> scrollByDeltaRequests() const;
+	[[nodiscard]] rpl::producer<Ui::ScrollToRequest> mustScrollTo() const;
+	[[nodiscard]] rpl::producer<Ui::ScrollToRequest> dialogMoved() const;
+	[[nodiscard]] rpl::producer<SearchRequestDelay> searchRequests() const;
+	[[nodiscard]] rpl::producer<QString> completeHashtagRequests() const;
+	[[nodiscard]] rpl::producer<> refreshHashtagsRequests() const;
+
+	[[nodiscard]] RowDescriptor resolveChatNext(RowDescriptor from = {}) const;
+	[[nodiscard]] RowDescriptor resolveChatPrevious(RowDescriptor from = {}) const;
+
 	~InnerWidget();
 
-public Q_SLOTS:
-	void onParentGeometryChanged();
+	void parentGeometryChanged();
 
-Q_SIGNALS:
-	void draggingScrollDelta(int delta);
-	void mustScrollTo(int scrollToTop, int scrollToBottom);
-	void dialogMoved(int movedFrom, int movedTo);
-	void searchMessages();
-	void cancelSearchInChat();
-	void completeHashtag(QString tag);
-	void refreshHashtags();
+	bool processTouchEvent(not_null<QTouchEvent*> e);
+	[[nodiscard]] rpl::producer<> touchCancelRequests() const {
+		return _touchCancelRequests.events();
+	}
+
+	[[nodiscard]] rpl::producer<UserId> openBotMainAppRequests() const;
+
+	void setSwipeContextData(
+		int64 key,
+		std::optional<Ui::Controls::SwipeContextData> data);
+	[[nodiscard]] int64 calcSwipeKey(int top);
+	bool prepareQuickAction(int64 key, Dialogs::Ui::QuickDialogAction);
+	void clearQuickActions();
+
+	Qt::FocusPolicy accessibilityFocusPolicy() override {
+		return Qt::TabFocus;
+	}
+	QAccessible::Role accessibilityRole() override {
+		return QAccessible::Role::List;
+	}
+	Ui::AccessibilityState accessibilityState() const override;
+	int accessibilityChildCount() const override;
+	QString accessibilityChildName(int index) const override;
+	QAccessible::State accessibilityChildState(int index) const override;
+	QAccessible::Role accessibilityChildRole() const override;
+	QRect accessibilityChildRect(int index) const override;
+	int accessibilityChildColumnCount(int row) const override;
+	QAccessible::Role accessibilityChildSubItemRole() const override;
+	QString accessibilityChildSubItemName(int row, int column) const override;
+	QString accessibilityChildSubItemValue(int row, int column) const override;
+	bool accessibilityChildSupportsActions(int index) const override;
+	quintptr accessibilityChildIdentity(int index) const override;
+	int accessibilityChildIndexByIdentity(quintptr identity) const override;
+	void accessibilityChildSetFocus(quintptr identity) override;
+	void accessibilityChildActivate(quintptr identity) override;
 
 protected:
 	void visibleTopBottomUpdated(
@@ -148,14 +283,18 @@ protected:
 	void mousePressEvent(QMouseEvent *e) override;
 	void mouseReleaseEvent(QMouseEvent *e) override;
 	void resizeEvent(QResizeEvent *e) override;
-	void enterEventHook(QEvent *e) override;
+	void enterEventHook(QEnterEvent *e) override;
 	void leaveEventHook(QEvent *e) override;
 	void contextMenuEvent(QContextMenuEvent *e) override;
+	void focusInEvent(QFocusEvent *e) override;
+	void keyPressEvent(QKeyEvent *e) override;
 
 private:
 	struct CollapsedRow;
 	struct HashtagResult;
+	struct SponsoredSearchResult;
 	struct PeerSearchResult;
+	struct TagCache;
 
 	enum class JumpSkip {
 		PreviousOrBegin,
@@ -169,20 +308,47 @@ private:
 		Loading,
 		NoContacts,
 		EmptyFolder,
+		EmptyForum,
+		EmptySavedSublists,
+	};
+
+	struct PinnedRow {
+		anim::value yadd;
+		crl::time animStartTime = 0;
+	};
+
+	struct CachedRow {
+		QRect preview;
+		QRect badge;
+		QImage band;
+		std::pair<uint64, uint64> userpic;
+		bool bandDirty = true;
+		bool video = false;
+	};
+
+	struct FilterResult {
+		FilterResult(not_null<Row*> row) : row(row) {
+		}
+
+		not_null<Row*> row;
+		int top = 0;
+
+		[[nodiscard]] Key key() const;
+		[[nodiscard]] int bottom() const;
 	};
 
 	Main::Session &session() const;
 
 	void dialogRowReplaced(Row *oldRow, Row *newRow);
 
+	void setState(WidgetState state);
 	void editOpenedFilter();
 	void repaintCollapsedFolderRow(not_null<Data::Folder*> folder);
 	void refreshWithCollapsedRows(bool toTop = false);
 	bool needCollapsedRowsRefresh() const;
-	bool chooseCollapsedRow();
-	void switchToFilter(FilterId filterId);
 	bool chooseHashtag();
 	ChosenRow computeChosenRow() const;
+	bool isRowActive(not_null<Row*> row, const RowDescriptor &entry) const;
 	bool isSearchResultActive(
 		not_null<FakeRow*> result,
 		const RowDescriptor &entry) const;
@@ -190,17 +356,38 @@ private:
 	void repaintDialogRow(FilterId filterId, not_null<Row*> row);
 	void repaintDialogRow(RowDescriptor row);
 	void refreshDialogRow(RowDescriptor row);
+	bool updateEntryHeight(not_null<Entry*> entry);
+	void showSponsoredMenu(int peerSearchIndex, QPoint globalPos);
+	void closeMenuForRemovedRow();
 
 	void clearMouseSelection(bool clearSelection = false);
-	void mousePressReleased(QPoint globalPosition, Qt::MouseButton button);
+	void deselectAllRows();
+	void mousePressReleased(
+		QPoint globalPosition,
+		Qt::MouseButton button,
+		Qt::KeyboardModifiers modifiers);
+	void processGlobalForceClick(QPoint globalPosition);
 	void clearIrrelevantState();
 	void selectByMouse(QPoint globalPosition);
-	void loadPeerPhotos();
+	void preloadRowsData();
+	void scrollToItem(int top, int height);
+	void scrollToDefaultSelected();
+	void scrollToFilteredSelected();
+	bool selectChildByIndex(int index);
+	void clearSecondaryMouseState();
 	void setCollapsedPressed(int pressed);
-	void setPressed(Row *pressed);
+	void setPressed(
+		Row *pressed,
+		bool pressedTopicJump,
+		bool pressedRightButton);
+	void clearPressed();
 	void setHashtagPressed(int pressed);
-	void setFilteredPressed(int pressed);
-	void setPeerSearchPressed(int pressed);
+	void setFilteredPressed(
+		int pressed,
+		bool pressedTopicJump,
+		bool pressedRightButton);
+	void setPeerSearchPressed(int pressed, bool pressedRightButton);
+	void setPreviewPressed(int pressed);
 	void setSearchedPressed(int pressed);
 	bool isPressed() const {
 		return (_collapsedPressed >= 0)
@@ -208,7 +395,11 @@ private:
 			|| (_hashtagPressed >= 0)
 			|| (_filteredPressed >= 0)
 			|| (_peerSearchPressed >= 0)
-			|| (_searchedPressed >= 0);
+			|| (_previewPressed >= 0)
+			|| (_searchedPressed >= 0)
+			|| (_communityPressed >= 0)
+			|| _pressedMorePosts
+			|| _pressedChatTypeFilter;
 	}
 	bool isSelected() const {
 		return (_collapsedSelected >= 0)
@@ -216,25 +407,44 @@ private:
 			|| (_hashtagSelected >= 0)
 			|| (_filteredSelected >= 0)
 			|| (_peerSearchSelected >= 0)
-			|| (_searchedSelected >= 0);
+			|| (_previewSelected >= 0)
+			|| (_searchedSelected >= 0)
+			|| (_communitySelected >= 0)
+			|| _selectedMorePosts
+			|| _selectedChatTypeFilter;
 	}
 	bool uniqueSearchResults() const;
 	bool hasHistoryInResults(not_null<History*> history) const;
 
 	int defaultRowTop(not_null<Row*> row) const;
 	void setupOnlineStatusCheck();
-	void userOnlineUpdated(not_null<PeerData*> peer);
-	void groupHasCallUpdated(not_null<PeerData*> peer);
+	void jumpToTop();
 
-	void updateRowCornerStatusShown(
-		not_null<History*> history,
-		bool shown);
-	void updateDialogRowCornerStatus(not_null<History*> history);
+	void updateRowCornerStatusShown(not_null<History*> history);
+	void repaintDialogRowCornerStatus(not_null<History*> history);
+
+	[[nodiscard]] bool animatedPreviewCached(not_null<Row*> row);
+	void invalidateCachedRow(uint64 rowId);
+	void invalidateLoadedUserpics();
+	void paintCachedRowOverlays(
+		Painter &p,
+		not_null<Row*> row,
+		uint64 rowId,
+		const Ui::PaintContext &context);
+	void paintAnimatedPreview(
+		Painter &p,
+		not_null<Ui::MessageView*> view,
+		CachedRow &cached,
+		const Ui::PaintContext &context);
+
+	bool addQuickActionRipple(not_null<Row*> row, Fn<void()> updateCallback);
+
+	bool addRightButtonRipple(QPoint origin, Fn<void()> updateCallback);
 
 	void setupShortcuts();
 	RowDescriptor computeJump(
 		const RowDescriptor &to,
-		JumpSkip skip);
+		JumpSkip skip) const;
 	bool jumpToDialogRow(RowDescriptor to);
 
 	RowDescriptor chatListEntryBefore(const RowDescriptor &which) const;
@@ -259,15 +469,39 @@ private:
 		QRect updateRect = QRect(),
 		UpdateRowSections sections = UpdateRowSection::All);
 	void fillSupportSearchMenu(not_null<Ui::PopupMenu*> menu);
-	void fillArchiveSearchMenu(not_null<Ui::PopupMenu*> menu);
+	void fillSearchResultMenu(
+		not_null<Ui::PopupMenu*> menu,
+		FullMsgId itemId);
 
-	int dialogsOffset() const;
-	int fixedOnTopCount() const;
-	int pinnedOffset() const;
-	int filteredOffset() const;
-	int peerSearchOffset() const;
-	int searchedOffset() const;
-	int searchInChatSkip() const;
+	void refreshShownList();
+	void rebuildCommunitySections();
+	void updateCommunityRequestableGeometry();
+	void setCommunityPressed(int pressed);
+	[[nodiscard]] int skipTopHeight() const;
+	[[nodiscard]] int archiveBandHeight() const;
+	void refreshWithArchiveSlide();
+	void prepareRemovedRowSlide(not_null<Row*> row);
+	[[nodiscard]] int collapsedRowsOffset() const;
+	[[nodiscard]] int dialogsOffset() const;
+	[[nodiscard]] int shownHeight(int till = -1) const;
+	[[nodiscard]] int fixedOnTopCount() const;
+	[[nodiscard]] int pinnedOffset() const;
+	[[nodiscard]] int filteredOffset() const;
+	[[nodiscard]] int filteredIndex(int y) const;
+	[[nodiscard]] int filteredHeight(int till = -1) const;
+	[[nodiscard]] int peerSearchOffset() const;
+	[[nodiscard]] int searchInChatOffset() const;
+	[[nodiscard]] int previewOffset() const;
+	[[nodiscard]] int searchedOffset() const;
+	[[nodiscard]] int searchInChatSkip() const;
+	[[nodiscard]] int hashtagsOffset() const;
+	[[nodiscard]] int communityViewableTop() const;
+	[[nodiscard]] int communityRequestableTop() const;
+	[[nodiscard]] int communitySectionsBottom() const;
+	[[nodiscard]] int communityRowCount() const;
+	[[nodiscard]] Row *communityRowAt(int index) const;
+	[[nodiscard]] int communityRowAbsoluteTop(int index) const;
+	[[nodiscard]] bool communityModeShown() const;
 
 	void paintCollapsedRows(
 		Painter &p,
@@ -279,78 +513,205 @@ private:
 	void paintPeerSearchResult(
 		Painter &p,
 		not_null<const PeerSearchResult*> result,
-		int fullWidth,
-		bool active,
-		bool selected) const;
-	void paintSearchInChat(Painter &p) const;
-	void paintSearchInPeer(
+		const Ui::PaintContext &context);
+	void paintSearchTags(
 		Painter &p,
-		not_null<PeerData*> peer,
-		std::shared_ptr<Data::CloudImageView> &userpic,
-		int top,
-		const Ui::Text::String &text) const;
-	void paintSearchInSaved(
-		Painter &p,
-		int top,
-		const Ui::Text::String &text) const;
-	void paintSearchInReplies(
-		Painter &p,
-		int top,
-		const Ui::Text::String &text) const;
-	template <typename PaintUserpic>
-	void paintSearchInFilter(
-		Painter &p,
-		PaintUserpic paintUserpic,
-		int top,
-		const style::icon *icon,
-		const Ui::Text::String &text) const;
-	void refreshSearchInChatLabel();
+		const Ui::PaintContext &context) const;
+	//void paintSearchInChat(
+	//	Painter &p,
+	//	const Ui::PaintContext &context) const;
+	//void paintSearchInPeer(
+	//	Painter &p,
+	//	not_null<PeerData*> peer,
+	//	Ui::PeerUserpicView &userpic,
+	//	int top,
+	//	const Ui::Text::String &text) const;
+	//void paintSearchInSaved(
+	//	Painter &p,
+	//	int top,
+	//	const Ui::Text::String &text) const;
+	//void paintSearchInReplies(
+	//	Painter &p,
+	//	int top,
+	//	const Ui::Text::String &text) const;
+	//void paintSearchInTopic(
+	//	Painter &p,
+	//	const Ui::PaintContext &context,
+	//	not_null<Data::ForumTopic*> topic,
+	//	Ui::PeerUserpicView &userpic,
+	//	int top,
+	//	const Ui::Text::String &text) const;
+	//template <typename PaintUserpic>
+	//void paintSearchInFilter(
+	//	Painter &p,
+	//	PaintUserpic paintUserpic,
+	//	int top,
+	//	const style::icon *icon,
+	//	const Ui::Text::String &text) const;
+	[[nodiscard]] bool archiveSearchActive() const;
+	[[nodiscard]] bool communitySearchActive() const;
+	void updateSearchIn();
+	void repaintSearchResult(int index);
+	void repaintPreviewResult(int index);
 
-	void clearSearchResults(bool clearPeerSearchResults = true);
+	[[nodiscard]] bool computeSearchWithPostsPreview() const;
+
+	Ui::VideoUserpic *validateVideoUserpic(not_null<Row*> row);
+	Ui::VideoUserpic *validateVideoUserpic(not_null<History*> history);
+
+	Row *shownRowByKey(Key key);
+	[[nodiscard]] const std::vector<SubItem> &activeSubItems(
+		not_null<const Row*> row) const;
+	enum class AccessibilityCohort {
+		Hashtag,
+		Filtered,
+		PeerSearch,
+		Preview,
+		Searched,
+	};
+	struct FilteredChildRef {
+		AccessibilityCohort cohort;
+		int local = 0;
+	};
+	[[nodiscard]] int filteredChildCount() const;
+	[[nodiscard]] std::optional<FilteredChildRef>
+		filteredChildAt(int index) const;
+
+	// A single logical mapping for the Default state shared by painting order,
+	// keyboard navigation and accessibility: collapsed rows first, then the
+	// shown list with _skipTopDialog applied. `collapsed` indexes
+	// _collapsedRows; otherwise `row` is the shown-list row.
+	struct DefaultChildRef {
+		int collapsed = -1;
+		Row *row = nullptr;
+	};
+	[[nodiscard]] int defaultChildCount() const;
+	[[nodiscard]] std::optional<DefaultChildRef>
+		defaultChildAt(int index) const;
+	[[nodiscard]] int defaultChildIndexOfSelected() const;
+
+	void announceSelectedFocus();
+	void refreshFilterResults();
+	void clearSearchResults(bool alsoPeerSearchResults = true);
+	void clearPeerSearchResults();
+	void clearPreviewResults();
 	void updateSelectedRow(Key key = Key());
+	void trackResultsHistory(not_null<History*> history);
 
-	not_null<IndexedList*> shownDialogs() const;
+	[[nodiscard]] QBrush currentBg() const;
+	[[nodiscard]] RowDescriptor computeChatPreviewRow() const;
 
+	[[nodiscard]] const std::vector<Key> &pinnedChatsOrder() const;
 	void checkReorderPinnedStart(QPoint localPosition);
+	void startReorderPinned(QPoint localPosition);
 	int updateReorderIndexGetCount();
 	bool updateReorderPinned(QPoint localPosition);
+	[[nodiscard]] bool skipChatsListFreeze() const;
+	void unfreezeShownList(bool updateIfWasFrozen);
 	void finishReorderPinned();
+	bool finishReorderOnRelease();
 	void stopReorderPinned();
 	int countPinnedIndex(Row *ofRow);
 	void savePinnedOrder();
 	bool pinnedShiftAnimationCallback(crl::time now);
 	void handleChatListEntryRefreshes();
+	void moveSearchIn();
+	void dragPinnedFromTouch();
+	[[nodiscard]] bool hasChatTypeFilter() const;
 
-	not_null<Window::SessionController*> _controller;
+	void restoreScrollShowingCommunity(
+		not_null<Data::CommunityInfo*> community);
+	void saveChatsFilterScrollState(FilterId filterId);
+	bool restoreChatsFilterScrollState(FilterId filterId);
 
+	[[nodiscard]] not_null<Ui::QuickActionContext*> ensureQuickAction(
+		int64 key);
+	void deactivateQuickAction();
+	void updateQuickActionRow(int64 key);
+
+	[[nodiscard]] bool lookupIsInBotAppButton(
+		Row *row,
+		QPoint localPosition);
+	[[nodiscard]] bool lookupIsInRightButton(
+		const RightButton &button,
+		QPoint localPosition);
+	[[nodiscard]] RightButton *maybeCacheRightButton(Row *row);
+	void fillRightButton(
+		RightButton &button,
+		const TextWithEntities &text,
+		const style::DialogRightButton &st);
+
+	[[nodiscard]] QImage *cacheChatsFilterTag(
+		const Data::ChatFilter &filter,
+		uint8 more,
+		bool active);
+
+	void performDrag();
+
+	const not_null<Window::SessionController*> _controller;
+
+	not_null<IndexedList*> _shownList;
 	FilterId _filterId = 0;
 	bool _mouseSelection = false;
 	std::optional<QPoint> _lastMousePosition;
+	int _lastRowLocalMouseX = -1;
 	Qt::MouseButton _pressButton = Qt::LeftButton;
 
 	Data::Folder *_openedFolder = nullptr;
+	Data::Forum *_openedForum = nullptr;
+	rpl::lifetime _openedForumLifetime;
+	Data::CommunityInfo *_openedCommunity = nullptr;
 
 	std::vector<std::unique_ptr<CollapsedRow>> _collapsedRows;
+	not_null<const style::DialogRow*> _st;
+	mutable std::unique_ptr<Ui::TopicJumpCache> _topicJumpCache;
+	base::flat_map<uint64, CachedRow> _cachedRows;
+	Ui::RowsScrollCache _rowsScrollCache{[this] {
+		_cachedRows.clear();
+		update();
+	}};
+	ArchiveSlide _archiveSlide{[this] {
+		_rowsScrollCache.markScrolling();
+		update(0, _visibleTop, width(), _visibleBottom - _visibleTop);
+	}};
+	RemovedRowSlide _removedRowSlide{[this] {
+		_rowsScrollCache.markScrolling();
+		update(0, _visibleTop, width(), _visibleBottom - _visibleTop);
+	}};
+	bool _selectedChatTypeFilter = false;
+	bool _pressedChatTypeFilter = false;
+	bool _selectedMorePosts = false;
+	bool _pressedMorePosts = false;
 	int _collapsedSelected = -1;
 	int _collapsedPressed = -1;
-	int _skipTopDialogs = 0;
+	bool _skipTopDialog = false;
 	Row *_selected = nullptr;
 	Row *_pressed = nullptr;
+	MsgId _pressedTopicJumpRootId;
+	PeerId _pressedSublistJumpPeerId;
+	bool _selectedTopicJump = false;
+	bool _pressedTopicJump = false;
+
+	RightButton *_pressedRightButtonData = nullptr;
+	bool _selectedRightButton = false;
+	bool _pressedRightButton = false;
+
+	Row *_qdragging = nullptr;
 
 	Row *_dragging = nullptr;
 	int _draggingIndex = -1;
 	int _aboveIndex = -1;
 	QPoint _dragStart;
-	struct PinnedRow {
-		anim::value yadd;
-		crl::time animStartTime = 0;
-	};
 	std::vector<PinnedRow> _pinnedRows;
 	Ui::Animations::Basic _pinnedShiftAnimation;
 	base::flat_set<Key> _pinnedOnDragStart;
 
+	mutable const Row *_activeSubItemsRow = nullptr;
+	mutable std::vector<SubItem> _activeSubItems;
+
 	// Remember the last currently dragged row top shift for updating area.
 	int _aboveTopShift = -1;
+	int _narrowWidth = 0;
 
 	int _visibleTop = 0;
 	int _visibleBottom = 0;
@@ -362,20 +723,29 @@ private:
 	bool _hashtagDeleteSelected = false;
 	bool _hashtagDeletePressed = false;
 
-	std::vector<not_null<Row*>> _filterResults;
-	base::flat_map<
-		not_null<PeerData*>,
-		std::unique_ptr<Row>> _filterResultsGlobal;
+	std::vector<FilterResult> _filterResults;
+	base::flat_map<Key, std::unique_ptr<Row>> _filterResultsGlobal;
 	int _filteredSelected = -1;
 	int _filteredPressed = -1;
 
-	bool _waitingForSearch = false;
 	EmptyState _emptyState = EmptyState::None;
 
+	base::flat_set<not_null<History*>> _trackedHistories;
+	rpl::lifetime _trackedLifetime;
+
 	QString _peerSearchQuery;
+	base::flat_set<not_null<PeerData*>> _sponsoredRemoved;
 	std::vector<std::unique_ptr<PeerSearchResult>> _peerSearchResults;
 	int _peerSearchSelected = -1;
 	int _peerSearchPressed = -1;
+	int _peerSearchMenu = -1;
+
+	std::vector<std::unique_ptr<FakeRow>> _previewResults;
+	int _previewCount = 0;
+	int _previewSelected = -1;
+	int _previewPressed = -1;
+	int _morePostsWidth = 0;
+	int _chatTypeFilterWidth = 0;
 
 	std::vector<std::unique_ptr<FakeRow>> _searchResults;
 	int _searchedCount = 0;
@@ -383,30 +753,92 @@ private:
 	int _searchedSelected = -1;
 	int _searchedPressed = -1;
 
-	int _lastSearchDate = 0;
-	PeerData *_lastSearchPeer = nullptr;
-	MsgId _lastSearchId = 0;
-	MsgId _lastSearchMigratedId = 0;
+	CommunityRowsView _communityViewable;
+	object_ptr<CommunityRequestableList> _communityRequestableList
+		= { nullptr };
+	int _communitySelected = -1;
+	int _communityPressed = -1;
+	int _communityRequestableCount = 0;
+	rpl::lifetime _openedCommunityLifetime;
 
 	WidgetState _state = WidgetState::Default;
 
+	std::unique_ptr<ChatSearchIn> _searchIn;
+	rpl::event_stream<ChatSearchTab> _changeSearchTabRequests;
+	rpl::event_stream<ChatTypeFilter> _changeSearchFilterRequests;
+	rpl::event_stream<bool> _changeSearchFromArchiveRequests;
+	rpl::event_stream<> _resetSearchRestrictionsRequests;
+	rpl::event_stream<> _cancelSearchRequests;
+	rpl::event_stream<> _cancelSearchFromRequests;
+	rpl::event_stream<> _changeSearchFromRequests;
+	object_ptr<Ui::RpWidget> _loadingAnimation = { nullptr };
+	object_ptr<SearchEmpty> _searchEmpty = { nullptr };
+	SearchState _searchEmptyState;
 	object_ptr<Ui::FlatLabel> _empty = { nullptr };
-	object_ptr<Ui::IconButton> _cancelSearchInChat;
-	object_ptr<Ui::IconButton> _cancelSearchFromUser;
+	object_ptr<Ui::VerticalLayout> _emptyList = { nullptr };
+	object_ptr<Ui::RoundButton> _emptyButton = { nullptr };
 
-	Key _searchInChat;
+	Ui::DraggingScrollManager _draggingScroll;
+
+	SearchState _searchState;
+	HashOrCashtag _searchHashOrCashtag = {};
+	bool _searchWithPostsPreview = false;
 	History *_searchInMigrated = nullptr;
-	PeerData *_searchFromPeer = nullptr;
-	mutable std::shared_ptr<Data::CloudImageView> _searchInChatUserpic;
-	mutable std::shared_ptr<Data::CloudImageView> _searchFromUserUserpic;
-	Ui::Text::String _searchInChatText;
+	PeerData *_searchFromShown = nullptr;
 	Ui::Text::String _searchFromUserText;
+	std::unique_ptr<SearchTags> _searchTags;
+	int _searchTagsLeft = 0;
 	RowDescriptor _menuRow;
 
+	base::flat_map<
+		not_null<PeerData*>,
+		std::unique_ptr<Ui::VideoUserpic>> _videoUserpics;
+
+	base::flat_map<FilterId, int> _chatsFilterScrollStates;
+	int _communityScrollTop = 0;
+
+	std::unordered_map<ChatsFilterTagsKey, TagCache> _chatsFilterTags;
+	bool _waitingAllChatListEntryRefreshesForTags = false;
+	rpl::lifetime _handleChatListEntryTagRefreshesLifetime;
+
+	std::unordered_map<PeerId, RightButton> _rightButtons;
+
 	Fn<void()> _loadMoreCallback;
+	Fn<void()> _loadMoreFilteredCallback;
+	Fn<QString(int count)> _searchResultsOnlyTitle;
+	bool _deselectOnTopUp = false;
 	rpl::event_stream<> _listBottomReached;
 	rpl::event_stream<ChosenRow> _chosenRow;
 	rpl::event_stream<> _updated;
+
+	rpl::event_stream<Ui::ScrollToRequest> _mustScrollTo;
+	rpl::event_stream<Ui::ScrollToRequest> _dialogMoved;
+	rpl::event_stream<SearchRequestDelay> _searchRequests;
+	rpl::event_stream<QString> _completeHashtagRequests;
+	rpl::event_stream<> _refreshHashtagsRequests;
+	rpl::event_stream<UserId> _openBotMainAppRequests;
+
+	using QuickActionPtr = std::unique_ptr<Ui::QuickActionContext>;
+	QuickActionPtr _activeQuickAction;
+	std::vector<QuickActionPtr> _inactiveQuickActions;
+
+	RowDescriptor _chatPreviewRow;
+	bool _chatPreviewScheduled = false;
+	std::optional<QPoint> _chatPreviewTouchGlobal;
+	base::Timer _touchDragPinnedTimer;
+	std::optional<QPoint> _touchDragStartGlobal;
+	std::optional<QPoint> _touchDragNowGlobal;
+	rpl::event_stream<> _touchCancelRequests;
+
+	rpl::variable<ChildListShown> _childListShown;
+	base::Timer _freezeTimer;
+	float64 _narrowRatio = 0.;
+	bool _geometryInited = false;
+
+	Data::SavedMessages *_savedSublists = nullptr;
+
+	bool _searchLoading = false;
+	bool _searchWaiting = false;
 
 	base::unique_qptr<Ui::PopupMenu> _menu;
 

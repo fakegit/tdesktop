@@ -8,11 +8,12 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "payments/ui/payments_form_summary.h"
 
 #include "payments/ui/payments_panel_delegate.h"
-#include "settings/settings_common.h"
+#include "settings/settings_common.h" // AddButtonWithLabel.
 #include "ui/widgets/scroll_area.h"
 #include "ui/widgets/buttons.h"
 #include "ui/widgets/labels.h"
 #include "ui/wrap/vertical_layout.h"
+#include "ui/vertical_list.h"
 #include "ui/wrap/fade_wrap.h"
 #include "ui/text/format_values.h"
 #include "ui/text/text_utilities.h"
@@ -117,11 +118,13 @@ bool FormSummary::showCriticalError(const TextWithEntities &text) {
 			< st::paymentsPanelSize.height() / 2)) {
 		return false;
 	}
-	Settings::AddSkip(_layout.get(), st::paymentsPricesTopSkip);
-	_layout->add(object_ptr<FlatLabel>(
-		_layout.get(),
-		rpl::single(text),
-		st::paymentsCriticalError));
+	Ui::AddSkip(_layout.get(), st::paymentsPricesTopSkip);
+	_layout->add(
+		object_ptr<FlatLabel>(
+			_layout.get(),
+			rpl::single(text),
+			st::paymentsCriticalError),
+		style::al_top);
 	return true;
 }
 
@@ -194,7 +197,7 @@ void FormSummary::setupControls() {
 	rpl::merge(
 		(_submit ? _submit->widthValue() : rpl::single(0)),
 		_cancel->widthValue()
-	) | rpl::skip(2) | rpl::start_with_next([=] {
+	) | rpl::skip(2) | rpl::on_next([=] {
 		updateControlsGeometry();
 	}, lifetime());
 }
@@ -206,7 +209,6 @@ void FormSummary::setupCover(not_null<VerticalLayout*> layout) {
 		FlatLabel *description = nullptr;
 		FlatLabel *seller = nullptr;
 	};
-
 	const auto cover = layout->add(object_ptr<RpWidget>(layout));
 	const auto state = cover->lifetime().make_state<State>();
 	state->title = CreateChild<FlatLabel>(
@@ -215,14 +217,14 @@ void FormSummary::setupCover(not_null<VerticalLayout*> layout) {
 		st::paymentsTitle);
 	state->description = CreateChild<FlatLabel>(
 		cover,
-		_invoice.cover.description,
+		rpl::single(_invoice.cover.description),
 		st::paymentsDescription);
 	state->seller = CreateChild<FlatLabel>(
 		cover,
 		_invoice.cover.seller,
 		st::paymentsSeller);
 	cover->paintRequest(
-	) | rpl::start_with_next([=](QRect clip) {
+	) | rpl::on_next([=](QRect clip) {
 		if (state->thumbnail.isNull()) {
 			return;
 		}
@@ -239,7 +241,7 @@ void FormSummary::setupCover(not_null<VerticalLayout*> layout) {
 	rpl::combine(
 		cover->widthValue(),
 		_thumbnails.events_starting_with_copy(_invoice.cover.thumbnail)
-	) | rpl::start_with_next([=](int width, QImage &&thumbnail) {
+	) | rpl::on_next([=](int width, QImage &&thumbnail) {
 		const auto &padding = st::paymentsCoverPadding;
 		const auto thumbnailSkip = st::paymentsThumbnailSize.width()
 			+ st::paymentsThumbnailSkip;
@@ -303,27 +305,27 @@ void FormSummary::setupPrices(not_null<VerticalLayout*> layout) {
 				padding.left(),
 				padding.top(),
 				(padding.right()
-					+ right->naturalWidth()
+					+ right->textMaxWidth()
 					+ 2 * st.style.font->spacew),
 				padding.bottom()));
 		rpl::combine(
 			left->topValue(),
 			layout->widthValue()
-		) | rpl::start_with_next([=](int top, int width) {
+		) | rpl::on_next([=](int top, int width) {
 			right->moveToRight(st::paymentsPricePadding.right(), top, width);
 		}, right->lifetime());
 		return right;
 	};
 
-	Settings::AddSkip(layout, st::paymentsPricesTopSkip);
+	Ui::AddSkip(layout, st::paymentsPricesTopSkip);
 	if (_invoice.receipt) {
 		addRow(
 			tr::lng_payments_date_label(tr::now),
 			{ langDateTime(base::unixtime::parse(_invoice.receipt.date)) },
 			true);
-		Settings::AddSkip(layout, st::paymentsPricesBottomSkip);
-		Settings::AddDivider(layout);
-		Settings::AddSkip(layout, st::paymentsPricesBottomSkip);
+		Ui::AddSkip(layout, st::paymentsPricesBottomSkip);
+		Ui::AddDivider(layout);
+		Ui::AddSkip(layout, st::paymentsPricesBottomSkip);
 	}
 
 	const auto add = [&](
@@ -357,16 +359,15 @@ void FormSummary::setupPrices(not_null<VerticalLayout*> layout) {
 		const auto text = formatAmount(_invoice.tipsSelected);
 		const auto label = addRow(
 			tr::lng_payments_tips_label(tr::now),
-			Ui::Text::Link(text, "internal:edit_tips"));
-		label->setClickHandlerFilter([=](auto&&...) {
+			tr::link(text));
+		label->overrideLinkClickHandler([=] {
 			_delegate->panelChooseTips();
-			return false;
 		});
 		setupSuggestedTips(layout);
 	}
 
 	add(tr::lng_payments_total_label(tr::now), total, true);
-	Settings::AddSkip(layout, st::paymentsPricesBottomSkip);
+	Ui::AddSkip(layout, st::paymentsPricesBottomSkip);
 }
 
 void FormSummary::setupSuggestedTips(not_null<VerticalLayout*> layout) {
@@ -386,7 +387,6 @@ void FormSummary::setupSuggestedTips(not_null<VerticalLayout*> layout) {
 		st::paymentsTipButtonsPadding);
 	const auto state = outer->lifetime().make_state<State>();
 	for (const auto amount : _invoice.suggestedTips) {
-		const auto text = formatAmount(amount, true);
 		const auto selected = (amount == _invoice.tipsSelected);
 		const auto &st = selected
 			? _tipChosen
@@ -408,7 +408,7 @@ void FormSummary::setupSuggestedTips(not_null<VerticalLayout*> layout) {
 	outer->widthValue(
 	) | rpl::filter([=](int outerWidth) {
 		return outerWidth >= state->maxWidth;
-	}) | rpl::start_with_next([=](int outerWidth) {
+	}) | rpl::on_next([=](int outerWidth) {
 		const auto skip = st::paymentsTipSkip;
 		const auto &buttons = state->buttons;
 		auto left = outerWidth;
@@ -452,8 +452,12 @@ void FormSummary::setupSuggestedTips(not_null<VerticalLayout*> layout) {
 			for (auto i = 0; i != count; ++i) {
 				const auto button = buttons[rowStart + i].widget;
 				auto right = x + buttonWidths[i];
-				button->setFullWidth(int(std::round(right) - std::round(x)));
-				button->moveToLeft(int(std::round(x)), height, outerWidth);
+				button->setFullWidth(
+					int(base::SafeRound(right) - base::SafeRound(x)));
+				button->moveToLeft(
+					int(base::SafeRound(x)),
+					height,
+					outerWidth);
 				x = right + skip;
 			}
 			height += buttons[0].widget->height() + skip;
@@ -474,7 +478,7 @@ void FormSummary::setupSuggestedTips(not_null<VerticalLayout*> layout) {
 }
 
 void FormSummary::setupSections(not_null<VerticalLayout*> layout) {
-	Settings::AddSkip(layout, st::paymentsSectionsTopSkip);
+	Ui::AddSkip(layout, st::paymentsSectionsTopSkip);
 
 	const auto add = [&](
 			rpl::producer<QString> title,
@@ -486,7 +490,7 @@ void FormSummary::setupSections(not_null<VerticalLayout*> layout) {
 			std::move(title),
 			rpl::single(label),
 			st::paymentsSectionButton,
-			icon);
+			{ .icon = icon });
 		button->addClickHandler(std::move(handler));
 		if (_invoice.receipt) {
 			button->setAttribute(Qt::WA_TransparentForMouseEvents);
@@ -494,7 +498,9 @@ void FormSummary::setupSections(not_null<VerticalLayout*> layout) {
 	};
 	add(
 		tr::lng_payments_payment_method(),
-		_method.title,
+		(_method.savedMethods.empty()
+			? QString()
+			: _method.savedMethods[_method.savedMethodIndex].title),
 		&st::paymentsIconPaymentMethod,
 		[=] { _delegate->panelEditPaymentMethod(); });
 	if (_invoice.isShippingAddressRequested) {
@@ -551,20 +557,20 @@ void FormSummary::setupSections(not_null<VerticalLayout*> layout) {
 			&st::paymentsIconPhone,
 			[=] { _delegate->panelEditPhone(); });
 	}
-	Settings::AddSkip(layout, st::paymentsSectionsTopSkip);
+	Ui::AddSkip(layout, st::paymentsSectionsTopSkip);
 }
 
 void FormSummary::setupContent(not_null<VerticalLayout*> layout) {
 	_scroll->widthValue(
-	) | rpl::start_with_next([=](int width) {
+	) | rpl::on_next([=](int width) {
 		layout->resizeToWidth(width);
 	}, layout->lifetime());
 
 	setupCover(layout);
 	if (_invoice) {
-		Settings::AddDivider(layout);
+		Ui::AddDivider(layout);
 		setupPrices(layout);
-		Settings::AddDivider(layout);
+		Ui::AddDivider(layout);
 		setupSections(layout);
 	}
 }

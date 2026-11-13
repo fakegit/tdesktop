@@ -12,10 +12,17 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "mtproto/connection_resolving.h"
 #include "mtproto/session.h"
 #include "base/unixtime.h"
-#include "base/openssl_help.h"
+#include "base/random.h"
+
+#include <QtCore/QtEndian>
 
 namespace MTP {
 namespace details {
+namespace {
+
+std::atomic<int> GlobalConnectionCounter/* = 0*/;
+
+} // namespace
 
 ConnectionPointer::ConnectionPointer() = default;
 
@@ -94,8 +101,8 @@ mtpBuffer AbstractConnection::prepareSecurePacket(
 	constexpr auto kTcpPostfixInts = 4;
 	result.reserve(kPrefixInts + size + kTcpPostfixInts);
 	result.resize(kPrefixInts);
-	*reinterpret_cast<uint64*>(&result[kAuthKeyIdPosition]) = keyId;
-	*reinterpret_cast<MTPint128*>(&result[kMessageKeyPosition]) = msgKey;
+	qToUnaligned(keyId, &result[kAuthKeyIdPosition]);
+	qToUnaligned(msgKey, &result[kMessageKeyPosition]);
 	return result;
 }
 
@@ -125,7 +132,9 @@ gsl::span<const mtpPrime> AbstractConnection::parseNotSecureResponse(
 		return {};
 	}
 	const auto answerLen = (uint32)answer[4];
-	if (answerLen < 1 || answerLen > (len - 5) * sizeof(mtpPrime)) {
+	if (answerLen < 1
+		|| (answerLen % sizeof(mtpPrime))
+		|| answerLen > (len - 5) * sizeof(mtpPrime)) {
 		LOG(("Not Secure Error: bad request answer 1 <= %1 <= %2"
 			).arg(answerLen
 			).arg((len - 5) * sizeof(mtpPrime)));
@@ -133,7 +142,7 @@ gsl::span<const mtpPrime> AbstractConnection::parseNotSecureResponse(
 			).arg(Logs::mb(answer, len * sizeof(mtpPrime)).str()));
 		return {};
 	}
-	return gsl::make_span(answer + 5, answerLen);
+	return gsl::make_span(answer + 5, answerLen / sizeof(mtpPrime));
 }
 
 mtpBuffer AbstractConnection::preparePQFake(const MTPint128 &nonce) const {
@@ -158,7 +167,8 @@ std::optional<MTPResPQ> AbstractConnection::readPQFakeReply(
 AbstractConnection::AbstractConnection(
 	QThread *thread,
 	const ProxyData &proxy)
-: _proxy(proxy) {
+: _proxy(proxy)
+, _debugId(QString::number(++GlobalConnectionCounter)) {
 	moveToThread(thread);
 }
 
@@ -188,8 +198,26 @@ ConnectionPointer AbstractConnection::Create(
 	return result;
 }
 
+QString AbstractConnection::ProtocolDcDebugId(int16 protocolDcId) {
+	const auto postfix = (protocolDcId < 0) ? "_media" : "";
+	protocolDcId = (protocolDcId < 0) ? (-protocolDcId) : protocolDcId;
+	const auto prefix = (protocolDcId > kTestModeDcIdShift) ? "test_" : "";
+	protocolDcId = (protocolDcId > kTestModeDcIdShift)
+		? (protocolDcId - kTestModeDcIdShift)
+		: protocolDcId;
+	return prefix + QString::number(protocolDcId) + postfix;
+}
+
+void AbstractConnection::logInfo(const QString &message) {
+	DEBUG_LOG(("Connection %1 Info: ").arg(_debugId) + message);
+}
+
+void AbstractConnection::logError(const QString &message) {
+	DEBUG_LOG(("Connection %1 Error: ").arg(_debugId) + message);
+}
+
 uint32 AbstractConnection::extendedNotSecurePadding() const {
-	return uint32(openssl::RandomValue<uchar>() & 0x3F);
+	return uint32(base::RandomValue<uchar>() & 0x3F);
 }
 
 } // namespace details

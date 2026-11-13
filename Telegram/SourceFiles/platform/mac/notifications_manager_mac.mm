@@ -7,16 +7,28 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "platform/mac/notifications_manager_mac.h"
 
+#include "base/platform/base_platform_info.h"
+#include "base/options.h"
+#include "base/platform/mac/base_utilities_mac.h"
+#include "base/random.h"
+#include "base/unixtime.h"
 #include "core/application.h"
 #include "core/core_settings.h"
-#include "base/platform/base_platform_info.h"
-#include "platform/platform_specific.h"
-#include "base/platform/mac/base_utilities_mac.h"
-#include "base/openssl_help.h"
+#include "data/data_forum_topic.h"
+#include "data/data_peer.h"
+#include "data/data_saved_sublist.h"
+#include "history/history_item.h"
 #include "history/history.h"
-#include "ui/empty_userpic.h"
+#include "lang/lang_cloud_manager.h"
+#include "lang/lang_instance.h"
+#include "lang/lang_keys.h"
 #include "main/main_session.h"
 #include "mainwindow.h"
+#include "platform/mac/notifications_manager_mac_tokens.h"
+#include "platform/mac/notifications_manager_mac_un.h"
+#include "platform/platform_specific.h"
+#include "ui/empty_userpic.h"
+#include "window/notifications_utilities.h"
 #include "styles/style_window.h"
 
 #include <thread>
@@ -24,17 +36,40 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 namespace {
 
-static constexpr auto kQuerySettingsEachMs = 1000;
-auto DoNotDisturbEnabled = false;
-auto LastSettingsQueryMs = 0;
+constexpr auto kQuerySettingsEachMs = crl::time(1000);
+constexpr auto kCacheExpirationWeeks = 5;
+constexpr auto kCacheExpirationSeconds = kCacheExpirationWeeks * 7 * 24 * 60 * 60;
+
+NSString *const kTelegramMarkAsReadText = @"TelegramMarkAsReadText";
+NSString *const kTelegramMarkAsReadTimestamp = @"TelegramMarkAsReadTimestamp";
+NSString *const kTelegramMarkAsReadLanguageCode = @"TelegramMarkAsReadLanguageCode";
+
+crl::time LastSettingsQueryMs/* = 0*/;
+bool DoNotDisturbEnabled/* = false*/;
+
+[[nodiscard]] bool ShouldQuerySettings() {
+	const auto now = crl::now();
+	if (LastSettingsQueryMs > 0 && now <= LastSettingsQueryMs + kQuerySettingsEachMs) {
+		return false;
+	}
+	LastSettingsQueryMs = now;
+	return true;
+}
+
+[[nodiscard]] QString LibraryPath() {
+	static const auto result = [] {
+		NSURL *url = [[NSFileManager defaultManager] URLForDirectory:NSLibraryDirectory inDomain:NSUserDomainMask appropriateForURL:nil create:NO error:nil];
+		return url
+			? QString::fromUtf8([[url path] fileSystemRepresentation])
+			: QString();
+	}();
+	return result;
+}
 
 void queryDoNotDisturbState() {
-	auto ms = crl::now();
-	if (LastSettingsQueryMs > 0 && ms <= LastSettingsQueryMs + kQuerySettingsEachMs) {
+	if (!ShouldQuerySettings()) {
 		return;
 	}
-	LastSettingsQueryMs = ms;
-
 	Boolean isKeyValid;
 	const auto doNotDisturb = CFPreferencesGetAppBooleanValue(
 		CFSTR("doNotDisturb"),
@@ -46,13 +81,14 @@ void queryDoNotDisturbState() {
 }
 
 using Manager = Platform::Notifications::Manager;
+using NotificationTokens = Platform::Notifications::NotificationTokens;
 
 } // namespace
 
 @interface NotificationDelegate : NSObject<NSUserNotificationCenterDelegate> {
 }
 
-- (id) initWithManager:(base::weak_ptr<Manager>)manager managerId:(uint64)managerId;
+- (id) initWithManager:(base::weak_ptr<Manager>)manager managerId:(uint64)managerId tokens:(const NotificationTokens*)tokens;
 - (void) userNotificationCenter:(NSUserNotificationCenter*)center didActivateNotification:(NSUserNotification*)notification;
 - (BOOL) userNotificationCenter:(NSUserNotificationCenter*)center shouldPresentNotification:(NSUserNotification*)notification;
 
@@ -61,21 +97,23 @@ using Manager = Platform::Notifications::Manager;
 @implementation NotificationDelegate {
 	base::weak_ptr<Manager> _manager;
 	uint64 _managerId;
+	const NotificationTokens *_tokens;
 
 }
 
-- (id) initWithManager:(base::weak_ptr<Manager>)manager managerId:(uint64)managerId {
+- (id) initWithManager:(base::weak_ptr<Manager>)manager managerId:(uint64)managerId tokens:(const NotificationTokens*)tokens {
 	if (self = [super init]) {
 		_manager = manager;
 		_managerId = managerId;
+		_tokens = tokens;
 	}
 	return self;
 }
 
 - (void) userNotificationCenter:(NSUserNotificationCenter *)center didActivateNotification:(NSUserNotification *)notification {
 	NSDictionary *notificationUserInfo = [notification userInfo];
-	NSNumber *managerIdObject = [notificationUserInfo objectForKey:@"manager"];
-	auto notificationManagerId = managerIdObject ? [managerIdObject unsignedLongLongValue] : 0ULL;
+	const auto notificationManagerId
+		= Platform::Notifications::NotificationManagerId(notificationUserInfo);
 	DEBUG_LOG(("Received notification with instance %1, mine: %2").arg(notificationManagerId).arg(_managerId));
 	if (notificationManagerId != _managerId) { // other app instance notification
 		crl::on_main([] {
@@ -93,40 +131,46 @@ using Manager = Platform::Notifications::Manager;
 		return;
 	}
 
-	NSNumber *sessionObject = [notificationUserInfo objectForKey:@"session"];
-	const auto notificationSessionId = sessionObject ? [sessionObject unsignedLongLongValue] : 0;
-	if (!notificationSessionId) {
-		LOG(("App Error: A notification with unknown session was received"));
+	const auto token
+		= Platform::Notifications::NotificationToken(notificationUserInfo);
+	if (!token) {
+		LOG(("App Error: A notification with unknown token was received"));
 		return;
 	}
-	NSNumber *peerObject = [notificationUserInfo objectForKey:@"peer"];
-	const auto notificationPeerId = peerObject ? [peerObject unsignedLongLongValue] : 0ULL;
-	if (!notificationPeerId) {
-		LOG(("App Error: A notification with unknown peer was received"));
-		return;
-	}
-
-	NSNumber *msgObject = [notificationUserInfo objectForKey:@"msgid"];
-	const auto notificationMsgId = msgObject ? [msgObject intValue] : 0;
-
-	const auto my = Window::Notifications::Manager::NotificationId{
-		.full = Manager::FullPeer{
-			.sessionId = notificationSessionId,
-			.peerId = PeerId(notificationPeerId)
-		},
-		.msgId = notificationMsgId
-	};
+	const auto manager = _manager;
+	const auto tokens = _tokens;
 	if (notification.activationType == NSUserNotificationActivationTypeReplied) {
 		const auto notificationReply = QString::fromUtf8([[[notification response] string] UTF8String]);
-		const auto manager = _manager;
 		crl::on_main(manager, [=] {
-			manager->notificationReplied(my, { notificationReply, {} });
+			if (const auto my = tokens->lookup(token)) {
+				manager->notificationReplied(*my, { notificationReply, {} });
+			}
 		});
 	} else if (notification.activationType == NSUserNotificationActivationTypeContentsClicked) {
-		const auto manager = _manager;
 		crl::on_main(manager, [=] {
-			manager->notificationActivated(my);
+			if (const auto my = tokens->lookup(token)) {
+				manager->notificationActivated(*my);
+			}
 		});
+	}
+	if (notification.activationType == NSUserNotificationActivationTypeAdditionalActionClicked
+		|| notification.activationType == NSUserNotificationActivationTypeActionButtonClicked) {
+		NSString *actionId = nil;
+		if (notification.activationType == NSUserNotificationActivationTypeAdditionalActionClicked
+			&& [notification respondsToSelector:@selector(additionalActivationAction)]) {
+			actionId = notification.additionalActivationAction.identifier;
+		}
+		if (!actionId) {
+			actionId = [notificationUserInfo objectForKey:@"actionId"];
+		}
+		if (actionId) {
+			const auto actionStr = QString::fromNSString(actionId);
+			crl::on_main(manager, [=] {
+				if (const auto my = tokens->lookup(token)) {
+					manager->notificationActionActivated(*my, actionStr);
+				}
+			});
+		}
 	}
 
 	[center removeDeliveredNotification: notification];
@@ -141,16 +185,20 @@ using Manager = Platform::Notifications::Manager;
 namespace Platform {
 namespace Notifications {
 
-bool SkipAudioForCustom() {
-	return false;
-}
-
 bool SkipToastForCustom() {
 	return false;
 }
 
-bool SkipFlashBounceForCustom() {
-	return false;
+void MaybePlaySoundForCustom(Fn<void()> playSound) {
+	playSound();
+}
+
+void MaybeFlashBounceForCustom(Fn<void()> flashBounce) {
+	flashBounce();
+}
+
+bool WaitForInputForCustom() {
+	return true;
 }
 
 bool Supported() {
@@ -165,12 +213,18 @@ bool ByDefault() {
 	return Supported();
 }
 
+bool VolumeSupported() {
+	return false;
+}
+
 void Create(Window::Notifications::System *system) {
-	if (Supported()) {
-		system->setManager(std::make_unique<Manager>(system));
-	} else {
-		system->setManager(nullptr);
+	if (UseUNManager()) {
+		system->setManager([=] {
+			return std::make_unique<UNManager>(system);
+		});
+		return;
 	}
+	system->setManager([=] { return std::make_unique<Manager>(system); });
 }
 
 class Manager::Private : public QObject {
@@ -178,15 +232,12 @@ public:
 	Private(Manager *manager);
 
 	void showNotification(
-		not_null<PeerData*> peer,
-		std::shared_ptr<Data::CloudImageView> &userpicView,
-		MsgId msgId,
-		const QString &title,
-		const QString &subtitle,
-		const QString &msg,
-		bool hideNameAndPhoto,
-		bool hideReplyButton);
+		NotificationInfo &&info,
+		Ui::PeerUserpicView &userpicView);
 	void clearAll();
+	void clearFromItem(not_null<HistoryItem*> item);
+	void clearFromTopic(not_null<Data::ForumTopic*> topic);
+	void clearFromSublist(not_null<Data::SavedSublist*> sublist);
 	void clearFromHistory(not_null<History*> history);
 	void clearFromSession(not_null<Main::Session*> session);
 	void updateDelegate();
@@ -196,90 +247,163 @@ public:
 private:
 	template <typename Task>
 	void putClearTask(Task task);
+	void clearTokens(base::flat_set<uint64> tokens);
 
 	void clearingThreadLoop();
+	void initCachedMarkAsReadText();
 
 	const uint64 _managerId = 0;
 	QString _managerIdString;
 
+	NotificationTokens _tokens;
 	NotificationDelegate *_delegate = nullptr;
 
 	std::thread _clearingThread;
 	std::mutex _clearingMutex;
 	std::condition_variable _clearingCondition;
 
-	struct ClearFromHistory {
-		FullPeer fullPeer;
-	};
-	struct ClearFromSession {
-		uint64 sessionId = 0;
+	struct ClearTokens {
+		base::flat_set<uint64> tokens;
 	};
 	struct ClearAll {
 	};
 	struct ClearFinish {
 	};
-	using ClearTask = std::variant<
-		ClearFromHistory,
-		ClearFromSession,
-		ClearAll,
-		ClearFinish>;
+	using ClearTask = std::variant<ClearTokens, ClearAll, ClearFinish>;
 	std::vector<ClearTask> _clearingTasks;
+
+	Media::Audio::LocalDiskCache _sounds;
+	NSString *_cachedMarkAsReadText = nil;
 
 	rpl::lifetime _lifetime;
 
 };
 
+[[nodiscard]] QString ResolveSoundsFolder() {
+	NSArray *paths = NSSearchPathForDirectoriesInDomains(
+		NSLibraryDirectory,
+		NSUserDomainMask,
+		YES);
+	NSString *library = [paths firstObject];
+	NSString *sounds = [library stringByAppendingPathComponent : @"Sounds"];
+	return NS2QString(sounds);
+}
+
+void AddActionIdToNotification(
+		NSUserNotification *notification,
+		NSString *actionId) {
+	NSMutableDictionary *mutableUserInfo
+		= [[notification userInfo] mutableCopy];
+	[mutableUserInfo setObject:actionId forKey:@"actionId"];
+	[notification setUserInfo:mutableUserInfo];
+	[mutableUserInfo release];
+}
+
 Manager::Private::Private(Manager *manager)
-: _managerId(openssl::RandomValue<uint64>())
+: _managerId(base::RandomValue<uint64>())
 , _managerIdString(QString::number(_managerId))
-, _delegate([[NotificationDelegate alloc] initWithManager:manager managerId:_managerId]) {
+, _delegate([[NotificationDelegate alloc]
+	initWithManager:manager
+	managerId:_managerId
+	tokens:&_tokens])
+, _sounds(ResolveSoundsFolder()) {
 	Core::App().settings().workModeValue(
-	) | rpl::start_with_next([=](Core::Settings::WorkMode mode) {
+	) | rpl::on_next([=](Core::Settings::WorkMode mode) {
 		// We need to update the delegate _after_ the tray icon change was done in Qt.
 		// Because Qt resets the delegate.
 		crl::on_main(this, [=] {
 			updateDelegate();
 		});
 	}, _lifetime);
+
+	initCachedMarkAsReadText();
 }
 
 void Manager::Private::showNotification(
-		not_null<PeerData*> peer,
-		std::shared_ptr<Data::CloudImageView> &userpicView,
-		MsgId msgId,
-		const QString &title,
-		const QString &subtitle,
-		const QString &msg,
-		bool hideNameAndPhoto,
-		bool hideReplyButton) {
+		NotificationInfo &&info,
+		Ui::PeerUserpicView &userpicView) {
 	@autoreleasepool {
 
+	const auto peer = info.peer;
+	const auto token = _tokens.add({
+		.contextId = {
+			.sessionId = peer->session().uniqueId(),
+			.peerId = peer->id,
+			.topicRootId = info.topicRootId,
+			.monoforumPeerId = info.monoforumPeerId,
+		},
+		.msgId = info.itemId,
+	});
 	NSUserNotification *notification = [[[NSUserNotification alloc] init] autorelease];
 	if ([notification respondsToSelector:@selector(setIdentifier:)]) {
-		auto identifier = _managerIdString + '_' + QString::number(peer->id.value) + '_' + QString::number(msgId);
+		auto identifier = _managerIdString + '_' + QString::number(token);
 		auto identifierValue = Q2NSString(identifier);
 		[notification setIdentifier:identifierValue];
 	}
-	[notification setUserInfo:[NSDictionary dictionaryWithObjectsAndKeys:[NSNumber numberWithUnsignedLongLong:peer->session().uniqueId()],@"session",[NSNumber numberWithUnsignedLongLong:peer->id.value],@"peer",[NSNumber numberWithInt:msgId],@"msgid",[NSNumber numberWithUnsignedLongLong:_managerId],@"manager",nil]];
+	[notification setUserInfo:NotificationUserInfo(_managerId, token)];
 
-	[notification setTitle:Q2NSString(title)];
-	[notification setSubtitle:Q2NSString(subtitle)];
-	[notification setInformativeText:Q2NSString(msg)];
-	if (!hideNameAndPhoto && [notification respondsToSelector:@selector(setContentImage:)]) {
-		auto userpic = peer->isSelf()
-			? Ui::EmptyUserpic::GenerateSavedMessages(st::notifyMacPhotoSize)
-			: peer->isRepliesChat()
-			? Ui::EmptyUserpic::GenerateRepliesMessages(st::notifyMacPhotoSize)
-			: peer->genUserpic(userpicView, st::notifyMacPhotoSize);
-		NSImage *img = Q2NSImage(userpic.toImage());
+	[notification setTitle:Q2NSString(info.title)];
+	[notification setSubtitle:Q2NSString(info.subtitle)];
+	[notification setInformativeText:Q2NSString(info.message)];
+	if (!info.options.hideNameAndPhoto
+		&& [notification respondsToSelector:@selector(setContentImage:)]) {
+		NSImage *img = Q2NSImage(
+			Window::Notifications::GenerateUserpic(peer, userpicView));
 		[notification setContentImage:img];
 	}
 
-	if (!hideReplyButton && [notification respondsToSelector:@selector(setHasReplyButton:)]) {
+	if (!info.actions.empty()
+		&& [notification respondsToSelector:@selector(setAdditionalActions:)]) {
+		NSMutableArray *actions = [NSMutableArray array];
+		if (!info.options.hideMarkAsRead) {
+			[actions addObject:[NSUserNotificationAction
+				actionWithIdentifier:@"markAsRead"
+				title:_cachedMarkAsReadText]];
+		}
+		for (const auto &action : info.actions) {
+			[actions addObject:[NSUserNotificationAction
+				actionWithIdentifier:Q2NSString(action.id)
+				title:Q2NSString(action.text)]];
+		}
+		if (!info.options.hideReplyButton
+			&& [notification respondsToSelector:@selector(setHasReplyButton:)]) {
+			[notification setHasReplyButton:YES];
+		}
+		[notification setAdditionalActions:actions];
+		AddActionIdToNotification(
+			notification,
+			[[actions firstObject] identifier]);
+	} else if (!info.options.hideReplyButton
+		&& !info.options.hideMarkAsRead
+		&& [notification respondsToSelector:@selector(setHasReplyButton:)]
+		&& [notification respondsToSelector:@selector(setAdditionalActions:)]) {
 		[notification setHasReplyButton:YES];
+
+		AddActionIdToNotification(notification, @"markAsRead");
+
+		[notification setAdditionalActions:@[
+			[NSUserNotificationAction
+				actionWithIdentifier:@"markAsRead"
+				title:_cachedMarkAsReadText]
+		]];
+	} else if (!info.options.hideReplyButton
+		&& [notification respondsToSelector:@selector(setHasReplyButton:)]) {
+		[notification setHasReplyButton:YES];
+	} else if (!info.options.hideMarkAsRead
+		&& [notification respondsToSelector:@selector(setHasActionButton:)]) {
+		[notification setHasActionButton:YES];
+		[notification
+			setActionButtonTitle:_cachedMarkAsReadText];
+
+		AddActionIdToNotification(notification, @"markAsRead");
 	}
 
-	[notification setSoundName:nil];
+	const auto sound = info.sound ? info.sound() : Media::Audio::LocalSound();
+	if (sound) {
+		[notification setSoundName:Q2NSString(_sounds.name(sound))];
+	} else {
+		[notification setSoundName:nil];
+	}
 
 	NSUserNotificationCenter *center = [NSUserNotificationCenter defaultUserNotificationCenter];
 	[center deliverNotification:notification];
@@ -290,60 +414,45 @@ void Manager::Private::showNotification(
 void Manager::Private::clearingThreadLoop() {
 	auto finished = false;
 	while (!finished) {
-		auto clearAll = false;
-		auto clearFromPeers = base::flat_set<FullPeer>();
-		auto clearFromSessions = base::flat_set<uint64>();
+		auto tasks = std::vector<ClearTask>();
 		{
 			std::unique_lock<std::mutex> lock(_clearingMutex);
 			while (_clearingTasks.empty()) {
 				_clearingCondition.wait(lock);
 			}
-			for (auto &task : _clearingTasks) {
-				v::match(task, [&](ClearFinish) {
-					finished = true;
-					clearAll = true;
-				}, [&](ClearAll) {
-					clearAll = true;
-				}, [&](const ClearFromHistory &value) {
-					clearFromPeers.emplace(value.fullPeer);
-				}, [&](const ClearFromSession &value) {
-					clearFromSessions.emplace(value.sessionId);
-				});
-			}
-			_clearingTasks.clear();
+			tasks = base::take(_clearingTasks);
 		}
+		auto clearAll = false;
+		auto selected = std::vector<uint64>();
+		for (const auto &task : tasks) {
+			v::match(task, [&](ClearFinish) {
+				finished = true;
+				clearAll = true;
+			}, [&](ClearAll) {
+				clearAll = true;
+			}, [&](const ClearTokens &value) {
+				selected.insert(
+					selected.end(),
+					value.tokens.begin(),
+					value.tokens.end());
+			});
+		}
+		const auto tokens = base::flat_set<uint64>(
+			selected.begin(),
+			selected.end());
 
 		@autoreleasepool {
-
-		auto clearBySpecial = [&](NSDictionary *notificationUserInfo) {
-			NSNumber *sessionObject = [notificationUserInfo objectForKey:@"session"];
-			const auto notificationSessionId = sessionObject ? [sessionObject unsignedLongLongValue] : 0;
-			if (!notificationSessionId) {
-				return true;
-			}
-			if (NSNumber *peerObject = [notificationUserInfo objectForKey:@"peer"]) {
-				const auto notificationPeerId = [peerObject unsignedLongLongValue];
-				if (notificationPeerId) {
-					return clearFromSessions.contains(notificationSessionId)
-						|| clearFromPeers.contains(FullPeer{
-							.sessionId = notificationSessionId,
-							.peerId = PeerId(notificationPeerId)
-						});
-				}
-			}
-			return true;
-		};
 
 		NSUserNotificationCenter *center = [NSUserNotificationCenter defaultUserNotificationCenter];
 		NSArray *notificationsList = [center deliveredNotifications];
 		for (id notification in notificationsList) {
 			NSDictionary *notificationUserInfo = [notification userInfo];
-			NSNumber *managerIdObject = [notificationUserInfo objectForKey:@"manager"];
-			auto notificationManagerId = managerIdObject ? [managerIdObject unsignedLongLongValue] : 0ULL;
-			if (notificationManagerId == _managerId) {
-				if (clearAll || clearBySpecial(notificationUserInfo)) {
-					[center removeDeliveredNotification:notification];
-				}
+			if (NotificationManagerId(notificationUserInfo) != _managerId) {
+				continue;
+			}
+			const auto token = NotificationToken(notificationUserInfo);
+			if (clearAll || !token || tokens.contains(token)) {
+				[center removeDeliveredNotification:notification];
 			}
 		}
 
@@ -358,28 +467,111 @@ void Manager::Private::putClearTask(Task task) {
 	}
 
 	std::unique_lock<std::mutex> lock(_clearingMutex);
-	_clearingTasks.push_back(task);
+	_clearingTasks.push_back(std::move(task));
 	_clearingCondition.notify_one();
 }
 
+void Manager::Private::clearTokens(base::flat_set<uint64> tokens) {
+	if (!tokens.empty()) {
+		putClearTask(ClearTokens{ std::move(tokens) });
+	}
+}
+
 void Manager::Private::clearAll() {
+	_tokens.clear();
 	putClearTask(ClearAll());
 }
 
+void Manager::Private::clearFromItem(not_null<HistoryItem*> item) {
+	clearTokens(_tokens.takeFromItem({ ItemContextId(item), item->id }));
+}
+
+void Manager::Private::clearFromTopic(not_null<Data::ForumTopic*> topic) {
+	clearTokens(_tokens.takeFromContext({
+		.sessionId = topic->session().uniqueId(),
+		.peerId = topic->history()->peer->id,
+		.topicRootId = topic->rootId(),
+	}));
+}
+
+void Manager::Private::clearFromSublist(
+		not_null<Data::SavedSublist*> sublist) {
+	clearTokens(_tokens.takeFromContext(SublistContextId(sublist)));
+}
+
 void Manager::Private::clearFromHistory(not_null<History*> history) {
-	putClearTask(ClearFromHistory { FullPeer{
+	clearTokens(_tokens.takeFromHistory({
 		.sessionId = history->session().uniqueId(),
-		.peerId = history->peer->id
-	} });
+		.peerId = history->peer->id,
+	}));
 }
 
 void Manager::Private::clearFromSession(not_null<Main::Session*> session) {
-	putClearTask(ClearFromSession { session->uniqueId() });
+	clearTokens(_tokens.takeFromSession(session->uniqueId()));
 }
 
 void Manager::Private::updateDelegate() {
 	NSUserNotificationCenter *center = [NSUserNotificationCenter defaultUserNotificationCenter];
 	[center setDelegate:_delegate];
+}
+
+void Manager::Private::initCachedMarkAsReadText() {
+	const auto langId = Lang::GetInstance().id();
+
+	const auto preferredLang = [[NSLocale preferredLanguages] firstObject];
+	const auto languageCode
+		= [[NSLocale localeWithLocaleIdentifier:preferredLang] languageCode];
+
+	const auto defaults = [NSUserDefaults standardUserDefaults];
+	const auto cachedText = static_cast<NSString*>([defaults
+		stringForKey:kTelegramMarkAsReadText]);
+	const auto cachedTimestamp = static_cast<NSNumber*>([defaults
+		objectForKey:kTelegramMarkAsReadTimestamp]);
+	const auto cachedLanguageCode = static_cast<NSString*>([defaults
+		stringForKey:kTelegramMarkAsReadLanguageCode]);
+
+	const auto now = base::unixtime::now();
+	const auto shouldRefresh = !cachedTimestamp
+		|| (now - [cachedTimestamp longLongValue]) > kCacheExpirationSeconds
+		|| ![cachedLanguageCode isEqualToString:languageCode];
+
+	if (cachedText && !shouldRefresh) {
+		_cachedMarkAsReadText = [cachedText retain];
+	} else {
+		_cachedMarkAsReadText
+			= [Q2NSString(tr::lng_context_mark_read(tr::now)) retain];
+	}
+
+	if (langId == NS2QString(languageCode)) {
+		[defaults
+			setObject:Q2NSString(tr::lng_context_mark_read(tr::now))
+			forKey:kTelegramMarkAsReadText];
+		[defaults
+			setObject:@(base::unixtime::now())
+			forKey:kTelegramMarkAsReadTimestamp];
+		[defaults
+			setObject:languageCode
+			forKey:kTelegramMarkAsReadLanguageCode];
+	} else if (shouldRefresh) {
+		Lang::CurrentCloudManager().getValueForLang(
+			u"lng_context_mark_read"_q,
+			NS2QString(languageCode),
+			[=](const QString &r) {
+				if (r != NS2QString(_cachedMarkAsReadText)) {
+					[_cachedMarkAsReadText release];
+					_cachedMarkAsReadText = [Q2NSString(r) retain];
+				}
+				[defaults
+					setObject:Q2NSString(r)
+					forKey:kTelegramMarkAsReadText];
+				[defaults
+					setObject:@(base::unixtime::now())
+					forKey:kTelegramMarkAsReadTimestamp];
+				[defaults
+					setObject:languageCode
+					forKey:kTelegramMarkAsReadLanguageCode];
+			});
+	}
 }
 
 Manager::Private::~Private() {
@@ -390,6 +582,7 @@ Manager::Private::~Private() {
 	NSUserNotificationCenter *center = [NSUserNotificationCenter defaultUserNotificationCenter];
 	[center setDelegate:nil];
 	[_delegate release];
+	[_cachedMarkAsReadText release];
 }
 
 Manager::Manager(Window::Notifications::System *system) : NativeManager(system)
@@ -399,27 +592,25 @@ Manager::Manager(Window::Notifications::System *system) : NativeManager(system)
 Manager::~Manager() = default;
 
 void Manager::doShowNativeNotification(
-		not_null<PeerData*> peer,
-		std::shared_ptr<Data::CloudImageView> &userpicView,
-		MsgId msgId,
-		const QString &title,
-		const QString &subtitle,
-		const QString &msg,
-		bool hideNameAndPhoto,
-		bool hideReplyButton) {
-	_private->showNotification(
-		peer,
-		userpicView,
-		msgId,
-		title,
-		subtitle,
-		msg,
-		hideNameAndPhoto,
-		hideReplyButton);
+		NotificationInfo &&info,
+		Ui::PeerUserpicView &userpicView) {
+	_private->showNotification(std::move(info), userpicView);
 }
 
 void Manager::doClearAllFast() {
 	_private->clearAll();
+}
+
+void Manager::doClearFromItem(not_null<HistoryItem*> item) {
+	_private->clearFromItem(item);
+}
+
+void Manager::doClearFromTopic(not_null<Data::ForumTopic*> topic) {
+	_private->clearFromTopic(topic);
+}
+
+void Manager::doClearFromSublist(not_null<Data::SavedSublist*> sublist) {
+	_private->clearFromSublist(sublist);
 }
 
 void Manager::doClearFromHistory(not_null<History*> history) {
@@ -434,17 +625,16 @@ QString Manager::accountNameSeparator() {
 	return QString::fromUtf8(" \xE2\x86\x92 ");
 }
 
-bool Manager::doSkipAudio() const {
-	queryDoNotDisturbState();
-	return DoNotDisturbEnabled;
-}
-
 bool Manager::doSkipToast() const {
 	return false;
 }
 
-bool Manager::doSkipFlashBounce() const {
-	return doSkipAudio();
+void Manager::doMaybePlaySound(Fn<void()> playSound) {
+	playSound();
+}
+
+void Manager::doMaybeFlashBounce(Fn<void()> flashBounce) {
+	flashBounce();
 }
 
 } // namespace Notifications

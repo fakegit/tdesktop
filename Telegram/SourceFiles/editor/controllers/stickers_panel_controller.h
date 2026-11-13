@@ -11,15 +11,12 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 namespace ChatHelpers {
 class TabbedPanel;
+class Show;
 } // namespace ChatHelpers
 
 namespace Ui {
 class RpWidget;
 } // namespace Ui
-
-namespace Window {
-class SessionController;
-} // namespace Window
 
 namespace Editor {
 
@@ -34,10 +31,14 @@ public:
 
 	StickersPanelController(
 		not_null<Ui::RpWidget*> panelContainer,
-		not_null<Window::SessionController*> controller);
+		std::shared_ptr<ChatHelpers::Show> show,
+		bool withAudio);
 
 	[[nodiscard]] auto stickerChosen() const
 	-> rpl::producer<not_null<DocumentData*>>;
+	[[nodiscard]] rpl::producer<> photoRequests() const;
+	[[nodiscard]] rpl::producer<> audioRequests() const;
+	[[nodiscard]] rpl::producer<> linkRequests() const;
 	[[nodiscard]] rpl::producer<bool> panelShown() const;
 
 	void setShowRequestChanges(rpl::producer<ShowRequest> &&showRequest);

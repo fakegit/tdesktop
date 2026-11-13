@@ -12,9 +12,9 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "window/themes/window_theme_preview.h"
 #include "window/themes/window_themes_generate_name.h"
 #include "window/window_controller.h"
-#include "boxes/confirm_box.h"
+#include "ui/boxes/confirm_box.h"
 #include "ui/text/text_utilities.h"
-#include "ui/widgets/input_fields.h"
+#include "ui/widgets/fields/input_field.h"
 #include "ui/widgets/checkbox.h"
 #include "ui/widgets/buttons.h"
 #include "ui/widgets/labels.h"
@@ -22,7 +22,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "ui/toast/toast.h"
 #include "ui/text/format_values.h"
 #include "ui/style/style_palette_colorizer.h"
-#include "ui/special_fields.h"
+#include "ui/widgets/fields/special_fields.h"
+#include "ui/painter.h"
 #include "ui/ui_utility.h"
 #include "main/main_account.h"
 #include "main/main_session.h"
@@ -34,7 +35,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "base/base_file_utilities.h"
 #include "base/zlib_help.h"
 #include "base/unixtime.h"
-#include "base/openssl_help.h"
+#include "base/random.h"
 #include "data/data_session.h"
 #include "data/data_document.h"
 #include "data/data_cloud_themes.h"
@@ -43,7 +44,6 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "apiwrap.h"
 #include "styles/style_widgets.h"
 #include "styles/style_window.h"
-#include "styles/style_settings.h"
 #include "styles/style_layers.h"
 #include "styles/style_boxes.h"
 
@@ -72,6 +72,7 @@ public:
 
 	[[nodiscard]] ParsedTheme result() const;
 	[[nodiscard]] QImage image() const;
+	[[nodiscard]] bool chosen() const;
 
 	int resizeGetHeight(int newWidth) override;
 
@@ -90,6 +91,7 @@ private:
 	QString _imageText;
 	int _thumbnailSize = 0;
 	QPixmap _thumbnail;
+	bool _chosen = false;
 
 };
 
@@ -156,22 +158,22 @@ int BackgroundSelector::resizeGetHeight(int newWidth) {
 void BackgroundSelector::updateThumbnail() {
 	const auto size = _thumbnailSize;
 	auto back = QImage(
-		QSize(size, size) * cIntRetinaFactor(),
+		QSize(size, size) * style::DevicePixelRatio(),
 		QImage::Format_ARGB32_Premultiplied);
-	back.setDevicePixelRatio(cRetinaFactor());
+	back.setDevicePixelRatio(style::DevicePixelRatio());
 	{
 		Painter p(&back);
 		PainterHighQualityEnabler hq(p);
 
-		auto &pix = _background;
+		const auto &pix = _background;
 		int sx = (pix.width() > pix.height()) ? ((pix.width() - pix.height()) / 2) : 0;
 		int sy = (pix.height() > pix.width()) ? ((pix.height() - pix.width()) / 2) : 0;
 		int s = (pix.width() > pix.height()) ? pix.height() : pix.width();
 		p.drawImage(QRect(0, 0, size, size), pix, QRect(sx, sy, s, s));
 	}
-	Images::prepareRound(back, ImageRoundRadius::Small);
-	_thumbnail = Ui::PixmapFromImage(std::move(back));
-	_thumbnail.setDevicePixelRatio(cRetinaFactor());
+	_thumbnail = Ui::PixmapFromImage(
+		Images::Round(std::move(back), ImageRoundRadius::Small));
+	_thumbnail.setDevicePixelRatio(style::DevicePixelRatio());
 	update();
 }
 
@@ -191,6 +193,7 @@ void BackgroundSelector::chooseBackgroundFromFile() {
 				&& (read.format == "jpeg"
 					|| read.format == "jpg"
 					|| read.format == "png")) {
+				_chosen = true;
 				_background = std::move(read.image);
 				_parsed.background = content;
 				_parsed.isPng = (read.format == "png");
@@ -223,6 +226,39 @@ QImage BackgroundSelector::image() const {
 	return _background;
 }
 
+bool BackgroundSelector::chosen() const {
+	return _chosen;
+}
+
+[[nodiscard]] MTPVector<MTPInputThemeSettings> PrepareThemeSettings(
+		not_null<Main::Session*> session) {
+	const auto paper = Background()->paper();
+	if (!Data::IsCloudWallPaper(paper) || paper.isLocal()) {
+		return MTPVector<MTPInputThemeSettings>();
+	}
+	const auto serialize = [](const QColor &color) {
+		return int(((uint32(color.red()) & 0xFFU) << 16)
+			| ((uint32(color.green()) & 0xFFU) << 8)
+			| (uint32(color.blue()) & 0xFFU));
+	};
+	using Flag = MTPDinputThemeSettings::Flag;
+	const auto dark = IsNightMode();
+	return MTP_vector<MTPInputThemeSettings>(
+		QVector<MTPInputThemeSettings>{
+			MTP_inputThemeSettings(
+			MTP_flags(Flag::f_message_colors
+				| Flag::f_wallpaper
+				| Flag::f_wallpaper_settings),
+			(dark ? MTP_baseThemeTinted() : MTP_baseThemeClassic()),
+			MTP_int(serialize(st::windowActiveTextFg->c)),
+			MTP_int(0),
+			MTP_vector<MTPint>(
+				QVector<MTPint>{ MTP_int(serialize(st::msgOutBg->c)) }),
+			paper.mtpInput(session),
+			paper.mtpSettings()),
+		});
+}
+
 bool PaletteChanged(
 		const QByteArray &editorPalette,
 		const QByteArray &originalPalette,
@@ -235,7 +271,7 @@ void ImportFromFile(
 		not_null<Main::Session*> session,
 		not_null<QWidget*> parent) {
 	auto filters = QStringList(
-		qsl("Theme files (*.tdesktop-theme *.tdesktop-palette)"));
+		u"Theme files (*.tdesktop-theme *.tdesktop-palette)"_q);
 	filters.push_back(FileDialog::AllFilesFilter());
 	const auto callback = crl::guard(session, [=](
 		const FileDialog::OpenResult &result) {
@@ -249,7 +285,7 @@ void ImportFromFile(
 	FileDialog::GetOpenPath(
 		parent.get(),
 		tr::lng_theme_editor_menu_import(tr::now),
-		filters.join(qsl(";;")),
+		filters.join(u";;"_q),
 		crl::guard(parent, callback));
 }
 
@@ -330,26 +366,6 @@ bool CopyColorsToPalette(
 	return true;
 }
 
-[[nodiscard]] QString GenerateSlug() {
-	const auto letters = uint8('Z' + 1 - 'A');
-	const auto digits = uint8('9' + 1 - '0');
-	const auto values = uint8(2 * letters + digits);
-
-	auto result = QString();
-	result.reserve(kRandomSlugSize);
-	for (auto i = 0; i != kRandomSlugSize; ++i) {
-		const auto value = openssl::RandomValue<uint8>() % values;
-		if (value < letters) {
-			result.append(char('A' + value));
-		} else if (value < 2 * letters) {
-			result.append(char('a' + (value - letters)));
-		} else {
-			result.append(char('0' + (value - 2 * letters)));
-		}
-	}
-	return result;
-}
-
 [[nodiscard]] QByteArray PackTheme(const ParsedTheme &parsed) {
 	zlib::FileToWrite zip;
 
@@ -405,7 +421,7 @@ bool CopyColorsToPalette(
 	});
 }
 
-SendMediaReady PrepareThemeMedia(
+std::shared_ptr<FilePrepareResult> PrepareThemeMedia(
 		MTP::DcId dcId,
 		const QString &name,
 		const QByteArray &content) {
@@ -423,61 +439,48 @@ SendMediaReady PrepareThemeMedia(
 		thumbnail.save(&buffer, "JPG", 87);
 	}
 
-	const auto push = [&](
-			const char *type,
-			QImage &&image,
-			QByteArray bytes = QByteArray()) {
-		sizes.push_back(MTP_photoSize(
-			MTP_string(type),
-			MTP_int(image.width()),
-			MTP_int(image.height()), MTP_int(0)));
-		thumbnails.emplace(type[0], PreparedPhotoThumb{
-			.image = std::move(image),
-			.bytes = std::move(bytes)
-		});
-	};
-	push("s", std::move(thumbnail), thumbnailBytes);
+	sizes.push_back(MTP_photoSize(
+		MTP_string("s"),
+		MTP_int(thumbnail.width()),
+		MTP_int(thumbnail.height()), MTP_int(0)));
 
+	const auto id = base::RandomValue<DocumentId>();
 	const auto filename = base::FileNameFromUserString(name)
-		+ qsl(".tdesktop-theme");
+		+ u".tdesktop-theme"_q;
 	auto attributes = QVector<MTPDocumentAttribute>(
 		1,
 		MTP_documentAttributeFilename(MTP_string(filename)));
-	const auto id = openssl::RandomValue<DocumentId>();
-	const auto document = MTP_document(
+
+	auto result = MakePreparedFile({
+		.id = id,
+		.type = SendMediaType::ThemeFile,
+	});
+	result->filename = filename;
+	result->content = content;
+	result->filesize = content.size();
+	result->thumb = thumbnail;
+	result->thumbname = "thumb.jpg";
+	result->setThumbData(thumbnailBytes);
+	result->document = MTP_document(
 		MTP_flags(0),
 		MTP_long(id),
 		MTP_long(0),
 		MTP_bytes(),
 		MTP_int(base::unixtime::now()),
 		MTP_string("application/x-tgtheme-tdesktop"),
-		MTP_int(content.size()),
+		MTP_long(content.size()),
 		MTP_vector<MTPPhotoSize>(sizes),
 		MTPVector<MTPVideoSize>(),
 		MTP_int(dcId),
 		MTP_vector<MTPDocumentAttribute>(attributes));
-
-	return SendMediaReady(
-		SendMediaType::ThemeFile,
-		QString(), // filepath
-		filename,
-		content.size(),
-		content,
-		id,
-		0,
-		QString(),
-		PeerId(),
-		MTP_photoEmpty(MTP_long(0)),
-		thumbnails,
-		document,
-		thumbnailBytes,
-		0);
+	return result;
 }
 
 Fn<void()> SavePreparedTheme(
 		not_null<Window::Controller*> window,
 		const ParsedTheme &parsed,
 		const QImage &background,
+		bool backgroundChosen,
 		const QByteArray &originalContent,
 		const ParsedTheme &originalParsed,
 		const Data::CloudTheme &fields,
@@ -485,7 +488,7 @@ Fn<void()> SavePreparedTheme(
 		Fn<void(SaveErrorType,QString)> fail) {
 	Expects(window->account().sessionExists());
 
-	using Storage::UploadedDocument;
+	using Storage::UploadedMedia;
 	struct State {
 		FullMsgId id;
 		bool generating = false;
@@ -499,7 +502,7 @@ Fn<void()> SavePreparedTheme(
 	const auto api = &session->api();
 	const auto state = std::make_shared<State>();
 	state->id = FullMsgId(
-		0,
+		session->userPeerId(),
 		session->data().nextLocalMessageId());
 
 	const auto creating = !fields.id
@@ -513,7 +516,7 @@ Fn<void()> SavePreparedTheme(
 		done();
 
 		const auto cloud = result.match([&](const MTPDtheme &data) {
-			const auto result = Data::CloudTheme::Parse(session, data);
+			const auto result = Data::CloudTheme::Parse(session, data, true);
 			session->data().cloudThemes().savedFromEditor(result);
 			return result;
 		});
@@ -530,14 +533,22 @@ Fn<void()> SavePreparedTheme(
 			background);
 	};
 
+	const auto themeSettings = backgroundChosen
+		? MTPVector<MTPInputThemeSettings>()
+		: PrepareThemeSettings(session);
+
 	const auto createTheme = [=](const MTPDocument &data) {
+		using Flag = MTPaccount_CreateTheme::Flag;
 		const auto document = session->data().processDocument(data);
 		state->requestId = api->request(MTPaccount_CreateTheme(
-			MTP_flags(MTPaccount_CreateTheme::Flag::f_document),
+			MTP_flags(Flag::f_document
+				| (themeSettings.v.isEmpty()
+					? Flag(0)
+					: Flag::f_settings)),
 			MTP_string(fields.slug),
 			MTP_string(fields.title),
 			document->mtpInput(),
-			MTPInputThemeSettings()
+			themeSettings
 		)).done([=](const MTPTheme &result) {
 			finish(result);
 		}).fail([=](const MTP::Error &error) {
@@ -552,7 +563,10 @@ Fn<void()> SavePreparedTheme(
 			| Flag::f_slug
 			| (data.type() == mtpc_documentEmpty
 				? Flag(0)
-				: Flag::f_document);
+				: Flag::f_document)
+			| (themeSettings.v.isEmpty()
+				? Flag(0)
+				: Flag::f_settings);
 		state->requestId = api->request(MTPaccount_UpdateTheme(
 			MTP_flags(flags),
 			MTP_string(Data::CloudThemes::Format()),
@@ -560,7 +574,7 @@ Fn<void()> SavePreparedTheme(
 			MTP_string(fields.slug),
 			MTP_string(fields.title),
 			document->mtpInput(),
-			MTPInputThemeSettings()
+			themeSettings
 		)).done([=](const MTPTheme &result) {
 			finish(result);
 		}).fail([=](const MTP::Error &error) {
@@ -568,11 +582,11 @@ Fn<void()> SavePreparedTheme(
 		}).send();
 	};
 
-	const auto uploadTheme = [=](const UploadedDocument &data) {
+	const auto uploadTheme = [=](const UploadedMedia &data) {
 		state->requestId = api->request(MTPaccount_UploadTheme(
 			MTP_flags(MTPaccount_UploadTheme::Flag::f_thumb),
-			data.file,
-			*data.thumb,
+			data.info.file,
+			*data.info.thumb,
 			MTP_string(state->filename),
 			MTP_string("application/x-tgtheme-tdesktop")
 		)).done([=](const MTPDocument &result) {
@@ -591,17 +605,17 @@ Fn<void()> SavePreparedTheme(
 			session->mainDcId(),
 			fields.title,
 			theme);
-		state->filename = media.filename;
+		state->filename = media->filename;
 		state->themeContent = theme;
 
 		session->uploader().documentReady(
-		) | rpl::filter([=](const UploadedDocument &data) {
-			return (data.fullId == state->id) && data.thumb.has_value();
-		}) | rpl::start_with_next([=](const UploadedDocument &data) {
+		) | rpl::filter([=](const UploadedMedia &data) {
+			return (data.fullId == state->id) && data.info.thumb.has_value();
+		}) | rpl::on_next([=](const UploadedMedia &data) {
 			uploadTheme(data);
 		}, state->lifetime);
 
-		session->uploader().uploadMedia(state->id, media);
+		session->uploader().upload(state->id, media);
 	};
 
 	const auto save = [=] {
@@ -627,11 +641,11 @@ Fn<void()> SavePreparedTheme(
 			MTP_string(fields.slug),
 			MTP_string(fields.title),
 			MTP_inputDocumentEmpty(),
-			MTPInputThemeSettings()
+			MTPVector<MTPInputThemeSettings>()
 		)).done([=](const MTPTheme &result) {
 			save();
 		}).fail([=](const MTP::Error &error) {
-			if (error.type() == qstr("THEME_FILE_INVALID")) {
+			if (error.type() == u"THEME_FILE_INVALID"_q) {
 				save();
 			} else {
 				fail(SaveErrorType::Other, error.type());
@@ -675,7 +689,7 @@ void StartEditor(
 		? GenerateDefaultPalette()
 		: ParseTheme(object, true).palette;
 	if (palette.isEmpty() || !CopyColorsToPalette(path, palette, cloud)) {
-		window->show(Box<InformBox>(tr::lng_theme_editor_error(tr::now)));
+		window->show(Ui::MakeInformBox(tr::lng_theme_editor_error()));
 		return;
 	}
 	if (Core::App().settings().systemDarkModeEnabled()) {
@@ -699,8 +713,8 @@ void CreateForExistingBox(
 	const auto amCreator = window->account().sessionExists()
 		&& (window->account().session().userId() == cloud.createdBy);
 	box->setTitle(amCreator
-		? (rpl::single(cloud.title) | Ui::Text::ToWithEntities())
-		: tr::lng_theme_editor_create_title(Ui::Text::WithEntities));
+		? (rpl::single(cloud.title) | rpl::map(tr::marked))
+		: tr::lng_theme_editor_create_title(tr::marked));
 
 	box->addRow(object_ptr<Ui::FlatLabel>(
 		box,
@@ -712,7 +726,7 @@ void CreateForExistingBox(
 	box->addRow(
 		object_ptr<Ui::SettingsButton>(
 			box,
-			tr::lng_theme_editor_import_existing() | Ui::Text::ToUpper(),
+			tr::lng_theme_editor_import_existing(),
 			st::createThemeImportButton),
 		style::margins(
 			0,
@@ -757,13 +771,12 @@ void SaveTheme(
 	if (cloud.id) {
 		window->account().session().api().request(MTPaccount_GetTheme(
 			MTP_string(Data::CloudThemes::Format()),
-			MTP_inputTheme(MTP_long(cloud.id), MTP_long(cloud.accessHash)),
-			MTP_long(0)
+			MTP_inputTheme(MTP_long(cloud.id), MTP_long(cloud.accessHash))
 		)).done([=](const MTPTheme &result) {
 			result.match([&](const MTPDtheme &data) {
 				save(CloudTheme::Parse(&window->account().session(), data));
 			});
-		}).fail([=](const MTP::Error &error) {
+		}).fail([=] {
 			save(CloudTheme());
 		}).send();
 	} else {
@@ -825,7 +838,7 @@ void SaveThemeBox(
 		? GenerateName(collected.accent)
 		: cloud.title;
 
-	box->setTitle(tr::lng_theme_editor_save_title(Ui::Text::WithEntities));
+	box->setTitle(tr::lng_theme_editor_save_title(tr::marked));
 
 	const auto name = box->addRow(object_ptr<Ui::InputField>(
 		box,
@@ -842,20 +855,20 @@ void SaveThemeBox(
 	const auto link = Ui::CreateChild<Ui::UsernameInput>(
 		linkWrap,
 		st::createThemeLink,
-		rpl::single(qsl("link")),
+		rpl::single(u"link"_q),
 		cloud.slug.isEmpty() ? GenerateSlug() : cloud.slug,
 		window->account().session().createInternalLink(QString()));
 	linkWrap->widthValue(
-	) | rpl::start_with_next([=](int width) {
+	) | rpl::on_next([=](int width) {
 		link->resize(width, link->height());
 		link->moveToLeft(0, 0, width);
 	}, link->lifetime());
 	link->heightValue(
-	) | rpl::start_with_next([=](int height) {
+	) | rpl::on_next([=](int height) {
 		linkWrap->resize(linkWrap->width(), height);
 	}, link->lifetime());
 	link->setLinkPlaceholder(
-		window->account().session().createInternalLink(qsl("addtheme/")));
+		window->account().session().createInternalLink(u"addtheme/"_q));
 	link->setPlaceholderHidden(false);
 	link->setMaxLength(kMaxSlugSize);
 
@@ -874,8 +887,8 @@ void SaveThemeBox(
 		object_ptr<Ui::FlatLabel>(
 			box,
 			tr::lng_theme_editor_background_image(),
-			st::settingsSubsectionTitle),
-		st::settingsSubsectionTitlePadding);
+			st::defaultSubsectionTitle),
+		st::defaultSubsectionTitlePadding);
 	const auto back = box->addRow(
 		object_ptr<BackgroundSelector>(
 			box,
@@ -907,16 +920,16 @@ void SaveThemeBox(
 				const QString &error) {
 			*saving = false;
 			box->showLoading(false);
-			if (error == qstr("THEME_TITLE_INVALID")) {
+			if (error == u"THEME_TITLE_INVALID"_q) {
 				type = SaveErrorType::Name;
-			} else if (error == qstr("THEME_SLUG_INVALID")) {
+			} else if (error == u"THEME_SLUG_INVALID"_q) {
 				type = SaveErrorType::Link;
-			} else if (error == qstr("THEME_SLUG_OCCUPIED")) {
-				Ui::Toast::Show(
+			} else if (error == u"THEME_SLUG_OCCUPIED"_q) {
+				box->showToast(
 					tr::lng_create_channel_link_occupied(tr::now));
 				type = SaveErrorType::Link;
 			} else if (!error.isEmpty()) {
-				Ui::Toast::Show(error);
+				box->showToast(error);
 			}
 			if (type == SaveErrorType::Name) {
 				name->showError();
@@ -941,6 +954,7 @@ void SaveThemeBox(
 			window,
 			back->result(),
 			back->image(),
+			back->chosen(),
 			collected.originalContent,
 			collected.originalParsed,
 			fields,
@@ -1016,6 +1030,29 @@ ParsedTheme ParseTheme(
 		return raw.background.isEmpty() ? ParsedTheme() : result();
 	}
 	return result();
+}
+
+[[nodiscard]] QString GenerateSlug() {
+	const auto letters = uint8('Z' + 1 - 'A');
+	const auto digits = uint8('9' + 1 - '0');
+	const auto firstValues = uint8(2 * letters);
+	const auto values = uint8(2 * letters + digits);
+
+	auto result = QString();
+	result.reserve(kRandomSlugSize);
+	for (auto i = 0; i != kRandomSlugSize; ++i) {
+		const auto value = i
+			? (base::RandomValue<uint8>() % values)
+			: (base::RandomValue<uint8>() % firstValues);
+		if (value < letters) {
+			result.append(char('A' + value));
+		} else if (value < 2 * letters) {
+			result.append(char('a' + (value - letters)));
+		} else {
+			result.append(char('0' + (value - 2 * letters)));
+		}
+	}
+	return result;
 }
 
 } // namespace Theme

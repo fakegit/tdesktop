@@ -9,8 +9,13 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 #include "base/object_ptr.h"
 #include "mtproto/sender.h"
+#include "ui/text/text_variant.h"
 #include "ui/rp_widget.h"
 #include "ui/effects/animations.h"
+
+namespace style {
+struct RoundButton;
+} // namespace style;
 
 namespace Main {
 class Account;
@@ -40,6 +45,16 @@ public:
 		bool hasCover = false);
 	~Step();
 
+	QAccessible::Role accessibilityRole() override {
+		return QAccessible::Role::Dialog;
+	}
+	QString accessibilityName() override {
+		return _titleText.current();
+	}
+	QString accessibilityDescription() override {
+		return _descriptionText.current().text;
+	}
+
 	[[nodiscard]] Main::Account &account() const {
 		return *_account;
 	}
@@ -57,6 +72,7 @@ public:
 
 	void setGoCallback(
 		Fn<void(Step *step, StackAction action, Animate animate)> callback);
+	void setStepBelowCallback(Fn<Step*()> callback);
 	void setShowResetCallback(Fn<void()> callback);
 	void setShowTermsCallback(Fn<void()> callback);
 	void setCancelNearestDcCallback(Fn<void()> callback);
@@ -77,6 +93,9 @@ public:
 
 	virtual void submit() = 0;
 	[[nodiscard]] virtual rpl::producer<QString> nextButtonText() const;
+	[[nodiscard]] virtual auto nextButtonStyle() const
+		-> rpl::producer<const style::RoundButton*>;
+	[[nodiscard]] virtual rpl::producer<> nextButtonFocusRequests() const;
 
 	[[nodiscard]] int contentLeft() const;
 	[[nodiscard]] int contentTop() const;
@@ -92,30 +111,36 @@ protected:
 	void resizeEvent(QResizeEvent *e) override;
 
 	void setTitleText(rpl::producer<QString> titleText);
-	void setDescriptionText(rpl::producer<QString> descriptionText);
-	void setDescriptionText(
-		rpl::producer<TextWithEntities> richDescriptionText);
-	bool paintAnimated(Painter &p, QRect clip);
+	void setDescriptionText(v::text::data &&descriptionText);
+	bool paintAnimated(QPainter &p, QRect clip);
 
 	void fillSentCodeData(const MTPDauth_sentCode &type);
-
-	void showDescription();
-	void hideDescription();
 
 	[[nodiscard]] not_null<Data*> getData() const {
 		return _data;
 	}
-	void finish(const MTPUser &user, QImage &&photo = QImage());
+	void finish(const MTPauth_Authorization &auth, QImage &&photo = {});
+	void finish(const MTPUser &user, QImage &&photo = {});
 	void createSession(
 		const MTPUser &user,
 		QImage photo,
-		const QVector<MTPDialogFilter> &filters);
+		const QVector<MTPDialogFilter> &filters,
+		bool tagsEnabled);
 
 	void goBack();
 
 	template <typename StepType>
 	void goNext() {
 		goNext(new StepType(parentWidget(), _account, _data));
+	}
+
+	template <typename StepType>
+	void goNextOrBack() {
+		if (dynamic_cast<StepType*>(stepBelow())) {
+			goBack();
+		} else {
+			goNext<StepType>();
+		}
 	}
 
 	template <typename StepType>
@@ -158,7 +183,7 @@ private:
 	};
 	void updateLabelsPosition();
 	void paintContentSnapshot(
-		Painter &p,
+		QPainter &p,
 		const QPixmap &snapshot,
 		float64 alpha,
 		float64 howMuchHidden);
@@ -166,6 +191,7 @@ private:
 
 	void goNext(Step *step);
 	void goReplace(Step *step, Animate animate);
+	[[nodiscard]] Step *stepBelow() const;
 
 	[[nodiscard]] CoverAnimation prepareCoverAnimation(Step *step);
 	[[nodiscard]] QPixmap prepareContentSnapshot();
@@ -173,7 +199,7 @@ private:
 	void showFinished();
 
 	void prepareCoverMask();
-	void paintCover(Painter &p, int top);
+	void paintCover(QPainter &p, int top);
 
 	const not_null<Main::Account*> _account;
 	const not_null<Data*> _data;
@@ -181,6 +207,7 @@ private:
 
 	bool _hasCover = false;
 	Fn<void(Step *step, StackAction action, Animate animate)> _goCallback;
+	Fn<Step*()> _stepBelowCallback;
 	Fn<void()> _showResetCallback;
 	Fn<void()> _showTermsCallback;
 	Fn<void()> _cancelNearestDcCallback;

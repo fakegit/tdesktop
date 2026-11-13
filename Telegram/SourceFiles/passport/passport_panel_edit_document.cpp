@@ -10,11 +10,11 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "passport/passport_panel_controller.h"
 #include "passport/passport_panel_edit_scans.h"
 #include "passport/ui/passport_details_row.h"
-#include "ui/widgets/input_fields.h"
+#include "ui/effects/scroll_content_shadow.h"
+#include "ui/widgets/fields/input_field.h"
 #include "ui/widgets/scroll_area.h"
 #include "ui/widgets/labels.h"
 #include "ui/widgets/buttons.h"
-#include "ui/widgets/shadow.h"
 #include "ui/widgets/checkbox.h"
 #include "ui/wrap/vertical_layout.h"
 #include "ui/wrap/fade_wrap.h"
@@ -22,9 +22,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "countries/countries_instance.h"
 #include "data/data_user.h" // ->bot()->session()
 #include "main/main_session.h" // ->session().user()
-#include "ui/text/text_utilities.h" // Ui::Text::ToUpper
 #include "boxes/abstract_box.h"
-#include "boxes/confirm_box.h"
+#include "ui/boxes/confirm_box.h"
 #include "lang/lang_keys.h"
 #include "styles/style_widgets.h"
 #include "styles/style_layers.h"
@@ -140,7 +139,7 @@ void RequestTypeBox::setupControls(
 	_height = y;
 
 	_submit = [=] {
-		const auto value = group->hasValue() ? group->value() : -1;
+		const auto value = group->hasValue() ? group->current() : -1;
 		if (value >= 0) {
 			submit(value);
 		}
@@ -219,12 +218,11 @@ PanelEditDocument::PanelEditDocument(
 : _controller(controller)
 , _scheme(std::move(scheme))
 , _scroll(this, st::passportPanelScroll)
-, _topShadow(this)
-, _bottomShadow(this)
 , _done(
 		this,
 		tr::lng_passport_save_value(),
 		st::passportPanelSaveValue) {
+	_done->setTextTransform(Ui::RoundButtonTextTransform::ToUpper);
 	setupControls(
 		&error,
 		&data,
@@ -247,12 +245,11 @@ PanelEditDocument::PanelEditDocument(
 : _controller(controller)
 , _scheme(std::move(scheme))
 , _scroll(this, st::passportPanelScroll)
-, _topShadow(this)
-, _bottomShadow(this)
 , _done(
 		this,
 		tr::lng_passport_save_value(),
 		st::passportPanelSaveValue) {
+	_done->setTextTransform(Ui::RoundButtonTextTransform::ToUpper);
 	setupControls(
 		nullptr,
 		nullptr,
@@ -272,12 +269,11 @@ PanelEditDocument::PanelEditDocument(
 : _controller(controller)
 , _scheme(std::move(scheme))
 , _scroll(this, st::passportPanelScroll)
-, _topShadow(this)
-, _bottomShadow(this)
 , _done(
 		this,
 		tr::lng_passport_save_value(),
 		st::passportPanelSaveValue) {
+	_done->setTextTransform(Ui::RoundButtonTextTransform::ToUpper);
 	setupControls(&error, &data, nullptr, nullptr, {}, {}, {});
 }
 
@@ -289,7 +285,7 @@ void PanelEditDocument::setupControls(
 		ScanListData &&scans,
 		std::optional<ScanListData> &&translations,
 		std::map<FileType, ScanInfo> &&specialFiles) {
-	setupContent(
+	const auto inner = setupContent(
 		error,
 		data,
 		scansError,
@@ -298,10 +294,8 @@ void PanelEditDocument::setupControls(
 		std::move(translations),
 		std::move(specialFiles));
 
-	using namespace rpl::mappers;
+	Ui::SetupShadowsToScrollContent(this, _scroll, inner->heightValue());
 
-	_topShadow->toggleOn(
-		_scroll->scrollTopValue() | rpl::map(_1 > 0));
 	_done->addClickHandler([=] {
 		crl::on_main(this, [=] {
 			save();
@@ -320,7 +314,7 @@ not_null<Ui::RpWidget*> PanelEditDocument::setupContent(
 	const auto inner = _scroll->setOwnedWidget(
 		object_ptr<Ui::VerticalLayout>(this));
 	_scroll->widthValue(
-	) | rpl::start_with_next([=](int width) {
+	) | rpl::on_next([=](int width) {
 		inner->resizeToWidth(width);
 	}, inner->lifetime());
 
@@ -425,25 +419,42 @@ not_null<Ui::RpWidget*> PanelEditDocument::setupContent(
 					showIfError = true;
 				}
 			});
-			const auto shown = [=](const QString &code) {
+			const auto shown = [=](const Scheme::CountryInfo &info) {
 				using Result = Scheme::AdditionalVisibility;
-				const auto value = _scheme.additionalShown(code);
+				const auto value = _scheme.additionalShown(info);
 				return (value == Result::Shown)
 					|| (value == Result::OnlyIfError && showIfError);
 			};
 
-			auto title = row->value(
-			) | rpl::filter(
+			auto langValue = row->value(
+			) | rpl::map(
+				_scheme.preferredLanguage
+			) | rpl::flatten_latest();
+
+			auto title = rpl::duplicate(langValue) | rpl::filter(
 				shown
-			) | rpl::map([=](const QString &code) {
-				return _scheme.additionalHeader(code);
+			) | rpl::map([=](const Scheme::CountryInfo &info) {
+				return _scheme.additionalHeader(info);
 			});
-			added->add(
+			const auto headerLabel = added->add(
 				object_ptr<Ui::FlatLabel>(
 					added,
-					std::move(title),
+					rpl::duplicate(title),
 					st::passportFormHeader),
 				st::passportNativeNameHeaderPadding);
+			std::move(
+				title
+			) | rpl::on_next([=] {
+				const auto &padding = st::passportNativeNameHeaderPadding;
+				const auto available = added->width()
+					- padding.left()
+					- padding.right();
+				headerLabel->resizeToNaturalWidth(available);
+				headerLabel->moveToLeft(
+					padding.left(),
+					padding.top(),
+					available);
+			}, headerLabel->lifetime());
 
 			enumerateRows([&](
 					int i,
@@ -454,11 +465,10 @@ not_null<Ui::RpWidget*> PanelEditDocument::setupContent(
 				}
 			});
 
-			auto description = row->value(
-			) | rpl::filter(
+			auto description = rpl::duplicate(langValue) | rpl::filter(
 				shown
-			) | rpl::map([=](const QString &code) {
-				return _scheme.additionalDescription(code);
+			) | rpl::map([=](const Scheme::CountryInfo &info) {
+				return _scheme.additionalDescription(info);
 			});
 			added->add(
 				object_ptr<Ui::DividerLabel>(
@@ -470,25 +480,25 @@ not_null<Ui::RpWidget*> PanelEditDocument::setupContent(
 					st::passportFormLabelPadding),
 				st::passportNativeNameAboutMargin);
 
-			wrap->toggleOn(row->value() | rpl::map(shown));
+			wrap->toggleOn(rpl::duplicate(langValue) | rpl::map(shown));
 			wrap->finishAnimating();
 
-			row->value(
-			) | rpl::map(
+			std::move(langValue) | rpl::map(
 				shown
-			) | rpl::start_with_next([=](bool visible) {
+			) | rpl::on_next([=](bool visible) {
 				_additionalShown = visible;
 			}, lifetime());
 		}
 
-		inner->add(
-			object_ptr<Ui::FixedHeightWidget>(inner, st::passportDetailsSkip));
+		inner->add(object_ptr<Ui::FixedHeightWidget>(
+			inner,
+			st::passportDetailsSkip));
 	}
 	if (auto text = _controller->deleteValueLabel()) {
 		inner->add(
 			object_ptr<Ui::SettingsButton>(
 				inner,
-				std::move(*text) | Ui::Text::ToUpper(),
+				std::move(*text) | rpl::map(tr::upper),
 				st::passportDeleteButton),
 			st::passportUploadButtonPadding
 		)->addClickHandler([=] {
@@ -523,7 +533,7 @@ void PanelEditDocument::createDetailsRow(
 	const auto isoByPhone = Countries::Instance().countryISO2ByPhone(
 		_controller->bot()->session().user()->phone());
 
-	const auto [it, ok] = _details.emplace(
+	const auto &[it, ok] = _details.emplace(
 		i,
 		container->add(Ui::PanelDetailsRow::Create(
 			container,
@@ -537,7 +547,7 @@ void PanelEditDocument::createDetailsRow(
 			row.lengthLimit)));
 	const bool details = (row.valueClass != Scheme::ValueClass::Scans);
 	it->second->value(
-	) | rpl::skip(1) | rpl::start_with_next([=] {
+	) | rpl::skip(1) | rpl::on_next([=] {
 		if (details) {
 			_fieldsChanged = true;
 			updateCommonError();
@@ -589,10 +599,6 @@ bool PanelEditDocument::hasUnsavedChanges() const {
 void PanelEditDocument::updateControlsGeometry() {
 	const auto submitTop = height() - _done->height();
 	_scroll->setGeometry(0, 0, width(), submitTop);
-	_topShadow->resizeToWidth(width());
-	_topShadow->moveToLeft(0, 0);
-	_bottomShadow->resizeToWidth(width());
-	_bottomShadow->moveToLeft(0, submitTop - st::lineWidth);
 	_done->resizeToWidth(width());
 	_done->moveToLeft(0, submitTop);
 

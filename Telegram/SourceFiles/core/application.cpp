@@ -8,41 +8,56 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "core/application.h"
 
 #include "data/data_abstract_structure.h"
-#include "data/data_photo.h"
-#include "data/data_document.h"
+#include "data/data_channel.h"
+#include "data/data_forum.h"
+#include "data/data_message_reactions.h"
 #include "data/data_session.h"
-#include "data/data_user.h"
-#include "base/timer.h"
+#include "data/data_download_manager.h"
+#include "base/battery_saving.h"
 #include "base/event_filter.h"
+#include "base/invoke_queued.h"
 #include "base/concurrent_timer.h"
+#include "base/options.h"
 #include "base/qt_signal_producer.h"
+#include "base/timer.h"
 #include "base/unixtime.h"
+#include "core/core_screenshot_protection.h"
+#include "core/core_settings.h"
 #include "core/update_checker.h"
 #include "core/shortcuts.h"
 #include "core/sandbox.h"
 #include "core/local_url_handlers.h"
 #include "core/launcher.h"
+#include "core/proxy_rotation_manager.h"
 #include "core/ui_integration.h"
+#include "core/version.h"
 #include "chat_helpers/emoji_keywords.h"
 #include "chat_helpers/stickers_emoji_image_loader.h"
+#include "base/platform/base_platform_global_shortcuts.h"
 #include "base/platform/base_platform_url_scheme.h"
 #include "base/platform/base_platform_last_input.h"
 #include "base/platform/base_platform_info.h"
+#include "base/platform/base_platform_process.h"
 #include "platform/platform_specific.h"
-#include "mainwindow.h"
-#include "dialogs/dialogs_entry.h"
+#include "platform/platform_integration.h"
 #include "history/history.h"
 #include "apiwrap.h"
 #include "api/api_updates.h"
 #include "calls/calls_instance.h"
 #include "countries/countries_manager.h"
-#include "lang/lang_file_parser.h"
+#include "iv/iv_delegate_impl.h"
+#include "iv/iv_instance.h"
+#include "iv/iv_data.h"
+#include "iv/editor/iv_editor_session.h"
+#include "iv/editor/iv_editor_window.h"
 #include "lang/lang_translator.h"
 #include "lang/lang_cloud_manager.h"
 #include "lang/lang_hardcoded.h"
 #include "lang/lang_instance.h"
+#include "inline_bots/bot_attach_web_view.h"
 #include "mainwidget.h"
-#include "core/file_utilities.h"
+#include "tray.h"
+#include "core/click_handler_types.h" // ClickHandlerContext.
 #include "core/crash_reports.h"
 #include "main/main_account.h"
 #include "main/main_domain.h"
@@ -51,43 +66,53 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "media/view/media_view_open_common.h"
 #include "mtproto/mtproto_dc_options.h"
 #include "mtproto/mtproto_config.h"
-#include "mtproto/mtp_instance.h"
-#include "media/audio/media_audio.h"
+#include "mtproto/web_proxy/web_proxy_transport.h"
 #include "media/audio/media_audio_track.h"
 #include "media/player/media_player_instance.h"
 #include "media/player/media_player_float.h"
 #include "media/clip/media_clip_reader.h" // For Media::Clip::Finish().
+#include "media/media_video_encode.h"
+#include "media/system_media_controls_manager.h"
 #include "window/notifications_manager.h"
 #include "window/themes/window_theme.h"
-#include "window/window_lock_widgets.h"
-#include "history/history_location_manager.h"
 #include "ui/widgets/tooltip.h"
 #include "ui/gl/gl_detection.h"
-#include "ui/image/image.h"
 #include "ui/text/text_options.h"
-#include "ui/emoji_config.h"
-#include "ui/effects/animations.h"
+#include "ui/effects/spoiler_mess.h"
 #include "ui/cached_round_corners.h"
-#include "storage/serialize_common.h"
+#include "ui/power_saving.h"
+#include "ui/screen_reader_mode.h"
 #include "storage/storage_domain.h"
 #include "storage/storage_databases.h"
+#include "storage/storage_folder_archive.h"
 #include "storage/localstorage.h"
 #include "payments/payments_checkout_process.h"
+#include "tgw/tgw_runtime.h"
 #include "export/export_manager.h"
+#include "wallet/wallet_panel.h"
+#include "webrtc/webrtc_environment.h"
+#include "webview/webview_interface.h"
+#include "window/window_columns.h"
+#include "window/window_saved_windows.h"
+#include "window/window_separate_id.h"
 #include "window/window_session_controller.h"
 #include "window/window_controller.h"
+#include "boxes/abstract_box.h"
+#include "boxes/keys_legend.h"
 #include "base/qthelp_regex.h"
 #include "base/qthelp_url.h"
-#include "boxes/connection_box.h"
-#include "boxes/confirm_phone_box.h"
-#include "boxes/confirm_box.h"
-#include "boxes/share_box.h"
-#include "app.h"
+#include "boxes/premium_limits_box.h"
+#include "ui/accessible/ui_accessible_factory.h"
+#include "ui/boxes/confirm_box.h"
+#include "core/cached_webview_availability.h"
+#include "test/test_agent.h"
 
-#include <QtWidgets/QDesktopWidget>
+#include <QtCore/QStandardPaths>
 #include <QtCore/QMimeDatabase>
 #include <QtGui/QGuiApplication>
 #include <QtGui/QScreen>
+
+#include <ksandbox.h>
 
 namespace Core {
 namespace {
@@ -96,8 +121,10 @@ constexpr auto kQuitPreventTimeoutMs = crl::time(1500);
 constexpr auto kAutoLockTimeoutLateMs = crl::time(3000);
 constexpr auto kClearEmojiImageSourceTimeout = 10 * crl::time(1000);
 
+LaunchState GlobalLaunchState/* = LaunchState::Running*/;
+
 void SetCrashAnnotationsGL() {
-#ifdef Q_OS_WIN
+#ifdef DESKTOP_APP_USE_ANGLE
 	CrashReports::SetAnnotation("OpenGL ANGLE", [] {
 		if (Core::App().settings().disableOpenGL()) {
 			return "Disabled";
@@ -106,77 +133,148 @@ void SetCrashAnnotationsGL() {
 		case Ui::GL::ANGLE::D3D11: return "Direct3D 11";
 		case Ui::GL::ANGLE::D3D9: return "Direct3D 9";
 		case Ui::GL::ANGLE::D3D11on12: return "D3D11on12";
-		case Ui::GL::ANGLE::OpenGL: return "OpenGL";
+		//case Ui::GL::ANGLE::OpenGL: return "OpenGL";
 		}
 		Unexpected("Ui::GL::CurrentANGLE value in SetupANGLE.");
 	}());
-#else // Q_OS_WIN
+#else // DESKTOP_APP_USE_ANGLE
 	CrashReports::SetAnnotation(
 		"OpenGL",
 		Core::App().settings().disableOpenGL() ? "Disabled" : "Enabled");
-#endif // Q_OS_WIN
+#endif // DESKTOP_APP_USE_ANGLE
 }
+
+base::options::toggle OptionSkipUrlSchemeRegister({
+	.id = kOptionSkipUrlSchemeRegister,
+	.name = "Skip URL scheme register",
+	.description = "Don't re-register tg:// URL scheme on autoupdate.",
+});
 
 } // namespace
 
 Application *Application::Instance = nullptr;
 
+const char kOptionSkipUrlSchemeRegister[] = "skip-url-scheme-register";
+
 struct Application::Private {
 	base::Timer quitTimer;
 	UiIntegration uiIntegration;
+	Settings settings;
+	std::unique_ptr<ProxyRotationManager> proxyRotation;
 };
 
-Application::Application(not_null<Launcher*> launcher)
+Application::Application()
 : QObject()
-, _launcher(launcher)
 , _private(std::make_unique<Private>())
+, _platformIntegration(Platform::Integration::Create())
+, _batterySaving(std::make_unique<base::BatterySaving>())
+, _mediaDevices(std::make_unique<Webrtc::Environment>())
+, _screenshotProtection(std::make_unique<ScreenshotProtection>())
 , _databases(std::make_unique<Storage::Databases>())
 , _animationsManager(std::make_unique<Ui::Animations::Manager>())
 , _clearEmojiImageLoaderTimer([=] { clearEmojiSourceImages(); })
 , _audio(std::make_unique<Media::Audio::Instance>())
 , _fallbackProductionConfig(
 	std::make_unique<MTP::Config>(MTP::Environment::Production))
+, _downloadManager(std::make_unique<Data::DownloadManager>())
 , _domain(std::make_unique<Main::Domain>(cDataFile()))
 , _exportManager(std::make_unique<Export::Manager>())
 , _calls(std::make_unique<Calls::Instance>())
+, _iv(std::make_unique<Iv::Instance>(
+	Ui::CreateChild<Iv::DelegateImpl>(this)))
 , _langpack(std::make_unique<Lang::Instance>())
 , _langCloudManager(std::make_unique<Lang::CloudManager>(langpack()))
 , _emojiKeywords(std::make_unique<ChatHelpers::EmojiKeywords>())
-, _logo(Window::LoadLogo())
-, _logoNoMargin(Window::LoadLogoNoMargin())
+, _tray(std::make_unique<Tray>())
+, _setupEmailLock(false)
 , _autoLockTimer([=] { checkAutoLock(); }) {
-	Expects(!_logo.isNull());
-	Expects(!_logoNoMargin.isNull());
-
 	Ui::Integration::Set(&_private->uiIntegration);
+	_private->proxyRotation = std::make_unique<ProxyRotationManager>();
+
+	_platformIntegration->init();
 
 	passcodeLockChanges(
-	) | rpl::start_with_next([=] {
+	) | rpl::on_next([=](bool locked) {
 		_shouldLockAt = 0;
+		if (locked) {
+			closeAdditionalWindows();
+		}
 	}, _lifetime);
 
 	passcodeLockChanges(
-	) | rpl::start_with_next([=] {
+	) | rpl::on_next([=] {
 		_notifications->updateAll();
+		updateWindowTitles();
+	}, _lifetime);
+
+	settings().windowTitleContentChanges(
+	) | rpl::on_next([=] {
+		updateWindowTitles();
 	}, _lifetime);
 
 	_domain->activeSessionChanges(
-	) | rpl::start_with_next([=](Main::Session *session) {
+	) | rpl::on_next([=](Main::Session *session) {
 		if (session && !UpdaterDisabled()) { // #TODO multi someSessionValue
 			UpdateChecker().setMtproto(session);
 		}
 	}, _lifetime);
+
+	MTP::WebProxy::Transport::StateChanges(
+	) | rpl::on_next([=](
+			const MTP::WebProxy::Transport::StateChange &change) {
+		using State = MTP::WebProxy::Transport::State;
+		if (change.state != State::WaitingForBrowser) {
+			if (_webProxyFallbackBox) {
+				_webProxyFallbackBox->closeBox();
+			}
+			return;
+		}
+		const auto &proxy = settings().proxy();
+		if (_webProxyFallbackBox
+			|| !proxy.isEnabled()
+			|| proxy.selected() != change.proxy) {
+			return;
+		}
+		_webProxyFallbackBox = Ui::show(Ui::MakeConfirmBox({
+			.text = tr::lng_proxy_web_fallback(tr::now),
+			.confirmed = [=] {
+				const auto &current = settings().proxy();
+				if (current.isEnabled()
+					&& current.selected() == change.proxy) {
+					MTP::WebProxy::Transport::OpenBrowser(change.proxy);
+				}
+			},
+			.confirmText = tr::lng_proxy_web_open(tr::now),
+			.cancelText = tr::lng_cancel(tr::now),
+		}), Ui::LayerOption::KeepOther);
+	}, _lifetime);
+}
+
+void Application::closeAdditionalWindows() {
+	Payments::CheckoutProcess::ClearAll();
+	for (const auto &[index, account] : _domain->accounts()) {
+		if (account->sessionExists()) {
+			account->session().attachWebView().closeAll();
+			Wallet::CloseWallet(&account->session());
+		}
+	}
+	_iv->closeAll();
+	Iv::Editor::CloseAllWindows();
 }
 
 Application::~Application() {
+	if (_savedWindows) {
+		_savedWindows->writeNow();
+	}
 	if (_saveSettingsTimer && _saveSettingsTimer->isActive()) {
 		Local::writeSettings();
 	}
 
-	// Depend on activeWindow() for now :(
-	Shortcuts::Finish();
-
-	_window = nullptr;
+	_windowStack.clear();
+	setLastActiveWindow(nullptr);
+	_windowInSettings = _lastActivePrimaryWindow = nullptr;
+	_closingAsyncWindows.clear();
+	_windows.clear();
 	_mediaView = nullptr;
 	_notifications->clearAllFast();
 
@@ -186,9 +284,11 @@ Application::~Application() {
 	//
 	// For example Domain::removeRedundantAccounts() is called from
 	// Domain::finish() and there is a violation on Ensures(started()).
-	Payments::CheckoutProcess::ClearAll();
+	closeAdditionalWindows();
 
+	_private->proxyRotation = nullptr;
 	_domain->finish();
+	MTP::WebProxy::Transport::Shutdown();
 
 	Local::finish();
 
@@ -202,55 +302,75 @@ Application::~Application() {
 
 	Window::Theme::Uninitialize();
 
-	Media::Player::finish(_audio.get());
-	style::stopManager();
+	_mediaControlsManager = nullptr;
 
-	ThirdParty::finish();
+	Media::Player::finish(_audio.get());
+	style::StopManager();
 
 	Instance = nullptr;
 }
 
 void Application::run() {
-	style::internal::StartFonts();
-
-	ThirdParty::start();
-	refreshGlobalProxy(); // Depends on Core::IsAppLaunched().
-
 	// Depends on OpenSSL on macOS, so on ThirdParty::start().
 	// Depends on notifications settings.
 	_notifications = std::make_unique<Window::Notifications::System>();
 
 	startLocalStorage();
+
+	style::SetCustomFont(settings().customFontFamily());
+	style::internal::StartFonts();
+
+	Test::ApplyStartupOverrides();
+
 	ValidateScale();
 
-	if (Local::oldSettingsVersion() < AppVersion) {
-		RegisterUrlScheme();
-		psNewVersion();
+	refreshGlobalProxy(); // Depends on app settings being read.
+
+	if (const auto old = Local::oldSettingsVersion(); old < AppVersion) {
+		autoRegisterUrlScheme();
+		Platform::NewVersionLaunched(old);
 	}
 
 	if (cAutoStart() && !Platform::AutostartSupported()) {
 		cSetAutoStart(false);
 	}
 
-	if (cLaunchMode() == LaunchModeAutoStart && !cAutoStart()) {
-		psAutoStart(false, true);
-		App::quit();
+	if (cLaunchMode() == LaunchModeAutoStart && Platform::AutostartSkip()) {
+		Platform::AutostartToggle(false);
+		Quit();
 		return;
 	}
 
 	_translator = std::make_unique<Lang::Translator>();
 	QCoreApplication::instance()->installTranslator(_translator.get());
 
-	style::startManager(cScale());
+	style::StartManager(cScale());
+	Ui::Accessible::Init();
 	Ui::InitTextOptions();
 	Ui::StartCachedCorners();
 	Ui::Emoji::Init();
+	Ui::PreloadTextSpoilerMask(_lifetime);
+	startShortcuts();
 	startEmojiImageLoader();
 	startSystemDarkModeViewer();
 	Media::Player::start(_audio.get());
+	Media::Encode::ClearStaleTempFiles();
+	Storage::ClearStaleArchiveFiles();
+	Webview::ClearStaleTemporaryStorage();
+
+	if (MediaControlsManager::Supported()) {
+		_mediaControlsManager = std::make_unique<MediaControlsManager>();
+	}
+
+	rpl::combine(
+		_batterySaving->value(),
+		settings().ignoreBatterySavingValue()
+	) | rpl::on_next([=](bool saving, bool ignore) {
+		PowerSaving::SetForceAll(saving && !ignore);
+	}, _lifetime);
 
 	style::ShortAnimationPlaying(
-	) | rpl::start_with_next([=](bool playing) {
+	) | rpl::on_next([=](bool playing) {
 		if (playing) {
 			MTP::details::pause();
 		} else {
@@ -259,25 +379,59 @@ void Application::run() {
 	}, _lifetime);
 
 	DEBUG_LOG(("Application Info: inited..."));
-
-	cChangeTimeFormat(QLocale::system().timeFormat(QLocale::ShortFormat));
+	LOG(("Qt version: %1 (compiled with %2)").arg(
+		QString::fromLatin1(qVersion()),
+		QString::fromLatin1(QT_VERSION_STR)));
 
 	DEBUG_LOG(("Application Info: starting app..."));
 
 	// Create mime database, so it won't be slow later.
-	QMimeDatabase().mimeTypeForName(qsl("text/plain"));
+	QMimeDatabase().mimeTypeForName(u"text/plain"_q);
 
-	_window = std::make_unique<Window::Controller>();
+	// Check now to avoid re-entrance later.
+	[[maybe_unused]] const auto &webviewAvailability
+		= Core::CachedWebviewAvailability();
+
+	_savedWindows = std::make_unique<Window::SavedWindows>(this);
+
+	_windows.emplace(nullptr, std::make_unique<Window::Controller>());
+	setLastActiveWindow(_windows.front().second.get());
+	_windowInSettings = _lastActivePrimaryWindow = _lastActiveWindow;
 
 	_domain->activeChanges(
-	) | rpl::start_with_next([=](not_null<Main::Account*> account) {
-		_window->showAccount(account);
-	}, _window->widget()->lifetime());
+	) | rpl::on_next([=](not_null<Main::Account*> account) {
+		showAccount(account);
+	}, _lifetime);
+
+	(
+		_domain->activeValue(
+		) | rpl::to_empty | rpl::filter([=] {
+			return _domain->started();
+		}) | rpl::take(1)
+	) | rpl::then(
+		_domain->accountsChanges()
+	) | rpl::map([=] {
+		return (_domain->accounts().size() > Main::Domain::kMaxAccounts)
+			? _domain->activeChanges()
+			: rpl::never<not_null<Main::Account*>>();
+	}) | rpl::flatten_latest(
+	) | rpl::on_next([=](not_null<Main::Account*> account) {
+		const auto ordered = _domain->orderedAccounts();
+		const auto it = ranges::find(ordered, account);
+		if (_lastActivePrimaryWindow && it != end(ordered)) {
+			const auto index = std::distance(begin(ordered), it);
+			if ((index + 1) > _domain->maxAccounts()) {
+				_lastActivePrimaryWindow->show(Box(
+					AccountsLimitBox,
+					&account->session()));
+			}
+		}
+	}, _lifetime);
 
 	QCoreApplication::instance()->installEventFilter(this);
 
 	appDeactivatedValue(
-	) | rpl::start_with_next([=](bool deactivated) {
+	) | rpl::on_next([=](bool deactivated) {
 		if (deactivated) {
 			handleAppDeactivated();
 		} else {
@@ -287,41 +441,37 @@ void Application::run() {
 
 	DEBUG_LOG(("Application Info: window created..."));
 
-	// Depend on activeWindow() for now :(
-	startShortcuts();
 	startDomain();
+	startTray();
 
-	_window->widget()->show();
+	_lastActivePrimaryWindow->firstShow();
 
-	const auto currentGeometry = _window->widget()->geometry();
-	_mediaView = std::make_unique<Media::View::OverlayWidget>();
-	_window->widget()->Ui::RpWidget::setGeometry(currentGeometry);
+	startMediaView();
 
 	DEBUG_LOG(("Application Info: showing."));
-	_window->finishFirstShow();
+	_lastActivePrimaryWindow->finishFirstShow();
 
-	if (!_window->locked() && cStartToSettings()) {
-		_window->showSettings();
+	if (!_lastActivePrimaryWindow->locked() && cStartToSettings()) {
+		_lastActivePrimaryWindow->showSettings();
 	}
 
-	_window->updateIsActiveFocus();
+	_lastActivePrimaryWindow->updateIsActiveFocus();
 
 	for (const auto &error : Shortcuts::Errors()) {
 		LOG(("Shortcuts Error: %1").arg(error));
 	}
 
 	SetCrashAnnotationsGL();
-	if (!Platform::IsMac() && Ui::GL::LastCrashCheckFailed()) {
+	if (Ui::GL::LastCrashCheckFailed()) {
 		showOpenGLCrashNotification();
 	}
 
-	_window->openInMediaViewRequests(
-	) | rpl::start_with_next([=](Media::View::OpenRequest &&request) {
+	_openInMediaViewRequests.events(
+	) | rpl::on_next([=](Media::View::OpenRequest &&request) {
 		if (_mediaView) {
 			_mediaView->show(std::move(request));
 		}
-	}, _window->lifetime());
-
+	}, _lifetime);
 	{
 		const auto countries = std::make_shared<Countries::Manager>(
 			_domain.get());
@@ -329,31 +479,72 @@ void Application::run() {
 			[[maybe_unused]] const auto countriesCopy = countries;
 		});
 	}
+
+	processCreatedWindow(_lastActivePrimaryWindow);
+
+	_savedWindows->startRestore();
+
+	Test::Fire(u"launch_finished"_q);
+	Test::Start();
+}
+
+void Application::autoRegisterUrlScheme() {
+	if (!OptionSkipUrlSchemeRegister.value()) {
+		InvokeQueued(this, [] { RegisterUrlScheme(); });
+	}
+}
+
+void Application::showAccount(not_null<Main::Account*> account) {
+	if (const auto separate = separateWindowFor(account)) {
+		_lastActivePrimaryWindow = separate;
+		separate->activate();
+	} else if (const auto last = activePrimaryWindow()) {
+		last->showAccount(account);
+	}
+}
+
+void Application::checkWindowId(not_null<Window::Controller*> window) {
+	const auto id = window->id();
+	for (auto &[existingId, existing] : _windows) {
+		if (existing.get() == window && existingId != id) {
+			auto found = std::move(existing);
+			_windows.remove(existingId);
+			_windows.emplace(id, std::move(found));
+			break;
+		}
+	}
+	if (_savedWindows) {
+		_savedWindows->scheduleSave();
+	}
+	if (!_lastActiveWindow) {
+		setLastActiveWindow(window);
+	}
 }
 
 void Application::showOpenGLCrashNotification() {
 	const auto enable = [=] {
-		Ui::GL::ForceDisable(false);
 		Ui::GL::CrashCheckFinish();
-		Core::App().settings().setDisableOpenGL(false);
+		settings().setDisableOpenGL(false);
 		Local::writeSettings();
-		App::restart();
+		Restart();
 	};
-	const auto keepDisabled = [=] {
-		Ui::GL::ForceDisable(true);
+	const auto keepDisabled = [=](Fn<void()> close) {
 		Ui::GL::CrashCheckFinish();
-		Core::App().settings().setDisableOpenGL(true);
+		settings().setDisableOpenGL(true);
 		Local::writeSettings();
+		close();
 	};
-	_window->show(Box<ConfirmBox>(
+	_lastActivePrimaryWindow->show(Ui::MakeConfirmBox({
+		.text = ""
 		"There may be a problem with your graphics drivers and OpenGL. "
 		"Try updating your drivers.\n\n"
 		"OpenGL has been disabled. You can try to enable it again "
 		"or keep it disabled if crashes continue.",
-		"Enable",
-		"Keep Disabled",
-		enable,
-		keepDisabled));
+		.confirmed = enable,
+		.cancelled = keepDisabled,
+		.confirmText = "Enable",
+		.cancelText = "Keep Disabled",
+	}));
 }
 
 void Application::startDomain() {
@@ -372,11 +563,13 @@ void Application::startSettingsAndBackground() {
 	Local::rewriteSettingsIfNeeded();
 	Window::Theme::Background()->start();
 	checkSystemDarkMode();
+	Ui::SetScreenReaderModeDisabled(
+		settings().readPref<bool>(kScreenReaderModeDisabledKey));
 }
 
 void Application::checkSystemDarkMode() {
-	const auto maybeDarkMode = _settings.systemDarkMode();
-	const auto darkModeEnabled = _settings.systemDarkModeEnabled();
+	const auto maybeDarkMode = settings().systemDarkMode();
+	const auto darkModeEnabled = settings().systemDarkModeEnabled();
 	const auto needToSwitch = darkModeEnabled
 		&& maybeDarkMode
 		&& (*maybeDarkMode != Window::Theme::IsNightMode());
@@ -388,20 +581,118 @@ void Application::checkSystemDarkMode() {
 
 void Application::startSystemDarkModeViewer() {
 	if (Window::Theme::Background()->editingTheme()) {
-		_settings.setSystemDarkModeEnabled(false);
+		settings().setSystemDarkModeEnabled(false);
 	}
 	rpl::merge(
-		_settings.systemDarkModeChanges() | rpl::to_empty,
-		_settings.systemDarkModeEnabledChanges() | rpl::to_empty
-	) | rpl::start_with_next([=] {
+		settings().systemDarkModeChanges() | rpl::to_empty,
+		settings().systemDarkModeEnabledChanges() | rpl::to_empty
+	) | rpl::on_next([=] {
 		checkSystemDarkMode();
 	}, _lifetime);
+}
+
+void Application::enumerateWindows(Fn<void(
+		not_null<Window::Controller*>)> callback) const {
+	for (const auto &window : ranges::views::values(_windows)) {
+		callback(window.get());
+	}
+}
+
+void Application::processCreatedWindow(
+		not_null<Window::Controller*> window) {
+	if (_savedWindows) {
+		_savedWindows->attachToWindow(window);
+	}
+	window->openInMediaViewRequests(
+	) | rpl::start_to_stream(_openInMediaViewRequests, window->lifetime());
+}
+
+void Application::startMediaView() {
+#ifdef Q_OS_MAC
+	// On macOS we create some windows async, otherwise they're
+	// added to the Dock Menu as a visible window and are removed
+	// only after first show and then hide.
+	InvokeQueued(this, [=] {
+		_mediaView = std::make_unique<Media::View::OverlayWidget>();
+		_mediaView->setSystemMediaControls(_mediaControlsManager.get());
+	});
+#elif defined Q_OS_WIN // Q_OS_MAC || Q_OS_WIN
+	// On Windows we needed such hack for the main window, otherwise
+	// somewhere inside the media viewer creating code its geometry
+	// was broken / lost to some invalid values.
+	const auto current = _lastActivePrimaryWindow->widget()->geometry();
+	_mediaView = std::make_unique<Media::View::OverlayWidget>();
+	_mediaView->setSystemMediaControls(_mediaControlsManager.get());
+	_lastActivePrimaryWindow->widget()->Ui::RpWidget::setGeometry(current);
+#else
+	_mediaView = std::make_unique<Media::View::OverlayWidget>();
+	_mediaView->setSystemMediaControls(_mediaControlsManager.get());
+#endif // Q_OS_MAC || Q_OS_WIN
+}
+
+void Application::startTray() {
+#ifdef Q_OS_MAC
+	// On macOS we create some windows async, otherwise they're
+	// added to the Dock Menu as a visible window and are removed
+	// only after first show and then hide, tray icon being "Item-0".
+	InvokeQueued(this, [=] {
+		createTray();
+	});
+#else // Q_OS_MAC
+	createTray();
+#endif // Q_OS_MAC
+}
+
+void Application::createTray() {
+	using WindowRaw = not_null<Window::Controller*>;
+	_tray->create();
+	_tray->aboutToShowRequests(
+	) | rpl::on_next([=] {
+		enumerateWindows([&](WindowRaw w) { w->updateIsActive(); });
+		_tray->updateMenuText();
+	}, _lifetime);
+
+	_tray->showFromTrayRequests(
+	) | rpl::on_next([=] {
+		activate();
+	}, _lifetime);
+
+	_tray->hideToTrayRequests(
+	) | rpl::on_next([=] {
+		enumerateWindows([&](WindowRaw w) {
+			w->widget()->minimizeToTray();
+		});
+	}, _lifetime);
+}
+
+void Application::activate() {
+	for (const auto &window : _windowStack) {
+		if (window == _lastActiveWindow) {
+			break;
+		}
+		const auto widget = window->widget();
+		const auto wasHidden = !widget->isVisible();
+		const auto state = widget->windowState();
+		if (state & Qt::WindowMinimized) {
+			widget->setWindowState(state & ~Qt::WindowMinimized);
+		}
+		widget->setVisible(true);
+		widget->activateWindow();
+		if (wasHidden) {
+			if (const auto session = window->sessionController()) {
+				session->content()->windowShown();
+			}
+		}
+	}
+	if (_lastActiveWindow) {
+		_lastActiveWindow->widget()->showFromTray();
+	}
 }
 
 auto Application::prepareEmojiSourceImages()
 -> std::shared_ptr<Ui::Emoji::UniversalImages> {
 	const auto &images = Ui::Emoji::SourceImages();
-	if (_settings.largeEmoji()) {
+	if (settings().largeEmoji()) {
 		return images;
 	}
 	Ui::Emoji::ClearSourceImages(images);
@@ -416,12 +707,19 @@ void Application::clearEmojiSourceImages() {
 	});
 }
 
+bool Application::isActiveForTrayMenu() const {
+	return ranges::any_of(ranges::views::values(_windows), [=](
+			const std::unique_ptr<Window::Controller> &controller) {
+		return controller->widget()->isActiveForTrayMenu();
+	});
+}
+
 bool Application::hideMediaView() {
-	if (_mediaView && !_mediaView->isHidden()) {
-		_mediaView->hide();
-		if (const auto window = activeWindow()) {
-			window->reActivate();
-		}
+	if (_mediaView
+		&& _mediaView->isFullScreen()
+		&& !_mediaView->isMinimized()
+		&& !_mediaView->isHidden()) {
+		_mediaView->close();
 		return true;
 	}
 	return false;
@@ -429,15 +727,39 @@ bool Application::hideMediaView() {
 
 bool Application::eventFilter(QObject *object, QEvent *e) {
 	switch (e->type()) {
-	case QEvent::KeyPress:
+	case QEvent::KeyPress: {
+		updateNonIdle();
+		_inAppKeyPressed.fire({});
+		const auto event = static_cast<QKeyEvent*>(e);
+		if (base::Platform::GlobalShortcuts::IsToggleFullScreenKey(event)
+			&& toggleActiveWindowFullScreen()) {
+			return true;
+		} else if (Shortcuts::HandlePossibleChatSwitch(event)) {
+			return true;
+		} else if (HandleKeysLegendHotkey(this, object, event)) {
+			return true;
+		}
+	} break;
 	case QEvent::MouseButtonPress:
 	case QEvent::TouchBegin:
 	case QEvent::Wheel: {
 		updateNonIdle();
 	} break;
 
+	case QEvent::KeyRelease: {
+		const auto event = static_cast<QKeyEvent*>(e);
+		if (Shortcuts::HandlePossibleChatSwitch(event)) {
+			return true;
+		}
+	} break;
+
 	case QEvent::ShortcutOverride: {
-		// handle shortcuts ourselves
+		// Ctrl+Tab/Ctrl+Shift+Tab chat switch is a special shortcut case,
+		// because it not only does an action on the shortcut activation,
+		// but also keeps the UI visible until you release the Ctrl key.
+		Shortcuts::HandlePossibleChatSwitch(static_cast<QKeyEvent*>(e));
+
+		// Handle all the shortcut management manually.
 		return true;
 	} break;
 
@@ -445,7 +767,7 @@ bool Application::eventFilter(QObject *object, QEvent *e) {
 		const auto event = static_cast<QShortcutEvent*>(e);
 		DEBUG_LOG(("Shortcut event caught: %1"
 			).arg(event->key().toString()));
-		if (Shortcuts::HandleEvent(event)) {
+		if (Shortcuts::HandleEvent(object, event)) {
 			return true;
 		}
 	} break;
@@ -458,21 +780,84 @@ bool Application::eventFilter(QObject *object, QEvent *e) {
 
 	case QEvent::FileOpen: {
 		if (object == QCoreApplication::instance()) {
+			if (_urlsToOpen.isEmpty()) {
+				InvokeQueued(this, [=] {
+					const auto activateRequired = ranges::any_of(
+						ranges::views::all(
+							_urlsToOpen
+						 ) | ranges::views::transform([](const QUrl &url) {
+							return url.toString();
+						}),
+						StartUrlRequiresActivate);
+					cRefStartUrls() << base::take(_urlsToOpen);
+					const auto activated = checkStartUrlsActivating();
+					if (!activateRequired) {
+						return;
+					} else if (activated) {
+						base::Platform::ActivateThisProcessWindow(
+							activated->winId());
+					} else if (_lastActivePrimaryWindow) {
+						_lastActivePrimaryWindow->activate();
+					}
+				});
+			}
 			const auto event = static_cast<QFileOpenEvent*>(e);
-			const auto url = QString::fromUtf8(
-				event->url().toEncoded().trimmed());
-			if (url.startsWith(qstr("tg://"), Qt::CaseInsensitive)) {
-				cSetStartUrl(url.mid(0, 8192));
-				checkStartUrl();
-			}
-			if (StartUrlRequiresActivate(url)) {
-				_window->activate();
-			}
+			_urlsToOpen << event->url().toString(QUrl::FullyEncoded).mid(
+				0,
+				8192);
+		}
+	} break;
+
+	case QEvent::ThemeChange: {
+		if (Platform::IsLinux() && object == qApp) {
+			refreshApplicationIcon();
+			tray().updateIconCounters();
 		}
 	} break;
 	}
 
+	switch (e->type()) {
+	case QEvent::TouchBegin:
+		Ui::Integration::Instance().touchCounterIncrement();
+		[[fallthrough]];
+	case QEvent::TouchUpdate:
+	case QEvent::TouchEnd: {
+		_lastTouchProcessed = object->isWidgetType();
+	} break;
+
+	case QEvent::MouseButtonPress:
+	case QEvent::MouseButtonRelease:
+	case QEvent::MouseButtonDblClick:
+	case QEvent::MouseMove: {
+		const auto ev = static_cast<QMouseEvent*>(e);
+		if (ev->source() == Qt::MouseEventSynthesizedBySystem) {
+			const auto widget = static_cast<QWidget*>(object);
+			if (_lastTouchProcessed
+				|| (object->isWidgetType()
+					&& widget->testAttribute(Qt::WA_AcceptTouchEvents))) {
+				_lastMouseIgnored = true;
+				return true;
+			}
+		}
+		_lastMouseIgnored = false;
+	} break;
+
+	case QEvent::ContextMenu: {
+		const auto ev = static_cast<QContextMenuEvent*>(e);
+		return (ev->reason() == QContextMenuEvent::Mouse)
+			&& _lastMouseIgnored;
+	} break;
+	}
+
 	return QObject::eventFilter(object, e);
+}
+
+Settings &Application::settings() {
+	return _private->settings;
+}
+
+const Settings &Application::settings() const {
+	return _private->settings;
 }
 
 void Application::saveSettingsDelayed(crl::time delay) {
@@ -483,6 +868,18 @@ void Application::saveSettingsDelayed(crl::time delay) {
 
 void Application::saveSettings() {
 	Local::writeSettings();
+}
+
+bool Application::canReadDefaultDownloadPath() const {
+	return KSandbox::isInside()
+		? base::CanReadDirectory(
+			QStandardPaths::writableLocation(
+				QStandardPaths::DownloadLocation))
+		: true;
+}
+
+bool Application::canSaveFileWithoutAskingForPath() const {
+	return !settings().askDownloadPath();
 }
 
 MTP::Config &Application::fallbackProductionConfig() const {
@@ -512,41 +909,73 @@ void Application::constructFallbackProductionConfig(
 void Application::setCurrentProxy(
 		const MTP::ProxyData &proxy,
 		MTP::ProxyData::Settings settings) {
+	auto &my = _private->settings.proxy();
 	const auto current = [&] {
-		return _settings.proxy().isEnabled()
-			? _settings.proxy().selected()
-			: MTP::ProxyData();
+		return my.isEnabled() ? my.selected() : MTP::ProxyData();
 	};
 	const auto was = current();
-	_settings.proxy().setSelected(proxy);
-	_settings.proxy().setSettings(settings);
+	my.setSelected(proxy);
+	my.setSettings(settings);
 	const auto now = current();
+	if (_badProxyConfiguration && *_badProxyConfiguration != now) {
+		_badProxyConfiguration.reset();
+		if (const auto box = base::take(_badProxyDisableBox)) {
+			box->closeBox();
+		}
+	}
 	refreshGlobalProxy();
 	_proxyChanges.fire({ was, now });
-	_settings.proxy().connectionTypeChangesNotify();
+	my.connectionTypeChangesNotify();
+	proxyRotationSettingsChanged();
+}
+
+void Application::proxyRotationSettingsChanged() {
+	_private->proxyRotation->settingsChanged();
+}
+
+void Application::checkProxyRotation(
+		not_null<Main::Account*> account,
+		int32 state) {
+	_private->proxyRotation->handleConnectionStateChanged(account, state);
 }
 
 auto Application::proxyChanges() const -> rpl::producer<ProxyChange> {
 	return _proxyChanges.events();
 }
 
-void Application::badMtprotoConfigurationError() {
-	if (_settings.proxy().isEnabled() && !_badProxyDisableBox) {
-		const auto disableCallback = [=] {
-			setCurrentProxy(
-				_settings.proxy().selected(),
-				MTP::ProxyData::Settings::System);
-		};
-		_badProxyDisableBox = Ui::show(Box<InformBox>(
-			Lang::Hard::ProxyConfigError(),
-			disableCallback));
+void Application::badMtprotoConfigurationError(const MTP::ProxyData &proxy) {
+	const auto &current = settings().proxy();
+	if (_badProxyDisableBox
+		|| _badProxyConfiguration == proxy
+		|| !current.isEnabled()
+		|| current.selected() != proxy) {
+		return;
+	}
+	_badProxyConfiguration = proxy;
+	_badProxyDisableBox = Ui::show(Ui::MakeConfirmBox({
+		.text = Lang::Hard::ProxyConfigError(),
+		.confirmed = [=](Fn<void()> close) {
+			close();
+			const auto &current = settings().proxy();
+			if (current.isEnabled() && current.selected() == proxy) {
+				setCurrentProxy(
+					current.selected(),
+					MTP::ProxyData::Settings::System);
+			}
+		},
+		.confirmText = tr::lng_proxy_disable(),
+		.cancelText = tr::lng_cancel(),
+	}), Ui::LayerOption::KeepOther);
+	if (!_badProxyDisableBox) {
+		_badProxyConfiguration.reset();
 	}
 }
 
 void Application::startLocalStorage() {
+	Ui::GL::DetectLastCheckCrash();
 	Local::start();
 	_saveSettingsTimer.emplace([=] { saveSettings(); });
-	_settings.saveDelayedRequests() | rpl::start_with_next([=] {
+	settings().saveDelayedRequests() | rpl::on_next([=] {
 		saveSettingsDelayed();
 	}, _lifetime);
 }
@@ -554,13 +983,13 @@ void Application::startLocalStorage() {
 void Application::startEmojiImageLoader() {
 	_emojiImageLoader.with([
 		source = prepareEmojiSourceImages(),
-		large = _settings.largeEmoji()
+		large = settings().largeEmoji()
 	](Stickers::EmojiImageLoader &loader) mutable {
 		loader.init(std::move(source), large);
 	});
 
-	_settings.largeEmojiChanges(
-	) | rpl::start_with_next([=](bool large) {
+	settings().largeEmojiChanges(
+	) | rpl::on_next([=](bool large) {
 		if (large) {
 			_clearEmojiImageLoaderTimer.cancel();
 		} else {
@@ -570,7 +999,7 @@ void Application::startEmojiImageLoader() {
 	}, _lifetime);
 
 	Ui::Emoji::Updated(
-	) | rpl::start_with_next([=] {
+	) | rpl::on_next([=] {
 		_emojiImageLoader.with([
 			source = prepareEmojiSourceImages()
 		](Stickers::EmojiImageLoader &loader) mutable {
@@ -584,38 +1013,27 @@ void Application::setScreenIsLocked(bool locked) {
 }
 
 bool Application::screenIsLocked() const {
-	return _screenIsLocked;
+	return _screenIsLocked.current();
 }
 
-void Application::setDefaultFloatPlayerDelegate(
-		not_null<Media::Player::FloatDelegate*> delegate) {
-	Expects(!_defaultFloatPlayerDelegate == !_floatPlayers);
-
-	_defaultFloatPlayerDelegate = delegate;
-	_replacementFloatPlayerDelegate = nullptr;
-	if (_floatPlayers) {
-		_floatPlayers->replaceDelegate(delegate);
-	} else {
-		_floatPlayers = std::make_unique<Media::Player::FloatController>(
-			delegate);
-	}
+rpl::producer<bool> Application::screenIsLockedValue() const {
+	return _screenIsLocked.value();
 }
 
-void Application::replaceFloatPlayerDelegate(
-		not_null<Media::Player::FloatDelegate*> replacement) {
-	Expects(_floatPlayers != nullptr);
-
-	_replacementFloatPlayerDelegate = replacement;
-	_floatPlayers->replaceDelegate(replacement);
+void Application::notifySystemSleep() {
+	_systemSleep.fire({});
 }
 
-void Application::restoreFloatPlayerDelegate(
-		not_null<Media::Player::FloatDelegate*> replacement) {
-	Expects(_floatPlayers != nullptr);
+rpl::producer<> Application::systemSleepEvents() const {
+	return _systemSleep.events();
+}
 
-	if (_replacementFloatPlayerDelegate == replacement) {
-		_replacementFloatPlayerDelegate = nullptr;
-		_floatPlayers->replaceDelegate(_defaultFloatPlayerDelegate);
+void Application::floatPlayerToggleGifsPaused(bool paused) {
+	_floatPlayerGifsPaused = paused;
+	if (_lastActiveWindow) {
+		if (const auto delegate = _lastActiveWindow->floatPlayerDelegate()) {
+			delegate->floatPlayerToggleGifsPaused(paused);
+		}
 	}
 }
 
@@ -633,16 +1051,40 @@ void Application::logout(Main::Account *account) {
 	}
 }
 
+void Application::logoutWithChecks(Main::Account *account) {
+	const auto weak = base::make_weak(account);
+	const auto retry = [=] {
+		if (const auto account = weak.get()) {
+			logoutWithChecks(account);
+		}
+	};
+	if (!account || !account->sessionExists()) {
+		logout(account);
+	} else if (_exportManager->inProgress(&account->session())) {
+		_exportManager->stopWithConfirmation(retry);
+	} else if (account->session().uploadsInProgress()) {
+		account->session().uploadsStopWithConfirmation(retry);
+	} else if (_downloadManager->loadingInProgress(&account->session())) {
+		_downloadManager->loadingStopWithConfirmation(
+			retry,
+			&account->session());
+	} else {
+		logout(account);
+	}
+}
+
 void Application::forceLogOut(
 		not_null<Main::Account*> account,
 		const TextWithEntities &explanation) {
-	const auto box = Ui::show(Box<InformBox>(
-		explanation,
-		tr::lng_passcode_logout(tr::now)));
+	const auto box = Ui::show(Ui::MakeConfirmBox({
+		.text = explanation,
+		.confirmText = tr::lng_passcode_logout(tr::now),
+		.inform = true,
+	}));
 	box->setCloseByEscape(false);
 	box->setCloseByOutsideClick(false);
-	const auto weak = base::make_weak(account.get());
-	connect(box, &QObject::destroyed, [=] {
+	const auto weak = base::make_weak(account);
+	connect(box.get(), &QObject::destroyed, [=] {
 		crl::on_main(weak, [=] {
 			account->forcedLogOut();
 		});
@@ -656,28 +1098,34 @@ void Application::checkLocalTime() {
 		base::ConcurrentTimerEnvironment::Adjust();
 		base::unixtime::http_invalidate();
 	}
-	if (const auto session = maybeActiveSession()) {
+	if (const auto session = maybePrimarySession()) {
 		session->updates().checkLastUpdate(adjusted);
 	}
 }
 
 void Application::handleAppActivated() {
 	checkLocalTime();
-	if (_window) {
-		_window->updateIsActiveFocus();
+	if (_lastActiveWindow) {
+		_lastActiveWindow->updateIsActiveFocus();
 	}
 }
 
 void Application::handleAppDeactivated() {
-	if (_window) {
-		_window->updateIsActiveBlur();
+	enumerateWindows([&](not_null<Window::Controller*> w) {
+		w->updateIsActiveBlur();
+	});
+	const auto session = _lastActiveWindow
+		? _lastActiveWindow->maybeSession()
+		: nullptr;
+	if (session) {
+		session->updates().updateOnline();
 	}
 	Ui::Tooltip::Hide();
 }
 
 rpl::producer<bool> Application::appDeactivatedValue() const {
-	const auto &app =
-		static_cast<QGuiApplication*>(QCoreApplication::instance());
+	const auto &app
+		= static_cast<QGuiApplication*>(QCoreApplication::instance());
 	return rpl::single(
 		app->applicationState()
 	) | rpl::then(
@@ -689,55 +1137,87 @@ rpl::producer<bool> Application::appDeactivatedValue() const {
 	});
 }
 
-void Application::call_handleObservables() {
-	base::HandleObservables();
+void Application::materializeLocalDrafts() {
+	_materializeLocalDraftsRequests.fire({});
+}
+
+rpl::producer<> Application::materializeLocalDraftsRequests() const {
+	return _materializeLocalDraftsRequests.events();
 }
 
 void Application::switchDebugMode() {
 	if (Logs::DebugEnabled()) {
 		Logs::SetDebugEnabled(false);
-		_launcher->writeDebugModeSetting();
-		App::restart();
+		Launcher::Instance().writeDebugModeSetting();
+		Restart();
 	} else {
 		Logs::SetDebugEnabled(true);
-		_launcher->writeDebugModeSetting();
+		Launcher::Instance().writeDebugModeSetting();
 		DEBUG_LOG(("Debug logs started."));
-		Ui::hideLayer();
-	}
-}
-
-void Application::switchFreeType() {
-	if (cUseFreeType()) {
-		QFile(cWorkingDir() + qsl("tdata/withfreetype")).remove();
-		cSetUseFreeType(false);
-	} else {
-		QFile f(cWorkingDir() + qsl("tdata/withfreetype"));
-		if (f.open(QIODevice::WriteOnly)) {
-			f.write("1");
-			f.close();
+		if (_lastActivePrimaryWindow) {
+			_lastActivePrimaryWindow->hideLayer();
 		}
-		cSetUseFreeType(true);
 	}
-	App::restart();
-}
-
-void Application::writeInstallBetaVersionsSetting() {
-	_launcher->writeInstallBetaVersionsSetting();
 }
 
 Main::Account &Application::activeAccount() const {
 	return _domain->active();
 }
 
-Main::Session *Application::maybeActiveSession() const {
+Main::Session *Application::maybePrimarySession() const {
 	return _domain->started() ? activeAccount().maybeSession() : nullptr;
 }
 
 bool Application::exportPreventsQuit() {
 	if (_exportManager->inProgress()) {
 		_exportManager->stopWithConfirmation([] {
-			App::quit();
+			Quit();
 		});
+		return true;
+	}
+	return false;
+}
+
+bool Application::uploadPreventsQuit() {
+	if (!_domain->started()) {
+		return false;
+	}
+	for (const auto &[index, account] : _domain->accounts()) {
+		if (!account->sessionExists()) {
+			continue;
+		}
+		if (account->session().uploadsInProgress()) {
+			account->session().uploadsStopWithConfirmation([=] {
+				for (const auto &[index, account] : _domain->accounts()) {
+					if (account->sessionExists()) {
+						account->session().uploadsStop();
+					}
+				}
+				Quit();
+			});
+			return true;
+		}
+	}
+	return false;
+}
+
+bool Application::downloadPreventsQuit() {
+	if (_downloadManager->loadingInProgress()) {
+		_downloadManager->loadingStopWithConfirmation([=] { Quit(); });
+		return true;
+	}
+	return false;
+}
+
+bool Application::preventsQuit(QuitReason reason) {
+	if (exportPreventsQuit()
+		|| uploadPreventsQuit()
+		|| downloadPreventsQuit()) {
+		return true;
+	} else if ((!_mediaView
+		|| _mediaView->isHidden()
+		|| !_mediaView->isFullScreen())
+		&& Platform::PreventsQuit(reason)) {
 		return true;
 	}
 	return false;
@@ -769,17 +1249,96 @@ bool Application::canApplyLangPackWithoutRestart() const {
 	return true;
 }
 
-void Application::checkStartUrl() {
-	if (!cStartUrl().isEmpty() && _window && !_window->locked()) {
-		const auto url = cStartUrl();
-		cSetStartUrl(QString());
-		if (!openLocalUrl(url, {})) {
-			cSetStartUrl(url);
+void Application::checkStartUrls() {
+	if (_setupEmailLock.current()) {
+		return;
+	}
+	if (!Core::App().passcodeLocked()) {
+		// WHY: tg://resolve?acc= switches the account, which shows the
+		// new main widget and re-enters here while we still iterate,
+		// so take the list out and merge whatever was added meanwhile.
+		const auto urls = base::take(cRefStartUrls());
+		auto left = ranges::views::all(
+			urls
+		) | ranges::views::filter([&](const QUrl &url) {
+			if (url.scheme() == u"tonsite"_q) {
+				iv().showTonSite(url.toString(), {});
+				return false;
+			} else if (url.scheme() == u"ton"_q) {
+				const auto window = _lastActivePrimaryWindow;
+				const auto controller = (window && !window->locked())
+					? window->sessionController()
+					: nullptr;
+				if (!controller) {
+					return true;
+				}
+				Wallet::OpenTransferLink(
+					controller,
+					url.toString(QUrl::FullyEncoded));
+				return false;
+			} else if (_lastActivePrimaryWindow) {
+				const auto local = TryConvertUrlToLocal(url.toString());
+				return IsGetPremiumLocalUrl(local)
+					? !openInternalUrl(local, {})
+					: !openLocalUrl(local, {});
+			}
+			return true;
+		}) | ranges::to<QList<QUrl>>;
+		left.append(base::take(cRefStartUrls()));
+		cRefStartUrls() = std::move(left);
+	}
+	if (!cRefStartUrls().isEmpty()
+		&& _lastActivePrimaryWindow
+		&& !_lastActivePrimaryWindow->locked()) {
+		auto paths = QStringList();
+		cRefStartUrls() = ranges::views::all(
+			cRefStartUrls()
+		) | ranges::views::filter([&](const QUrl &url) {
+			if (url.isLocalFile()) {
+				paths.append(url.toLocalFile());
+				return false;
+			}
+			return true;
+		}) | ranges::to<QList<QUrl>>;
+		if (!paths.isEmpty()) {
+			_lastActivePrimaryWindow->widget()->handleStartFiles(
+				std::move(paths));
 		}
 	}
 }
 
+QPointer<QWidget> Application::checkStartUrlsActivating() {
+	if (_startUrlActivated) {
+		checkStartUrls();
+		return nullptr;
+	}
+	_startUrlActivated.emplace();
+	checkStartUrls();
+	return *base::take(_startUrlActivated);
+}
+
+void Application::registerWindowActivation(not_null<QWidget*> window) {
+	if (_startUrlActivated) {
+		*_startUrlActivated = window.get();
+	}
+}
+
 bool Application::openLocalUrl(const QString &url, QVariant context) {
+	const auto urlTrimmed = url.trimmed();
+	const auto protocol = u"tg://"_q;
+	if (urlTrimmed.startsWith(protocol, Qt::CaseInsensitive)
+		&& !passcodeLocked()) {
+		const auto command = urlTrimmed.mid(protocol.size());
+		const auto my = context.value<ClickHandlerContext>();
+		const auto controller = my.sessionWindow.get()
+			? my.sessionWindow.get()
+			: _lastActivePrimaryWindow
+			? _lastActivePrimaryWindow->sessionController()
+			: nullptr;
+		if (TryRouterForLocalUrl(controller, command)) {
+			return true;
+		}
+	}
 	return openCustomUrl("tg://", LocalUrlHandlers(), url, context);
 }
 
@@ -788,36 +1347,7 @@ bool Application::openInternalUrl(const QString &url, QVariant context) {
 }
 
 QString Application::changelogLink() const {
-	const auto base = u"https://desktop.telegram.org/changelog"_q;
-	const auto languages = {
-		"id",
-		"de",
-		"fr",
-		"nl",
-		"pl",
-		"tr",
-		"uk",
-		"fa",
-		"ru",
-		"ms",
-		"es",
-		"it",
-		"uz",
-		"pt-br",
-		"be",
-		"ar",
-		"ko",
-	};
-	const auto current = _langpack->id().replace("-raw", "");
-	if (current.isEmpty()) {
-		return base;
-	}
-	for (const auto language : languages) {
-		if (current == language || current.split(u'-')[0] == language) {
-			return base + "?setln=" + language;
-		}
-	}
-	return base;
+	return u"https://telegramdesktop.github.io/tdesktop/changelog/"_q;
 }
 
 bool Application::openCustomUrl(
@@ -830,8 +1360,23 @@ bool Application::openCustomUrl(
 		|| passcodeLocked()) {
 		return false;
 	}
-	const auto command = urlTrimmed.midRef(protocol.size(), 8192);
-	const auto controller = _window ? _window->sessionController() : nullptr;
+	auto skip = protocol.size();
+	if (protocol == u"internal:"_q) {
+		static const auto kTagExp = QRegularExpression(
+			u"^\\~[a-zA-Z0-9_\\-]+\\~:"_q);
+		const auto match = kTagExp.match(
+			base::StringViewMid(urlTrimmed, skip));
+		if (match.hasMatch()) {
+			skip += match.capturedLength();
+		}
+	}
+	const auto command = base::StringViewMid(urlTrimmed, skip, 8192);
+	const auto my = context.value<ClickHandlerContext>();
+	const auto controller = my.sessionWindow.get()
+		? my.sessionWindow.get()
+		: _lastActivePrimaryWindow
+		? _lastActivePrimaryWindow->sessionController()
+		: nullptr;
 
 	using namespace qthelp;
 	const auto options = RegExOption::CaseInsensitive;
@@ -842,27 +1387,44 @@ bool Application::openCustomUrl(
 		}
 	}
 	return false;
-
 }
 
 void Application::preventOrInvoke(Fn<void()> &&callback) {
-	_window->preventOrInvoke(std::move(callback));
+	if (_lastActivePrimaryWindow) {
+		_lastActivePrimaryWindow->preventOrInvoke(std::move(callback));
+	} else {
+		callback();
+	}
+}
+
+void Application::updateWindowTitles() {
+	enumerateWindows([](not_null<Window::Controller*> window) {
+		window->widget()->updateTitle();
+	});
 }
 
 void Application::lockByPasscode() {
+	_passcodeLock = true;
+	enumerateWindows([&](not_null<Window::Controller*> w) {
+		w->setupPasscodeLock();
+	});
+	if (_mediaView) {
+		_mediaView->close();
+	}
+	_calls->hidePanelLayers();
+}
+
+void Application::maybeLockByPasscode() {
 	preventOrInvoke([=] {
-		if (_window) {
-			_passcodeLock = true;
-			_window->setupPasscodeLock();
-		}
+		lockByPasscode();
 	});
 }
 
 void Application::unlockPasscode() {
 	clearPasscodeLock();
-	if (_window) {
-		_window->clearPasscodeLock();
-	}
+	enumerateWindows([&](not_null<Window::Controller*> w) {
+		w->clearPasscodeLock();
+	});
 }
 
 void Application::clearPasscodeLock() {
@@ -876,7 +1438,7 @@ bool Application::passcodeLocked() const {
 
 void Application::updateNonIdle() {
 	_lastNonIdleTime = crl::now();
-	if (const auto session = maybeActiveSession()) {
+	if (const auto session = maybePrimarySession()) {
 		session->updates().checkIdleFinish(_lastNonIdleTime);
 	}
 }
@@ -887,12 +1449,32 @@ crl::time Application::lastNonIdleTime() const {
 		_lastNonIdleTime);
 }
 
+rpl::producer<> Application::inAppKeyPressed() const {
+	return _inAppKeyPressed.events();
+}
+
 rpl::producer<bool> Application::passcodeLockChanges() const {
 	return _passcodeLock.changes();
 }
 
 rpl::producer<bool> Application::passcodeLockValue() const {
 	return _passcodeLock.value();
+}
+
+void Application::lockBySetupEmail() {
+	_setupEmailLock = true;
+	closeAdditionalWindows();
+	enumerateWindows([&](not_null<Window::Controller*> w) {
+		w->setupSetupEmailLock();
+	});
+}
+
+void Application::unlockSetupEmail() {
+	_setupEmailLock = false;
+	enumerateWindows([&](not_null<Window::Controller*> w) {
+		w->clearSetupEmailLock();
+	});
+	checkStartUrls();
 }
 
 bool Application::someSessionExists() const {
@@ -905,6 +1487,7 @@ bool Application::someSessionExists() const {
 }
 
 void Application::checkAutoLock(crl::time lastNonIdleTime) {
+	// Cached verification stops planted bytes from disarming idle locking.
 	if (!_domain->local().hasLocalPasscode()
 		|| passcodeLocked()
 		|| !someSessionExists()) {
@@ -917,9 +1500,11 @@ void Application::checkAutoLock(crl::time lastNonIdleTime) {
 
 	checkLocalTime();
 	const auto now = crl::now();
-	const auto shouldLockInMs = _settings.autoLock() * 1000LL;
+	const auto shouldLockInMs = settings().autoLock() * 1000LL;
 	const auto checkTimeMs = now - lastNonIdleTime;
-	if (checkTimeMs >= shouldLockInMs || (_shouldLockAt > 0 && now > _shouldLockAt + kAutoLockTimeoutLateMs)) {
+	if (checkTimeMs >= shouldLockInMs
+		|| (_shouldLockAt > 0
+			&& now > _shouldLockAt + kAutoLockTimeoutLateMs)) {
 		_shouldLockAt = 0;
 		_autoLockTimer.cancel();
 		lockByPasscode();
@@ -943,52 +1528,426 @@ void Application::localPasscodeChanged() {
 	checkAutoLock(crl::now());
 }
 
+bool Application::isWindowInSettings(
+		not_null<Window::Controller*> window) const {
+	return (_windowInSettings == window);
+}
+
+void Application::reseedWindowInSettings() {
+	if (_windowInSettings) {
+		_windowInSettings->columns().seedFromSettings();
+	}
+}
+
 bool Application::hasActiveWindow(not_null<Main::Session*> session) const {
-	if (App::quitting() || !_window) {
+	if (Quitting() || !_lastActiveWindow) {
 		return false;
 	} else if (_calls->hasActivePanel(session)) {
 		return true;
-	} else if (const auto controller = _window->sessionController()) {
-		if (&controller->session() == session
-			&& _window->widget()->isActive()) {
+	} else if (_iv->hasActiveWindow(session)) {
+		return true;
+	} else if (const auto window = _lastActiveWindow) {
+		return (window->account().maybeSession() == session)
+			&& window->widget()->isActive();
+	}
+	return false;
+}
+
+Window::Controller *Application::activePrimaryWindow() const {
+	return _lastActivePrimaryWindow;
+}
+
+void Application::setActivePrimaryWindow(
+		not_null<Window::Controller*> window) {
+	if (window->isPrimary()) {
+		_lastActivePrimaryWindow = window;
+	}
+}
+
+Window::Controller *Application::separateWindowFor(
+		Window::SeparateId id) const {
+	for (const auto &[existingId, window] : _windows) {
+		if (existingId == id) {
+			return window.get();
+		}
+	}
+	return nullptr;
+}
+
+not_null<Window::Controller*> Application::ensureSeparateWindowFor(
+		Window::SeparateId id,
+		MsgId showAtMsgId) {
+	const auto activate = [&](not_null<Window::Controller*> window) {
+		window->activate();
+		return window;
+	};
+	if (const auto existing = separateWindowFor(id)) {
+		if (id.thread
+			&& id.type == Window::SeparateType::Chat
+			&& !passcodeLocked()) {
+			existing->sessionController()->showThread(
+				id.thread,
+				showAtMsgId,
+				Window::SectionShow::Way::ClearStack);
+		}
+		return activate(existing);
+	}
+
+	Assert(Window::CanShowSeparateWindow(id));
+
+	const auto result = _windows.emplace(
+		id,
+		std::make_unique<Window::Controller>(id, showAtMsgId)
+	).first->second.get();
+	processCreatedWindow(result);
+	if (passcodeLocked()) {
+		result->setupPasscodeLock();
+	}
+	result->firstShow();
+	result->finishFirstShow();
+	if (result->isPrimary()) {
+		if (!_lastActivePrimaryWindow) {
+			_lastActivePrimaryWindow = result;
+		}
+		if (!_windowInSettings) {
+			setWindowInSettings(result);
+		}
+	}
+	return activate(result);
+}
+
+Window::Controller *Application::windowFor(Window::SeparateId id) const {
+	if (const auto separate = separateWindowFor(id)) {
+		return separate;
+	} else if (id && !id.primary()) {
+		return windowFor(not_null(id.account));
+	}
+	return activePrimaryWindow();
+}
+
+Window::Controller *Application::windowForShowingHistory(
+		not_null<PeerData*> peer) const {
+	if (const auto separate = separateWindowFor(peer)) {
+		return separate;
+	}
+	auto result = (Window::Controller*)nullptr;
+	enumerateWindows([&](not_null<Window::Controller*> window) {
+		if (const auto controller = window->sessionController()) {
+			const auto current = controller->activeChatCurrent();
+			if (const auto history = current.history()) {
+				if (history->peer == peer) {
+					result = window;
+				}
+			}
+		}
+	});
+	return result;
+}
+
+Window::Controller *Application::windowForShowingForum(
+		not_null<Data::Forum*> forum) const {
+	const auto tabs = forum->bot() || forum->peer()->useSubsectionTabs();
+	const auto id = Window::SeparateId(
+		tabs ? Window::SeparateType::Chat : Window::SeparateType::Forum,
+		forum->history());
+	if (const auto separate = separateWindowFor(id)) {
+		return separate;
+	}
+	auto result = (Window::Controller*)nullptr;
+	enumerateWindows([&](not_null<Window::Controller*> window) {
+		if (const auto controller = window->sessionController()) {
+			if (tabs) {
+				if (controller->windowId() == id) {
+					result = window;
+				}
+			} else {
+				const auto current = controller->shownForum().current();
+				if (forum == current) {
+					result = window;
+				}
+			}
+		}
+	});
+	return result;
+}
+
+Window::Controller *Application::findWindow(
+		not_null<QWidget*> widget) const {
+	const auto window = widget->window();
+	if (_lastActiveWindow && _lastActiveWindow->widget() == window) {
+		return _lastActiveWindow;
+	}
+	for (const auto &[id, controller] : _windows) {
+		if (controller->widget() == window) {
+			return controller.get();
+		}
+	}
+	return nullptr;
+}
+
+Window::Controller *Application::activeWindow() const {
+	return _lastActiveWindow;
+}
+
+bool Application::closeNonLastAsync(not_null<Window::Controller*> window) {
+	const auto hasOther = [&] {
+		for (const auto &[id, controller] : _windows) {
+			if (id.primary()
+				&& !_closingAsyncWindows.contains(controller.get())
+				&& controller.get() != window
+				&& controller->maybeSession()) {
+				return true;
+			}
+		}
+		return false;
+	}();
+	if (!hasOther) {
+		return false;
+	}
+	_closingAsyncWindows.emplace(window);
+	crl::on_main(window, [=] { closeWindow(window); });
+	return true;
+}
+
+void Application::setLastActiveWindow(Window::Controller *window) {
+	_floatPlayerDelegateLifetime.destroy();
+
+	if (_floatPlayerGifsPaused && _lastActiveWindow) {
+		if (const auto delegate = _lastActiveWindow->floatPlayerDelegate()) {
+			delegate->floatPlayerToggleGifsPaused(false);
+		}
+	}
+	_lastActiveWindow = window;
+	if (window) {
+		const auto i = ranges::find(_windowStack, not_null(window));
+		if (i == end(_windowStack)) {
+			_windowStack.push_back(window);
+		} else if (i + 1 != end(_windowStack)) {
+			std::rotate(i, i + 1, end(_windowStack));
+		}
+	}
+	if (!window) {
+		_floatPlayers = nullptr;
+		return;
+	}
+	window->floatPlayerDelegateValue(
+	) | rpl::on_next([=](Media::Player::FloatDelegate *value) {
+		if (!value) {
+			_floatPlayers = nullptr;
+		} else if (_floatPlayers) {
+			_floatPlayers->replaceDelegate(value);
+		} else if (value) {
+			_floatPlayers = std::make_unique<Media::Player::FloatController>(
+				value);
+		}
+		if (value && _floatPlayerGifsPaused) {
+			value->floatPlayerToggleGifsPaused(true);
+		}
+	}, _floatPlayerDelegateLifetime);
+}
+
+void Application::setWindowInSettings(Window::Controller *window) {
+	Expects(!window || window->isPrimary());
+
+	if (_windowInSettings == window) {
+		return;
+	}
+	if (window) {
+		window->widget()->savePosition();
+	}
+	_windowInSettings = window;
+	if (window) {
+		window->widget()->savePositionToSettings();
+		window->columns().writeToSettings();
+		saveSettingsDelayed();
+	}
+}
+
+Window::Controller *Application::nextPrimaryWindow(
+		not_null<Window::Controller*> closing) const {
+	const auto eligible = [&](not_null<Window::Controller*> window) {
+		return (window != closing)
+			&& window->isPrimary()
+			&& !_closingAsyncWindows.contains(window);
+	};
+	for (const auto &window : ranges::views::reverse(_windowStack)) {
+		if (eligible(window)) {
+			return window;
+		}
+	}
+	for (const auto &window : ranges::views::values(_windows)) {
+		if (eligible(window.get())) {
+			return window.get();
+		}
+	}
+	return nullptr;
+}
+
+void Application::closeWindow(not_null<Window::Controller*> window) {
+	if (_savedWindows) {
+		_savedWindows->windowClosed(window);
+	}
+	const auto stackIt = ranges::find(_windowStack, window);
+	const auto nextFromStack = _windowStack.empty()
+		? nullptr
+		: (stackIt == end(_windowStack) || stackIt + 1 != end(_windowStack))
+		? _windowStack.back().get()
+		: (_windowStack.size() > 1)
+		? (stackIt - 1)->get()
+		: nullptr;
+	const auto next = nextFromStack
+		? nextFromStack
+		: (_windows.front().second.get() != window)
+		? _windows.front().second.get()
+		: (_windows.back().second.get() != window)
+		? _windows.back().second.get()
+		: nullptr;
+	Assert(next != window);
+
+	const auto nextPrimary = nextPrimaryWindow(window);
+	if (_lastActivePrimaryWindow == window) {
+		_lastActivePrimaryWindow = nextPrimary;
+	}
+	if (_windowInSettings == window) {
+		setWindowInSettings(nextPrimary);
+	}
+	if (stackIt != end(_windowStack)) {
+		_windowStack.erase(stackIt);
+	}
+	if (_lastActiveWindow == window) {
+		setLastActiveWindow(next);
+		if (_lastActiveWindow) {
+			_lastActiveWindow->activate();
+			_lastActiveWindow->widget()->updateGlobalMenu();
+		}
+	}
+	_closingAsyncWindows.remove(window);
+	for (auto i = begin(_windows); i != end(_windows);) {
+		if (i->second.get() == window) {
+			Assert(_lastActiveWindow != window);
+			Assert(_lastActivePrimaryWindow != window);
+			Assert(_windowInSettings != window);
+			i = _windows.erase(i);
+		} else {
+			++i;
+		}
+	}
+	const auto account = domain().started()
+		? &domain().active()
+		: nullptr;
+	if (account
+		&& !_windows.contains(Window::SeparateId(account))
+		&& _lastActiveWindow) {
+		domain().activate(&_lastActiveWindow->account());
+	}
+	if (_savedWindows) {
+		_savedWindows->scheduleSave();
+	}
+}
+
+void Application::closeChatFromWindows(not_null<PeerData*> peer) {
+	const auto closeOne = [&] {
+		for (const auto &[id, window] : _windows) {
+			if (id.thread && id.thread->peer() == peer) {
+				closeWindow(window.get());
+				return true;
+			} else if (const auto controller = window->sessionController()) {
+				if (controller->activeChatCurrent().peer() == peer) {
+					controller->showByInitialId();
+				}
+				if (const auto forum = controller->shownForum().current()) {
+					if (peer->forum() == forum) {
+						controller->closeForum();
+					}
+				}
+			}
+		}
+		return false;
+	};
+
+	while (closeOne()) {
+	}
+}
+
+void Application::windowActivated(not_null<Window::Controller*> window) {
+	const auto was = _lastActiveWindow;
+	const auto now = window;
+
+	setLastActiveWindow(window);
+
+	if (_savedWindows) {
+		_savedWindows->windowActivated();
+	}
+
+	if (window->isPrimary()) {
+		_lastActivePrimaryWindow = window;
+	}
+	window->widget()->updateGlobalMenu();
+
+	const auto wasSession = was ? was->maybeSession() : nullptr;
+	const auto nowSession = now->maybeSession();
+	if (wasSession != nowSession) {
+		if (wasSession) {
+			wasSession->updates().updateOnline();
+		}
+		if (nowSession) {
+			nowSession->updates().updateOnline();
+		}
+	}
+	if (_mediaView && _mediaView->takeFocusFrom(now->widget())) {
+		_mediaView->activate();
+	}
+}
+
+bool Application::closeOtherWindows() {
+	const auto keep = _lastActivePrimaryWindow
+		? _lastActivePrimaryWindow
+		: activeWindow();
+	auto toClose = std::vector<not_null<Window::Controller*>>();
+	for (const auto &[id, window] : _windows) {
+		if (window.get() != keep) {
+			toClose.push_back(window.get());
+		}
+	}
+	for (const auto &window : toClose) {
+		window->close();
+	}
+	if (keep && !toClose.empty()) {
+		keep->activate();
+	}
+	return !toClose.empty();
+}
+
+bool Application::closeActiveWindow() {
+	if (_mediaView && _mediaView->isActive()) {
+		_mediaView->close();
+		return true;
+	} else if (_iv->closeActive()
+		|| Iv::Editor::CloseActiveWindow()
+		|| calls().closeCurrentActiveCall()
+		|| (_savedWindows && _savedWindows->closeActiveShell())
+		|| Wallet::CloseActiveWindow()) {
+		return true;
+	} else if (const auto window = activeWindow()) {
+		if (window->widget()->isActive()) {
+			window->close();
 			return true;
 		}
 	}
 	return false;
 }
 
-void Application::saveCurrentDraftsToHistories() {
-	if (!_window) {
-		return;
-	} else if (const auto controller = _window->sessionController()) {
-		controller->content()->saveFieldToHistoryLocalDraft();
-	}
-}
-
-Window::Controller *Application::activeWindow() const {
-	return _window.get();
-}
-
-bool Application::closeActiveWindow() {
-	if (hideMediaView()) {
-		return true;
-	}
-	if (!calls().closeCurrentActiveCall()) {
-		if (const auto window = activeWindow()) {
-			if (window->widget()->isVisible()
-				&& window->widget()->isActive()) {
-				window->close();
-				return true;
-			}
-		}
-	}
-	return false;
-}
-
 bool Application::minimizeActiveWindow() {
-	hideMediaView();
-	if (!calls().minimizeCurrentActiveCall()) {
-		if (const auto window = activeWindow()) {
+	if (_mediaView && _mediaView->isActive()) {
+		_mediaView->minimize();
+		return true;
+	} else if (_iv->minimizeActive()
+		|| Iv::Editor::MinimizeActiveWindow()
+		|| calls().minimizeCurrentActiveCall()
+		|| Wallet::MinimizeActiveWindow()) {
+		return true;
+	} else if (const auto window = activeWindow()) {
+		if (window->widget()->isActive()) {
 			window->minimize();
 			return true;
 		}
@@ -996,12 +1955,32 @@ bool Application::minimizeActiveWindow() {
 	return false;
 }
 
+bool Application::toggleActiveWindowFullScreen() {
+	if (_mediaView && _mediaView->isActive()) {
+		_mediaView->toggleFullScreen();
+		return true;
+	} else if (calls().toggleFullScreenCurrentActiveCall()) {
+		return true;
+	} else if (const auto window = activeWindow()) {
+		if constexpr (Platform::IsMac()) {
+			if (window->widget()->isFullScreen()) {
+				window->widget()->showNormal();
+			} else {
+				window->widget()->showFullScreen();
+			}
+			return true;
+		}
+	}
+	return false;
+}
+
 QWidget *Application::getFileDialogParent() {
-	return (_mediaView && !_mediaView->isHidden())
-		? static_cast<QWidget*>(_mediaView->widget())
-		: activeWindow()
-		? static_cast<QWidget*>(activeWindow()->widget())
-		: nullptr;
+	if (const auto view = _mediaView.get(); view && !view->isHidden()) {
+		return view->widget();
+	} else if (const auto active = activeWindow()) {
+		return active->widget();
+	}
+	return nullptr;
 }
 
 void Application::notifyFileDialogShown(bool shown) {
@@ -1010,17 +1989,18 @@ void Application::notifyFileDialogShown(bool shown) {
 	}
 }
 
-void Application::checkMediaViewActivation() {
-	if (_mediaView && !_mediaView->isHidden()) {
-		_mediaView->activate();
-	}
-}
-
 QPoint Application::getPointForCallPanelCenter() const {
 	if (const auto window = activeWindow()) {
 		return window->getPointForCallPanelCenter();
 	}
-	return QGuiApplication::primaryScreen()->geometry().center();
+	// When the last monitor is removed QGuiApplication has no screens at
+	// all, so primaryScreen() is nullptr.
+	const auto primary = QGuiApplication::primaryScreen();
+	return primary ? primary->geometry().center() : QPoint();
+}
+
+bool Application::isSharingScreen() const {
+	return _calls->isSharingScreen();
 }
 
 // macOS Qt bug workaround, sometimes no leaveEvent() gets to the nested widgets.
@@ -1033,7 +2013,7 @@ void Application::registerLeaveSubscription(not_null<QWidget*> widget) {
 				if (e->type() == QEvent::Leave) {
 					if (const auto taken = _leaveFilters.take(window)) {
 						for (const auto &weak : taken->registered) {
-							if (const auto widget = weak.data()) {
+							if (const auto widget = weak.get()) {
 								QEvent ev(QEvent::Leave);
 								QCoreApplication::sendEvent(widget, &ev);
 							}
@@ -1063,8 +2043,8 @@ void Application::unregisterLeaveSubscription(not_null<QWidget*> widget) {
 		if (i != end(_leaveFilters)) {
 			i->second.registered = std::move(
 				i->second.registered
-			) | ranges::actions::remove_if([&](QPointer<QWidget> widget) {
-				const auto pointer = widget.data();
+			) | ranges::actions::remove_if([&](QPointer<QWidget> weak) {
+				const auto pointer = weak.data();
 				return !pointer || (pointer == widget);
 			});
 		}
@@ -1077,20 +2057,33 @@ void Application::postponeCall(FnMut<void()> &&callable) {
 }
 
 void Application::refreshGlobalProxy() {
+	const auto &proxySettings = settings().proxy();
+	const auto proxy = proxySettings.isEnabled()
+		? proxySettings.selected()
+		: MTP::ProxyData();
+	if (proxy.type == MTP::ProxyData::Type::Web && proxy.valid()) {
+		MTP::WebProxy::Transport::Activate(proxy);
+	} else {
+		MTP::WebProxy::Transport::Deactivate();
+	}
 	Sandbox::Instance().refreshGlobalProxy();
 }
 
-void Application::QuitAttempt() {
+void QuitAttempt() {
+	const auto savingSession = Sandbox::Instance().isSavingSession();
 	if (!IsAppLaunched()
-		|| Sandbox::Instance().isSavingSession()
+		|| savingSession
 		|| App().readyToQuit()) {
-		QApplication::quit();
+		Sandbox::QuitWhenStarted();
 	}
 }
 
 bool Application::readyToQuit() {
 	auto prevented = false;
 	if (_calls->isQuitPrevent()) {
+		prevented = true;
+	}
+	if (Tgw::Runtime::IsQuitPrevent()) {
 		prevented = true;
 	}
 	if (_domain->started()) {
@@ -1100,6 +2093,12 @@ bool Application::readyToQuit() {
 					prevented = true;
 				}
 				if (session->api().isQuitPrevent()) {
+					prevented = true;
+				}
+				if (session->data().stories().isQuitPrevent()) {
+					prevented = true;
+				}
+				if (session->data().reactions().isQuitPrevent()) {
 					prevented = true;
 				}
 			}
@@ -1113,38 +2112,55 @@ bool Application::readyToQuit() {
 }
 
 void Application::quitPreventFinished() {
-	if (App::quitting()) {
+	if (Quitting()) {
 		QuitAttempt();
 	}
 }
 
 void Application::quitDelayed() {
+	for (const auto &[id, controller] : _windows) {
+		controller->widget()->hide();
+	}
 	if (!_private->quitTimer.isActive()) {
-		_private->quitTimer.setCallback([] { QApplication::quit(); });
+		_private->quitTimer.setCallback([] { Sandbox::QuitWhenStarted(); });
 		_private->quitTimer.callOnce(kQuitPreventTimeoutMs);
 	}
+}
+
+void Application::refreshApplicationIcon() {
+	const auto session = (domain().started() && domain().active().sessionExists())
+		? &domain().active().session()
+		: nullptr;
+	refreshApplicationIcon(session);
+}
+
+void Application::refreshApplicationIcon(Main::Session *session) {
+	const auto support = session && session->supportMode();
+	Shortcuts::ToggleSupportShortcuts(support);
+	Platform::SetApplicationIcon(Window::CreateIcon(
+		session,
+		Platform::IsMac()));
 }
 
 void Application::startShortcuts() {
 	Shortcuts::Start();
 
 	_domain->activeSessionChanges(
-	) | rpl::start_with_next([=](Main::Session *session) {
-		const auto support = session && session->supportMode();
-		Shortcuts::ToggleSupportShortcuts(support);
-		Platform::SetApplicationIcon(Window::CreateIcon(session));
+	) | rpl::on_next([=](Main::Session *session) {
+		refreshApplicationIcon(session);
 	}, _lifetime);
 
 	Shortcuts::Requests(
-	) | rpl::start_with_next([=](not_null<Shortcuts::Request*> request) {
+	) | rpl::on_next([=](not_null<Shortcuts::Request*> request) {
 		using Command = Shortcuts::Command;
 		request->check(Command::Quit) && request->handle([] {
-			App::quit();
+			Quit();
 			return true;
 		});
 		request->check(Command::Lock) && request->handle([=] {
+			// Keep manual locking available for a verified app lock.
 			if (!passcodeLocked() && _domain->local().hasLocalPasscode()) {
-				lockByPasscode();
+				maybeLockByPasscode();
 				return true;
 			}
 			return false;
@@ -1155,16 +2171,48 @@ void Application::startShortcuts() {
 		request->check(Command::Close) && request->handle([=] {
 			return closeActiveWindow();
 		});
+		request->check(Command::ReopenClosedWindow) && request->handle([=] {
+			return _savedWindows && _savedWindows->reopenLastClosed();
+		});
+		request->check(Command::CloseOtherWindows) && request->handle([=] {
+			return closeOtherWindows();
+		});
 	}, _lifetime);
 }
 
 void Application::RegisterUrlScheme() {
+	const auto arguments = Launcher::Instance().customWorkingDir()
+		? u"-workdir \"%1\""_q.arg(cWorkingDir())
+		: QString();
+
 	base::Platform::RegisterUrlScheme(base::Platform::UrlSchemeDescriptor{
-		.executable = cExeDir() + cExeName(),
-		.arguments = qsl("-workdir \"%1\"").arg(cWorkingDir()),
-		.protocol = qsl("tg"),
-		.protocolName = qsl("Telegram Link"),
-		.shortAppName = qsl("tdesktop"),
+		.executable = Platform::ExecutablePathForShortcuts(),
+		.arguments = arguments,
+		.protocol = u"tg"_q,
+		.protocolName = u"Telegram Link"_q,
+		.shortAppName = u"tdesktop"_q,
+		.longAppName = QCoreApplication::applicationName(),
+		.displayAppName = AppName.utf16(),
+		.displayAppDescription = AppName.utf16(),
+	});
+
+	base::Platform::RegisterUrlScheme(base::Platform::UrlSchemeDescriptor{
+		.executable = Platform::ExecutablePathForShortcuts(),
+		.arguments = arguments,
+		.protocol = u"tonsite"_q,
+		.protocolName = u"TonSite Link"_q,
+		.shortAppName = u"tdesktop"_q,
+		.longAppName = QCoreApplication::applicationName(),
+		.displayAppName = AppName.utf16(),
+		.displayAppDescription = AppName.utf16(),
+	});
+
+	base::Platform::RegisterUrlScheme(base::Platform::UrlSchemeDescriptor{
+		.executable = Platform::ExecutablePathForShortcuts(),
+		.arguments = arguments,
+		.protocol = u"ton"_q,
+		.protocolName = u"Ton Link"_q,
+		.shortAppName = u"tdesktop"_q,
 		.longAppName = QCoreApplication::applicationName(),
 		.displayAppName = AppName.utf16(),
 		.displayAppDescription = AppName.utf16(),
@@ -1179,6 +2227,41 @@ Application &App() {
 	Expects(Application::Instance != nullptr);
 
 	return *Application::Instance;
+}
+
+void Quit(QuitReason reason) {
+   if (Quitting()) {
+	   return;
+   } else if (IsAppLaunched() && App().preventsQuit(reason)) {
+	   return;
+   }
+   SetLaunchState(LaunchState::QuitRequested);
+
+   QuitAttempt();
+}
+
+bool Quitting() {
+   return GlobalLaunchState != LaunchState::Running;
+}
+
+LaunchState CurrentLaunchState() {
+   return GlobalLaunchState;
+}
+
+void SetLaunchState(LaunchState state) {
+   GlobalLaunchState = state;
+}
+
+void Restart() {
+   const auto updateReady = !UpdaterDisabled()
+	   && (UpdateChecker().state() == UpdateChecker::State::Ready);
+   if (updateReady) {
+	   cSetRestartingUpdate(true);
+   } else {
+	   cSetRestarting(true);
+	   cSetRestartingToSettings(true);
+   }
+   Quit();
 }
 
 } // namespace Core

@@ -14,9 +14,12 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include <QtNetwork/QLocalSocket>
 #include <QtCore/QAbstractNativeEventFilter>
 
+class QLockFile;
+
 namespace Core {
 
-class Launcher;
+extern const char kOptionDeadlockDetector[];
+
 class UpdateChecker;
 class Application;
 
@@ -30,7 +33,7 @@ private:
 	}
 
 public:
-	Sandbox(not_null<Launcher*> launcher, int &argc, char **argv);
+	Sandbox(int &argc, char **argv);
 
 	Sandbox(const Sandbox &other) = delete;
 	Sandbox &operator=(const Sandbox &other) = delete;
@@ -38,9 +41,19 @@ public:
 	int start();
 
 	void refreshGlobalProxy();
-	uint64 installationTag() const;
 
 	void postponeCall(FnMut<void()> &&callable);
+
+	// Test-agent-only seam: runs every pending postponed call, and any
+	// calls they queue, regardless of loop-nesting tags. No-op without
+	// the -testagent switch. Call only from a top-level event context.
+	void drainPostponedCalls();
+
+	// Test-agent-only seam: while set, postponed calls queue but never
+	// run at event unwinds. The harness brackets synthetic dispatch with
+	// it and then drains explicitly. No-op without the -testagent switch.
+	void setPostponedCallsDeferred(bool deferred);
+
 	bool notify(QObject *receiver, QEvent *e) override;
 
 	template <typename Callable>
@@ -59,6 +72,7 @@ public:
 
 		return *static_cast<Sandbox*>(QCoreApplication::instance());
 	}
+	static void QuitWhenStarted();
 
 	~Sandbox();
 
@@ -66,15 +80,17 @@ protected:
 	bool event(QEvent *e) override;
 
 private:
-	typedef QPair<QLocalSocket*, QByteArray> LocalClient;
+	struct LocalClient {
+		QLocalSocket *socket = nullptr;
+		QByteArray buffer;
+		bool externalUrlReceived = false;
+	};
 	typedef QList<LocalClient> LocalClients;
 
 	struct PostponedCall {
 		int loopNestingLevel = 0;
 		FnMut<void()> callable;
 	};
-
-	bool notifyOrInvoke(QObject *receiver, QEvent *e);
 
 	void closeApplication(); // will be done in aboutToQuit()
 	void checkForQuit(); // will be done in exec()
@@ -85,12 +101,14 @@ private:
 	bool nativeEventFilter(
 		const QByteArray &eventType,
 		void *message,
-		long *result) override;
+		native_event_filter_result *result) override;
 	void processPostponedCalls(int level);
 	void singleInstanceChecked();
 	void launchApplication();
 	void setupScreenScale();
-	void execExternal(const QString &cmd);
+
+	// Return window id for activation.
+	uint64 execExternal(const QString &cmd);
 
 	// Single instance application
 	void socketConnected();
@@ -99,25 +117,29 @@ private:
 	void socketWritten(qint64 bytes);
 	void socketReading();
 	void newInstanceConnected();
+	int stopRunningInstance();
 
 	void readClients();
 	void removeClients();
 
+	QEventLoopLocker _eventLoopLocker;
 	const Qt::HANDLE _mainThreadId = nullptr;
 	int _eventNestingLevel = 0;
 	int _loopNestingLevel = 0;
 	std::vector<int> _previousLoopNestingLevels;
 	std::vector<PostponedCall> _postponedCalls;
-	SingleQueuedInvokation _handleObservables;
+	bool _postponedCallsDeferred = false;
 
-	not_null<Launcher*> _launcher;
 	std::unique_ptr<Application> _application;
 
 	QString _localServerName, _localSocketReadData;
 	QLocalServer _localServer;
 	QLocalSocket _localSocket;
 	LocalClients _localClients;
+	std::unique_ptr<QLockFile> _lockFile;
 	bool _secondInstance = false;
+	bool _started = false;
+	static bool QuitOnStartRequested;
 
 	std::unique_ptr<UpdateChecker> _updateChecker;
 
@@ -125,6 +147,10 @@ private:
 	MTP::ProxyData _sandboxProxy;
 
 	rpl::event_stream<> _widgetUpdateRequests;
+
+	std::unique_ptr<QThread> _deadlockDetector;
+
+	rpl::lifetime _lifetime;
 
 };
 

@@ -11,8 +11,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "ui/widgets/checkbox.h"
 #include "ui/wrap/vertical_layout.h"
 #include "ui/wrap/padding_wrap.h"
-#include "styles/style_boxes.h"
 #include "styles/style_layers.h"
+#include "styles/style_passcode_box.h"
 
 void SingleChoiceBox(
 		not_null<Ui::GenericBox*> box,
@@ -29,7 +29,7 @@ void SingleChoiceBox(
 		layout,
 		st::boxOptionListPadding.top() + st::autolockButton.margin.top()));
 	auto &&ints = ranges::views::ints(0, ranges::unreachable);
-	for (const auto [i, text] : ranges::views::zip(ints, args.options)) {
+	for (const auto &[i, text] : ranges::views::zip(ints, args.options)) {
 		layout->add(
 			object_ptr<Ui::Radiobutton>(
 				layout,
@@ -44,9 +44,9 @@ void SingleChoiceBox(
 				st::boxPadding.right(),
 				st::boxOptionListSkip));
 	}
-	const auto callback = args.callback;
+	const auto callback = args.callback.value();
 	group->setChangedCallback([=](int value) {
-		const auto weak = Ui::MakeWeak(box);
+		const auto weak = base::make_weak(box);
 		callback(value);
 		if (weak) {
 			box->closeBox();

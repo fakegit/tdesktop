@@ -8,7 +8,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "mtproto/details/mtproto_tcp_socket.h"
 
 #include "base/invoke_queued.h"
-#include "base/qt_adapters.h"
+
+#include <QtCore/QtEndian>
 
 namespace MTP::details {
 
@@ -47,7 +48,7 @@ TcpSocket::TcpSocket(
 		wrap([=] { _readyRead.fire({}); }));
 	connect(
 		&_socket,
-		base::QTcpSocket_error,
+		&QAbstractSocket::errorOccurred,
 		wrap([=](Error e) { handleError(e); }));
 }
 
@@ -59,9 +60,9 @@ bool TcpSocket::isGoodStartNonce(bytes::const_span nonce) {
 	Expects(nonce.size() >= 2 * sizeof(uint32));
 
 	const auto bytes = nonce.data();
-	const auto zero = *reinterpret_cast<const uchar*>(bytes);
-	const auto first = *reinterpret_cast<const uint32*>(bytes);
-	const auto second = *(reinterpret_cast<const uint32*>(bytes) + 1);
+	const auto zero = gsl::to_integer<uchar>(nonce.front());
+	const auto first = qFromUnaligned<uint32>(bytes);
+	const auto second = qFromUnaligned<uint32>(bytes + sizeof(uint32));
 	const auto reserved01 = 0x000000EFU;
 	const auto reserved11 = 0x44414548U;
 	const auto reserved12 = 0x54534F50U;
@@ -114,50 +115,12 @@ int32 TcpSocket::debugState() {
 	return _socket.state();
 }
 
-void TcpSocket::LogError(int errorCode, const QString &errorText) {
-	switch (errorCode) {
-	case QAbstractSocket::ConnectionRefusedError:
-		LOG(("TCP Error: socket connection refused - %1").arg(errorText));
-		break;
-
-	case QAbstractSocket::RemoteHostClosedError:
-		TCP_LOG(("TCP Info: remote host closed socket connection - %1"
-			).arg(errorText));
-		break;
-
-	case QAbstractSocket::HostNotFoundError:
-		LOG(("TCP Error: host not found - %1").arg(errorText));
-		break;
-
-	case QAbstractSocket::SocketTimeoutError:
-		LOG(("TCP Error: socket timeout - %1").arg(errorText));
-		break;
-
-	case QAbstractSocket::NetworkError: {
-		DEBUG_LOG(("TCP Error: network - %1").arg(errorText));
-	} break;
-
-	case QAbstractSocket::ProxyAuthenticationRequiredError:
-	case QAbstractSocket::ProxyConnectionRefusedError:
-	case QAbstractSocket::ProxyConnectionClosedError:
-	case QAbstractSocket::ProxyConnectionTimeoutError:
-	case QAbstractSocket::ProxyNotFoundError:
-	case QAbstractSocket::ProxyProtocolError:
-		LOG(("TCP Error: proxy (%1) - %2").arg(errorCode).arg(errorText));
-		break;
-
-	default:
-		LOG(("TCP Error: other (%1) - %2").arg(errorCode).arg(errorText));
-		break;
-	}
-
-	TCP_LOG(("TCP Error %1, restarting! - %2"
-		).arg(errorCode
-		).arg(errorText));
+QString TcpSocket::debugPostfix() const {
+	return QString();
 }
 
 void TcpSocket::handleError(int errorCode) {
-	LogError(errorCode, _socket.errorString());
+	logError(errorCode, _socket.errorString());
 	_error.fire({});
 }
 

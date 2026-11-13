@@ -1,7 +1,7 @@
-AppVersion         3000003
-AppVersionStrMajor 3.0
-AppVersionStrSmall 3.0.3
-AppVersionStr      3.0.3
-BetaChannel        1
+AppVersion         7004004
+AppVersionStrMajor 7.4
+AppVersionStrSmall 7.4.4
+AppVersionStr      7.4.4
+BetaChannel        0
 AlphaVersion       0
-AppVersionOriginal 3.0.3.beta
+AppVersionOriginal 7.4.4

@@ -7,25 +7,34 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #pragma once
 
-#include <rpl/producer.h>
 #include "info/info_content_widget.h"
 #include "storage/storage_shared_media.h"
 #include "data/data_search_controller.h"
 
-namespace Info {
-namespace Media {
+namespace tr {
+template <typename ...Tags>
+struct phrase;
+} // namespace tr
+
+namespace Data {
+class ForumTopic;
+} // namespace Data
+
+namespace Info::Media {
 
 using Type = Storage::SharedMediaType;
 
-std::optional<int> TypeToTabIndex(Type type);
-Type TabIndexToType(int index);
+[[nodiscard]] Type TabIndexToType(int index);
+[[nodiscard]] tr::phrase<> SharedMediaTitle(Type type);
 
 class InnerWidget;
 
 class Memento final : public ContentMemento {
 public:
-	Memento(not_null<Controller*> controller);
+	explicit Memento(not_null<Controller*> controller);
 	Memento(not_null<PeerData*> peer, PeerId migratedPeerId, Type type);
+	Memento(not_null<Data::ForumTopic*> topic, Type type);
+	Memento(not_null<Data::SavedSublist*> sublist, Type type);
 
 	using SearchState = Api::DelayedSearchController::SavedState;
 
@@ -34,48 +43,64 @@ public:
 		not_null<Controller*> controller,
 		const QRect &geometry) override;
 
-	Section section() const override;
+	[[nodiscard]] Section section() const override;
 
-	Type type() const {
+	[[nodiscard]] Type type() const {
 		return _type;
 	}
 
+	// Only for media, not for downloads.
 	void setAroundId(FullMsgId aroundId) {
 		_aroundId = aroundId;
 	}
-	FullMsgId aroundId() const {
+	[[nodiscard]] FullMsgId aroundId() const {
 		return _aroundId;
 	}
 	void setIdsLimit(int limit) {
 		_idsLimit = limit;
 	}
-	int idsLimit() const {
+	[[nodiscard]] int idsLimit() const {
 		return _idsLimit;
 	}
-	void setScrollTopItem(FullMsgId item) {
+
+	void setScrollTopItem(GlobalMsgId item) {
 		_scrollTopItem = item;
 	}
-	FullMsgId scrollTopItem() const {
+	[[nodiscard]] GlobalMsgId scrollTopItem() const {
 		return _scrollTopItem;
+	}
+	void setScrollTopItemPosition(int64 position) {
+		_scrollTopItemPosition = position;
+	}
+	[[nodiscard]] int64 scrollTopItemPosition() const {
+		return _scrollTopItemPosition;
 	}
 	void setScrollTopShift(int shift) {
 		_scrollTopShift = shift;
 	}
-	int scrollTopShift() const {
+	[[nodiscard]] int scrollTopShift() const {
 		return _scrollTopShift;
 	}
 	void setSearchState(SearchState &&state) {
 		_searchState = std::move(state);
 	}
-	SearchState searchState() {
+	[[nodiscard]] SearchState searchState() {
 		return std::move(_searchState);
 	}
 
 private:
+	Memento(
+		not_null<PeerData*> peer,
+		Data::ForumTopic *topic,
+		Data::SavedSublist *sublist,
+		PeerId migratedPeerId,
+		Type type);
+
 	Type _type = Type::Photo;
 	FullMsgId _aroundId;
 	int _idsLimit = 0;
-	FullMsgId _scrollTopItem;
+	int64 _scrollTopItemPosition = 0;
+	GlobalMsgId _scrollTopItem;
 	int _scrollTopShift = 0;
 	SearchState _searchState;
 
@@ -97,7 +122,12 @@ public:
 		not_null<Memento*> memento);
 
 	rpl::producer<SelectedItems> selectedListValue() const override;
-	void cancelSelection() override;
+	void selectionAction(SelectionAction action) override;
+
+	void fillTopBarMenu(const Ui::Menu::MenuCallback &addAction) override;
+	bool processZoomKey(not_null<QKeyEvent*> e) override;
+
+	rpl::producer<QString> title() override;
 
 private:
 	void saveState(not_null<Memento*> memento);
@@ -109,5 +139,4 @@ private:
 
 };
 
-} // namespace Media
-} // namespace Info
+} // namespace Info::Media

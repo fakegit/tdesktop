@@ -7,26 +7,18 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "data/data_shared_media.h"
 
-#include <rpl/combine.h>
-#include "main/main_session.h"
-#include "main/main_domain.h"
-#include "core/application.h"
 #include "apiwrap.h"
-#include "storage/storage_facade.h"
-#include "storage/storage_shared_media.h"
-#include "history/history.h"
-#include "history/history_item.h"
+#include "core/crash_reports.h"
+#include "data/components/scheduled_messages.h"
 #include "data/data_document.h"
 #include "data/data_media_types.h"
 #include "data/data_photo.h"
-#include "data/data_scheduled_messages.h"
-#include "data/data_sparse_ids.h"
+#include "data/data_saved_music.h"
 #include "data/data_session.h"
-#include "info/info_memento.h"
-#include "info/info_controller.h"
-#include "window/window_session_controller.h"
-#include "mainwindow.h"
-#include "core/crash_reports.h"
+#include "history/history.h"
+#include "history/history_item.h"
+#include "main/main_session.h"
+#include "storage/storage_facade.h"
 
 namespace {
 
@@ -87,35 +79,27 @@ std::optional<Storage::SharedMediaType> SharedMediaOverviewType(
 	case Type::MusicFile:
 	case Type::File:
 	case Type::RoundVoiceFile:
-	case Type::Link: return type;
+	case Type::Link:
+	case Type::Poll: return type;
 	}
 	return std::nullopt;
-}
-
-void SharedMediaShowOverview(
-		Storage::SharedMediaType type,
-		not_null<History*> history) {
-	if (SharedMediaOverviewType(type)) {
-		const auto &windows = history->session().windows();
-		if (windows.empty()) {
-			Core::App().domain().activate(&history->session().account());
-			if (windows.empty()) {
-				return;
-			}
-		}
-		windows.front()->showSection(std::make_shared<Info::Memento>(
-			history->peer,
-			Info::Section(type)));
-	}
 }
 
 bool SharedMediaAllowSearch(Storage::SharedMediaType type) {
 	switch (type) {
 	case Type::MusicFile:
 	case Type::File:
-	case Type::Link: return true;
+	case Type::Link:
+	case Type::Poll: return true;
 	default: return false;
 	}
+}
+
+Storage::SharedMediaKey SharedMediaLoadableKey(Storage::SharedMediaKey key) {
+	if (key.type == Type::ChatPhoto) {
+		key.topicRootId = MsgId(); // messages.search rejects it in threads.
+	}
+	return key;
 }
 
 rpl::producer<SparseIdsSlice> SharedMediaViewer(
@@ -126,6 +110,7 @@ rpl::producer<SparseIdsSlice> SharedMediaViewer(
 	Expects(IsServerMsgId(key.messageId) || (key.messageId == 0));
 	Expects((key.messageId != 0) || (limitBefore == 0 && limitAfter == 0));
 
+	key = SharedMediaLoadableKey(key);
 	return [=](auto consumer) {
 		auto lifetime = rpl::lifetime();
 		auto builder = lifetime.make_state<SparseIdsSliceBuilder>(
@@ -134,16 +119,20 @@ rpl::producer<SparseIdsSlice> SharedMediaViewer(
 			limitAfter);
 		auto requestMediaAround = [
 			peer = session->data().peer(key.peerId),
+			topicRootId = key.topicRootId,
+			monoforumPeerId = key.monoforumPeerId,
 			type = key.type
 		](const SparseIdsSliceBuilder::AroundData &data) {
 			peer->session().api().requestSharedMedia(
 				peer,
+				topicRootId,
+				monoforumPeerId,
 				type,
 				data.aroundId,
 				data.direction);
 		};
 		builder->insufficientAround(
-		) | rpl::start_with_next(requestMediaAround, lifetime);
+		) | rpl::on_next(requestMediaAround, lifetime);
 
 		auto pushNextSnapshot = [=] {
 			consumer.put_next(builder->snapshot());
@@ -153,28 +142,38 @@ rpl::producer<SparseIdsSlice> SharedMediaViewer(
 		session->storage().sharedMediaSliceUpdated(
 		) | rpl::filter([=](const SliceUpdate &update) {
 			return (update.peerId == key.peerId)
+				&& (update.topicRootId == key.topicRootId)
+				&& (update.monoforumPeerId == key.monoforumPeerId)
 				&& (update.type == key.type);
 		}) | rpl::filter([=](const SliceUpdate &update) {
 			return builder->applyUpdate(update.data);
-		}) | rpl::start_with_next(pushNextSnapshot, lifetime);
+		}) | rpl::on_next(pushNextSnapshot, lifetime);
 
 		using OneRemoved = Storage::SharedMediaRemoveOne;
 		session->storage().sharedMediaOneRemoved(
 		) | rpl::filter([=](const OneRemoved &update) {
 			return (update.peerId == key.peerId)
+				&& (!key.topicRootId
+					|| key.topicRootId == update.topicRootId)
+				&& (!key.monoforumPeerId
+					|| key.monoforumPeerId == update.monoforumPeerId)
 				&& update.types.test(key.type);
 		}) | rpl::filter([=](const OneRemoved &update) {
 			return builder->removeOne(update.messageId);
-		}) | rpl::start_with_next(pushNextSnapshot, lifetime);
+		}) | rpl::on_next(pushNextSnapshot, lifetime);
 
 		using AllRemoved = Storage::SharedMediaRemoveAll;
 		session->storage().sharedMediaAllRemoved(
 		) | rpl::filter([=](const AllRemoved &update) {
 			return (update.peerId == key.peerId)
-				&& (update.types.test(key.type));
+				&& (!update.topicRootId
+					|| update.topicRootId == key.topicRootId)
+				&& (!update.monoforumPeerId
+					|| update.monoforumPeerId == key.monoforumPeerId)
+				&& update.types.test(key.type);
 		}) | rpl::filter([=] {
 			return builder->removeAll();
-		}) | rpl::start_with_next(pushNextSnapshot, lifetime);
+		}) | rpl::on_next(pushNextSnapshot, lifetime);
 
 		using InvalidateBottom = Storage::SharedMediaInvalidateBottom;
 		session->storage().sharedMediaBottomInvalidated(
@@ -182,7 +181,7 @@ rpl::producer<SparseIdsSlice> SharedMediaViewer(
 			return (update.peerId == key.peerId);
 		}) | rpl::filter([=] {
 			return builder->invalidateBottom();
-		}) | rpl::start_with_next(pushNextSnapshot, lifetime);
+		}) | rpl::on_next(pushNextSnapshot, lifetime);
 
 		using Result = Storage::SharedMediaResult;
 		session->storage().query(Storage::SharedMediaQuery(
@@ -191,7 +190,7 @@ rpl::producer<SparseIdsSlice> SharedMediaViewer(
 			limitAfter
 		)) | rpl::filter([=](const Result &result) {
 			return builder->applyInitial(result);
-		}) | rpl::start_with_next_done(
+		}) | rpl::on_next_done(
 			pushNextSnapshot,
 			[=] { builder->checkInsufficient(); },
 			lifetime);
@@ -205,18 +204,17 @@ rpl::producer<SparseIdsMergedSlice> SharedScheduledMediaViewer(
 		SharedMediaMergedKey key,
 		int limitBefore,
 		int limitAfter) {
-	Expects(!IsServerMsgId(key.mergedKey.universalId));
+	Expects(!key.mergedKey.universalId
+		|| Data::IsScheduledMsgId(key.mergedKey.universalId));
 	Expects((key.mergedKey.universalId != 0)
 		|| (limitBefore == 0 && limitAfter == 0));
 
 	const auto history = session->data().history(key.mergedKey.peerId);
 
-	return rpl::single(
-		rpl::empty_value()
-	) | rpl::then(
-		session->data().scheduledMessages().updates(history)
+	return rpl::single(rpl::empty) | rpl::then(
+		session->scheduledMessages().updates(history)
 	) | rpl::map([=] {
-		const auto list = session->data().scheduledMessages().list(history);
+		const auto list = session->scheduledMessages().list(history);
 
 		auto items = ranges::views::all(
 			list.ids
@@ -249,6 +247,39 @@ rpl::producer<SparseIdsMergedSlice> SharedScheduledMediaViewer(
 	});
 }
 
+rpl::producer<SparseIdsMergedSlice> SavedMusicMediaViewer(
+		not_null<Main::Session*> session,
+		SharedMediaMergedKey key,
+		int limitBefore,
+		int limitAfter) {
+	Expects((key.mergedKey.universalId != 0)
+		|| (limitBefore == 0 && limitAfter == 0));
+
+	const auto peerId = key.mergedKey.peerId;
+	const auto item = key.mergedKey.universalId
+		? session->data().message(peerId, key.mergedKey.universalId)
+		: nullptr;
+
+	return Data::SavedMusicList(
+		session->data().peer(peerId),
+		item,
+		std::max(limitBefore, limitAfter)
+	) | rpl::map([=](const Data::SavedMusicSlice &slice) {
+		auto list = std::vector<MsgId>();
+		list.reserve(slice.size());
+		for (auto i = 0, count = int(slice.size()); i != count; ++i) {
+			list.push_back(slice[i]->id);
+		}
+		return SparseIdsMergedSlice(
+			key.mergedKey,
+			SparseUnsortedIdsSlice(
+				std::move(list),
+				slice.fullCount(),
+				slice.skippedBefore(),
+				slice.skippedAfter()));
+	});
+}
+
 rpl::producer<SparseIdsMergedSlice> SharedMediaMergedViewer(
 		not_null<Main::Session*> session,
 		SharedMediaMergedKey key,
@@ -256,6 +287,8 @@ rpl::producer<SparseIdsMergedSlice> SharedMediaMergedViewer(
 		int limitAfter) {
 	auto createSimpleViewer = [=](
 			PeerId peerId,
+			MsgId topicRootId,
+			PeerId monoforumPeerId,
 			SparseIdsSlice::Key simpleKey,
 			int limitBefore,
 			int limitAfter) {
@@ -263,6 +296,8 @@ rpl::producer<SparseIdsMergedSlice> SharedMediaMergedViewer(
 			session,
 			Storage::SharedMediaKey(
 				peerId,
+				topicRootId,
+				monoforumPeerId,
 				key.type,
 				simpleKey),
 			limitBefore,
@@ -365,8 +400,8 @@ std::optional<int> SharedMediaWithLastSlice::indexOf(Value value) const {
 			? QString::number(*_ending->skippedAfter())
 			: QString("-"));
 		if (const auto msgId = std::get_if<FullMsgId>(&value)) {
-			info.push_back("value:" + QString::number(msgId->channel.bare));
-			info.push_back(QString::number(msgId->msg));
+			info.push_back("value:" + QString::number(msgId->peer.value));
+			info.push_back(QString::number(msgId->msg.bare));
 			const auto index = _slice.indexOf(*std::get_if<FullMsgId>(&value));
 			info.push_back("index:" + (index
 				? QString::number(*index)
@@ -480,7 +515,7 @@ rpl::producer<SharedMediaWithLastSlice> SharedMediaWithLastViewer(
 				std::move(viewerKey),
 				limitBefore,
 				limitAfter
-			) | rpl::start_with_next([=](SparseIdsMergedSlice &&update) {
+			) | rpl::on_next([=](SparseIdsMergedSlice &&update) {
 				consumer.put_next(SharedMediaWithLastSlice(
 					session,
 					key,
@@ -489,13 +524,26 @@ rpl::producer<SharedMediaWithLastSlice> SharedMediaWithLastViewer(
 			});
 		}
 
-		if (key.scheduled) {
+		if (key.topicRootId == SharedMediaWithLastSlice::kScheduledTopicId) {
 			return SharedScheduledMediaViewer(
 				session,
 				std::move(viewerKey),
 				limitBefore,
 				limitAfter
-			) | rpl::start_with_next([=](SparseIdsMergedSlice &&update) {
+			) | rpl::on_next([=](SparseIdsMergedSlice &&update) {
+				consumer.put_next(SharedMediaWithLastSlice(
+					session,
+					key,
+					std::move(update),
+					std::nullopt));
+			});
+		} else if (key.topicRootId == SharedMediaWithLastSlice::kSavedMusicTopicId) {
+			return SavedMusicMediaViewer(
+				session,
+				std::move(viewerKey),
+				limitBefore,
+				limitAfter
+			) | rpl::on_next([=](SparseIdsMergedSlice &&update) {
 				consumer.put_next(SharedMediaWithLastSlice(
 					session,
 					key,
@@ -516,7 +564,7 @@ rpl::producer<SharedMediaWithLastSlice> SharedMediaWithLastViewer(
 					key.type),
 				1,
 				1)
-		) | rpl::start_with_next([=](
+		) | rpl::on_next([=](
 				SparseIdsMergedSlice &&viewer,
 				SparseIdsMergedSlice &&ending) {
 			consumer.put_next(SharedMediaWithLastSlice(

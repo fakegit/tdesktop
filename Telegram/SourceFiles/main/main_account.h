@@ -75,6 +75,7 @@ public:
 	[[nodiscard]] bool sessionExists() const;
 	[[nodiscard]] Session &session() const;
 	[[nodiscard]] Session *maybeSession() const;
+	[[nodiscard]] bool destroyingSession() const;
 	[[nodiscard]] rpl::producer<Session*> sessionValue() const;
 	[[nodiscard]] rpl::producer<Session*> sessionChanges() const;
 
@@ -109,6 +110,9 @@ public:
 
 	void suggestMainDcId(MTP::DcId mainDcId);
 	void destroyStaleAuthorizationKeys();
+
+	void setHandleLoginCode(Fn<void(QString)> callback);
+	void handleLoginCode(const QString &code) const;
 
 	[[nodiscard]] rpl::lifetime &lifetime() {
 		return _lifetime;
@@ -152,6 +156,8 @@ private:
 	std::unique_ptr<Session> _session;
 	rpl::variable<Session*> _sessionValue;
 
+	Fn<void(QString)> _handleLoginCode = nullptr;
+
 	UserId _sessionUserId = 0;
 	QByteArray _sessionUserSerialized;
 	int32 _sessionUserStreamVersion = 0;
@@ -159,6 +165,7 @@ private:
 	MTP::Instance::Fields _mtpFields;
 	MTP::AuthKeysList _mtpKeysToDestroy;
 	bool _loggingOut = false;
+	bool _destroyingSession = false;
 
 	rpl::lifetime _lifetime;
 

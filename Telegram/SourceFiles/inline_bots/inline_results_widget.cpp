@@ -17,6 +17,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "ui/widgets/scroll_area.h"
 #include "ui/image/image_prepare.h"
 #include "ui/cached_round_corners.h"
+#include "ui/ui_utility.h"
 #include "styles/style_chat_helpers.h"
 
 namespace InlineBots {
@@ -35,7 +36,11 @@ Widget::Widget(
 , _api(&_controller->session().mtp())
 , _contentMaxHeight(st::emojiPanMaxHeight)
 , _contentHeight(_contentMaxHeight)
+, _shadow(st::emojiPanAnimation.shadow)
 , _scroll(this, st::inlineBotsScroll)
+, _innerRounding(Ui::PrepareCornerPixmaps(
+	ImageRoundRadius::Small,
+	st::emojiPanBg))
 , _inlineRequestTimer([=] { onInlineRequest(); }) {
 	resize(QRect(0, 0, st::emojiPanWidth, _contentHeight).marginsAdded(innerPadding()).size());
 	_width = width();
@@ -48,29 +53,35 @@ Widget::Widget(
 
 	_inner->moveToLeft(0, 0, _scroll->width());
 
-	connect(
-		_scroll,
-		&Ui::ScrollArea::scrolled,
-		this,
-		&InlineBots::Layout::Widget::onScroll);
+	_scroll->scrolls(
+	) | rpl::on_next([=] {
+		onScroll();
+	}, lifetime());
 
 	_inner->inlineRowsCleared(
-	) | rpl::start_with_next([=] {
+	) | rpl::on_next([=] {
 		hideAnimated();
 		_inner->clearInlineRowsPanel();
+	}, lifetime());
+
+	style::PaletteChanged(
+	) | rpl::on_next([=] {
+		_innerRounding = Ui::PrepareCornerPixmaps(
+			ImageRoundRadius::Small,
+			st::emojiPanBg);
 	}, lifetime());
 
 	macWindowDeactivateEvents(
 	) | rpl::filter([=] {
 		return !isHidden();
-	}) | rpl::start_with_next([=] {
+	}) | rpl::on_next([=] {
 		leaveEvent(nullptr);
 	}, lifetime());
 
 	// Inner widget has OpaquePaintEvent attribute so it doesn't repaint on scroll.
 	// But we should force it to repaint so that GIFs will continue to animate without update() calls.
 	// We do that by creating a transparent widget above our _inner.
-	auto forceRepaintOnScroll = object_ptr<TWidget>(this);
+	auto forceRepaintOnScroll = object_ptr<RpWidget>(this);
 	forceRepaintOnScroll->setGeometry(innerRect().x() + st::roundRadiusSmall, innerRect().y() + st::roundRadiusSmall, st::roundRadiusSmall, st::roundRadiusSmall);
 	forceRepaintOnScroll->setAttribute(Qt::WA_TransparentForMouseEvents);
 	forceRepaintOnScroll->show();
@@ -86,7 +97,9 @@ void Widget::moveBottom(int bottom) {
 
 void Widget::updateContentHeight() {
 	auto addedHeight = innerPadding().top() + innerPadding().bottom();
-	auto wantedContentHeight = qRound(st::emojiPanHeightRatio * _bottom) - addedHeight;
+	const auto wanted
+		= int(base::SafeRound(st::emojiPanHeightRatio * _bottom));
+	auto wantedContentHeight = wanted - addedHeight;
 	auto contentHeight = std::clamp(
 		wantedContentHeight,
 		st::inlineResultsMinHeight,
@@ -120,7 +133,7 @@ void Widget::updateContentHeight() {
 }
 
 void Widget::paintEvent(QPaintEvent *e) {
-	Painter p(this);
+	auto p = QPainter(this);
 
 	auto opacityAnimating = _a_opacity.animating();
 
@@ -144,24 +157,30 @@ void Widget::paintEvent(QPaintEvent *e) {
 		hideFinished();
 	} else {
 		if (!_cache.isNull()) _cache = QPixmap();
-		if (!_inPanelGrab) Ui::Shadow::paint(p, innerRect(), width(), st::emojiPanAnimation.shadow);
+		if (!_inPanelGrab) _shadow.paint(p, innerRect(), st::roundRadiusSmall);
 		paintContent(p);
 	}
 }
 
-void Widget::paintContent(Painter &p) {
+void Widget::paintContent(QPainter &p) {
 	auto inner = innerRect();
-	Ui::FillRoundRect(p, inner, st::emojiPanBg, ImageRoundRadius::Small, RectPart::FullTop | RectPart::FullBottom);
+	const auto radius = st::roundRadiusSmall;
+
+	const auto top = Ui::CornersPixmaps{
+		.p = { _innerRounding.p[0], _innerRounding.p[1], QPixmap(), QPixmap() },
+	};
+	Ui::FillRoundRect(p, inner.x(), inner.y(), inner.width(), radius, st::emojiPanBg, top);
+
+	const auto bottom = Ui::CornersPixmaps{
+		.p = { QPixmap(), QPixmap(), _innerRounding.p[2], _innerRounding.p[3] },
+	};
+	Ui::FillRoundRect(p, inner.x(), inner.y() + inner.height() - radius, inner.width(), radius, st::emojiPanBg, bottom);
 
 	auto horizontal = horizontalRect();
 	auto sidesTop = horizontal.y();
 	auto sidesHeight = horizontal.height();
 	p.fillRect(myrtlrect(inner.x() + inner.width() - st::emojiScroll.width, sidesTop, st::emojiScroll.width, sidesHeight), st::emojiPanBg);
 	p.fillRect(myrtlrect(inner.x(), sidesTop, st::roundRadiusSmall, sidesHeight), st::emojiPanBg);
-}
-
-void Widget::moveByBottom() {
-	updateContentHeight();
 }
 
 void Widget::hideFast() {
@@ -217,7 +236,12 @@ void Widget::startShowAnimation() {
 
 		_showAnimation = std::make_unique<Ui::PanelAnimation>(st::emojiPanAnimation, Ui::PanelAnimation::Origin::BottomLeft);
 		auto inner = rect().marginsRemoved(st::emojiPanMargins);
-		_showAnimation->setFinalImage(std::move(image), QRect(inner.topLeft() * cIntRetinaFactor(), inner.size() * cIntRetinaFactor()));
+		_showAnimation->setFinalImage(
+			std::move(image),
+			QRect(
+				inner.topLeft() * style::DevicePixelRatio(),
+				inner.size() * style::DevicePixelRatio()),
+			st::emojiPanRadius);
 		_showAnimation->setCornerMasks(Images::CornersMask(ImageRoundRadius::Small));
 		_showAnimation->start();
 	}
@@ -227,8 +251,10 @@ void Widget::startShowAnimation() {
 
 QImage Widget::grabForPanelAnimation() {
 	Ui::SendPendingMoveResizeEvents(this);
-	auto result = QImage(size() * cIntRetinaFactor(), QImage::Format_ARGB32_Premultiplied);
-	result.setDevicePixelRatio(cRetinaFactor());
+	auto result = QImage(
+		size() * style::DevicePixelRatio(),
+		QImage::Format_ARGB32_Premultiplied);
+	result.setDevicePixelRatio(style::DevicePixelRatio());
 	result.fill(Qt::transparent);
 	_inPanelGrab = true;
 	render(&result);
@@ -240,12 +266,8 @@ void Widget::setResultSelectedCallback(Fn<void(ResultSelected)> callback) {
 	_inner->setResultSelectedCallback(std::move(callback));
 }
 
-void Widget::setSendMenuType(Fn<SendMenu::Type()> &&callback) {
-	_inner->setSendMenuType(std::move(callback));
-}
-
-void Widget::setCurrentDialogsEntryState(Dialogs::EntryState state) {
-	_inner->setCurrentDialogsEntryState(state);
+void Widget::setSendMenuDetails(Fn<SendMenu::Details()> &&callback) {
+	_inner->setSendMenuDetails(std::move(callback));
 }
 
 void Widget::hideAnimated() {
@@ -266,7 +288,6 @@ void Widget::hideFinished() {
 	_a_show.stop();
 	_showAnimation.reset();
 	_cache = QPixmap();
-	_horizontal = false;
 	_hiding = false;
 
 	_scroll->scrollToY(0);
@@ -352,10 +373,10 @@ void Widget::inlineResultsDone(const MTPmessages_BotResults &result) {
 	auto it = _inlineCache.find(_inlineQuery);
 	auto adding = (it != _inlineCache.cend());
 	if (result.type() == mtpc_messages_botResults) {
-		auto &d = result.c_messages_botResults();
+		const auto &d = result.c_messages_botResults();
 		_controller->session().data().processUsers(d.vusers());
 
-		auto &v = d.vresults().v;
+		const auto &v = d.vresults().v;
 		auto queryId = d.vquery_id().v;
 
 		if (it == _inlineCache.cend()) {
@@ -366,13 +387,17 @@ void Widget::inlineResultsDone(const MTPmessages_BotResults &result) {
 		auto entry = it->second.get();
 		entry->nextOffset = qs(d.vnext_offset().value_or_empty());
 		if (const auto switchPm = d.vswitch_pm()) {
-			switchPm->match([&](const MTPDinlineBotSwitchPM &data) {
-				entry->switchPmText = qs(data.vtext());
-				entry->switchPmStartToken = qs(data.vstart_param());
-			});
+			entry->switchPmText = qs(switchPm->data().vtext());
+			entry->switchPmStartToken = qs(switchPm->data().vstart_param());
+			entry->switchPmUrl = QByteArray();
+		} else if (const auto switchWebView = d.vswitch_webview()) {
+			entry->switchPmText = qs(switchWebView->data().vtext());
+			entry->switchPmStartToken = QString();
+			entry->switchPmUrl = switchWebView->data().vurl().v;
 		}
+		entry->gallery = d.is_gallery();
 
-		if (auto count = v.size()) {
+		if (const auto count = v.size()) {
 			entry->results.reserve(entry->results.size() + count);
 		}
 		auto added = 0;
@@ -441,14 +466,14 @@ void Widget::onInlineRequest() {
 	_requesting.fire(true);
 	_inlineRequestId = _api.request(MTPmessages_GetInlineBotResults(
 		MTP_flags(0),
-		_inlineBot->inputUser,
-		_inlineQueryPeer->input,
+		_inlineBot->inputUser(),
+		_inlineQueryPeer->input(),
 		MTPInputGeoPoint(),
 		MTP_string(_inlineQuery),
 		MTP_string(nextOffset)
 	)).done([=](const MTPmessages_BotResults &result) {
 		inlineResultsDone(result);
-	}).fail([=](const MTP::Error &error) {
+	}).fail([=] {
 		// show error?
 		_requesting.fire(false);
 		_inlineRequestId = 0;
@@ -457,7 +482,7 @@ void Widget::onInlineRequest() {
 
 bool Widget::refreshInlineRows(int *added) {
 	auto it = _inlineCache.find(_inlineQuery);
-	const CacheEntry *entry = nullptr;
+	auto entry = (const CacheEntry*)nullptr;
 	if (it != _inlineCache.cend()) {
 		if (!it->second->results.empty() || !it->second->switchPmText.isEmpty()) {
 			entry = it->second.get();

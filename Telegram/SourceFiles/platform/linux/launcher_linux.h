@@ -18,10 +18,12 @@ public:
 	int exec() override;
 
 private:
-	void initHook() override;
 	bool launchUpdater(UpdaterLaunch action) override;
+	bool installProtectedUpdate();
+	bool relaunchAfterUpdate(bool installed);
 
-	std::vector<std::string> _arguments;
+	bool _updating = false;
+	bool _updateFailed = false;
 
 };
 

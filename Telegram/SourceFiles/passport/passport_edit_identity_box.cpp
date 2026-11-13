@@ -8,7 +8,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "passport/passport_edit_identity_box.h"
 
 #include "passport/passport_panel_controller.h"
-#include "ui/widgets/input_fields.h"
+#include "ui/widgets/fields/input_field.h"
 #include "ui/widgets/buttons.h"
 #include "ui/text_options.h"
 #include "lang/lang_keys.h"
@@ -174,7 +174,7 @@ void IdentityBox::prepare() {
 		_scans.back()->setImage(scan.thumb);
 		_scans.back()->resizeToWidth(st::boxWideWidth);
 		_scans.back()->deleteClicks(
-		) | rpl::start_with_next([=] {
+		) | rpl::on_next([=] {
 			_controller->deleteScan(_valueIndex, index - 1);
 		}, lifetime());
 	}
@@ -186,7 +186,7 @@ void IdentityBox::prepare() {
 		closeBox();
 	});
 	_controller->scanUpdated(
-	) | rpl::start_with_next([=](ScanInfo &&info) {
+	) | rpl::on_next([=](ScanInfo &&info) {
 		updateScan(std::move(info));
 	}, lifetime());
 
@@ -267,9 +267,9 @@ void IdentityBox::updateControlsPosition() {
 
 void IdentityBox::chooseScan() {
 	const auto filter = FileDialog::AllFilesFilter()
-		+ qsl(";;Image files (*")
-		+ cImgExtensions().join(qsl(" *"))
-		+ qsl(")");
+		+ u";;Image files (*"_q
+		+ cImgExtensions().join(u" *"_q)
+		+ u")"_q;
 	const auto callback = [=](FileDialog::OpenResult &&result) {
 		if (result.paths.size() == 1) {
 			encryptScan(result.paths.front());

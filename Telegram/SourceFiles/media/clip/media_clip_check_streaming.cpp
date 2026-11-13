@@ -13,6 +13,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 #include <QtCore/QtEndian>
 #include <QtCore/QBuffer>
+#include <QtCore/QFile>
 
 namespace Media {
 namespace Clip {
@@ -71,11 +72,13 @@ bool CheckStreamingSupport(
 			return true;
 		}
 
+		auto headerSize = kHeaderSize;
 		const auto length = [&] {
 			const auto result = ReadBigEndian<uint32>(atomHeaderBytes);
 			if (result != 1) {
 				return uint64(result);
 			}
+			headerSize += kHeaderSize;
 			char atomSize64[kHeaderSize] = { 0 };
 			if (device->read(atomSize64, kHeaderSize) != kHeaderSize) {
 				return uint64(-1);
@@ -83,10 +86,13 @@ bool CheckStreamingSupport(
 			auto atomSize64Bytes = bytes::make_span(atomSize64);
 			return ReadBigEndian<uint64>(atomSize64Bytes);
 		}();
-		if (position + length > size) {
+		if (length < uint64(headerSize)
+			|| position < 0
+			|| position > size
+			|| length > uint64(size - position)
+			|| !device->seek(position + qint64(length))) {
 			break;
 		}
-		device->seek(position + length);
 		lastReadPosition = position;
 	}
 	return false;

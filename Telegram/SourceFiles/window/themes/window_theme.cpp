@@ -8,6 +8,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "window/themes/window_theme.h"
 
 #include "window/themes/window_theme_preview.h"
+#include "window/themes/window_themes_chat.h"
 #include "window/themes/window_themes_embedded.h"
 #include "window/themes/window_theme_editor.h"
 #include "window/window_controller.h"
@@ -18,34 +19,43 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "storage/localstorage.h"
 #include "storage/localimageloader.h"
 #include "storage/file_upload.h"
-#include "base/openssl_help.h"
+#include "base/random.h"
 #include "base/parse_helper.h"
 #include "base/zlib_help.h"
 #include "base/unixtime.h"
 #include "base/crc32hash.h"
+#include "base/never_freed_pointer.h"
+#include "base/qt_signal_producer.h"
 #include "data/data_session.h"
 #include "data/data_document_resolver.h"
 #include "main/main_account.h" // Account::local.
 #include "main/main_domain.h" // Domain::activeSessionValue.
+#include "lang/lang_keys.h"
 #include "ui/chat/chat_theme.h"
+#include "ui/chat/chat_theme_readability.h"
 #include "ui/image/image.h"
+#include "ui/image/image_prepare.h"
 #include "ui/style/style_palette_colorizer.h"
 #include "ui/ui_utility.h"
-#include "boxes/confirm_box.h"
+#include "ui/boxes/confirm_box.h"
 #include "boxes/background_box.h"
 #include "core/application.h"
-#include "styles/style_widgets.h"
-#include "styles/style_chat.h"
+#include "webview/webview_common.h"
 
 #include <QtCore/QBuffer>
+#include <QtCore/QJsonDocument>
+#include <QtCore/QJsonObject>
+#include <QtCore/QFileSystemWatcher>
+#include <QtGui/QGuiApplication>
+#include <QtGui/QStyleHints>
 
 namespace Window {
 namespace Theme {
 namespace {
 
-constexpr auto kThemeFileSizeLimit = 5 * 1024 * 1024;
 constexpr auto kBackgroundSizeLimit = 25 * 1024 * 1024;
 constexpr auto kNightThemeFile = ":/gui/night.tdesktop-theme"_cs;
+constexpr auto kDarkValueThreshold = 0.5;
 
 struct Applying {
 	Saved data;
@@ -53,7 +63,7 @@ struct Applying {
 	Fn<void()> overrideKeep;
 };
 
-NeverFreedPointer<ChatBackground> GlobalBackground;
+base::NeverFreedPointer<ChatBackground> GlobalBackground;
 Applying GlobalApplying;
 
 inline bool AreTestingTheme() {
@@ -64,7 +74,8 @@ inline bool AreTestingTheme() {
 	return Ui::ReadBackgroundImage(
 		u":/gui/art/background.tgv"_q,
 		QByteArray(),
-		true);
+		true
+	).image;
 }
 
 [[nodiscard]] bool GoodImageFormatAndSize(const QImage &image) {
@@ -154,7 +165,6 @@ bool readNameAndValue(const char *&from, const char *end, QLatin1String *outName
 
 enum class SetResult {
 	Ok,
-	Bad,
 	NotFound,
 };
 SetResult setColorSchemeValue(
@@ -202,7 +212,7 @@ SetResult setColorSchemeValue(
 	} else {
 		LOG(("Theme Error: Unexpected internal error."));
 	}
-	return SetResult::Bad;
+	Unexpected("Value after palette.setColor().");
 }
 
 bool loadColorScheme(
@@ -215,12 +225,24 @@ bool loadColorScheme(
 		value = unsupported.value(value, value);
 
 		auto result = setColorSchemeValue(name, value, colorizer, out);
-		if (result == SetResult::Bad) {
-			return false;
-		} else if (result == SetResult::NotFound) {
+		if (result == SetResult::NotFound) {
 			unsupported.insert(name, value);
 		}
 		return true;
+	});
+}
+
+void EnsureAccentReadable(
+		const style::palette &palette,
+		const QByteArray &content) {
+	auto reference = Instance();
+	if (!loadColorScheme(content, style::colorizer(), &reference)) {
+		return;
+	}
+	reference.palette.finalize();
+	Ui::EnsureBubblesReadable(palette, {
+		.dark = Ui::IsDarkPalette(reference.palette),
+		.reference = &reference.palette,
 	});
 }
 
@@ -267,12 +289,38 @@ bool loadBackground(zlib::FileToRead &file, QByteArray *outBackground, bool *out
 	return true;
 }
 
+std::optional<QByteArray> ReadPaletteContent(
+		zlib::FileToRead &file,
+		const QByteArray &content,
+		const std::optional<QByteArray> &editedPalette) {
+	unz_global_info globalInfo = { 0 };
+	file.getGlobalInfo(&globalInfo);
+	if (file.error() != UNZ_OK) {
+		// Looks like it is not a .zip theme.
+		return editedPalette.value_or(content);
+	}
+	auto schemeContent = editedPalette.value_or(QByteArray());
+	if (schemeContent.isEmpty()) {
+		schemeContent = file.readFileContent("colors.tdesktop-theme", zlib::kCaseInsensitive, kThemeSchemeSizeLimit);
+	}
+	if (schemeContent.isEmpty()) {
+		file.clearError();
+		schemeContent = file.readFileContent("colors.tdesktop-palette", zlib::kCaseInsensitive, kThemeSchemeSizeLimit);
+	}
+	if (file.error() != UNZ_OK) {
+		LOG(("Theme Error: could not read 'colors.tdesktop-theme' or 'colors.tdesktop-palette' in the theme file."));
+		return std::nullopt;
+	}
+	return schemeContent;
+}
+
 bool LoadTheme(
 		const QByteArray &content,
 		const style::colorizer &colorizer,
 		const std::optional<QByteArray> &editedPalette,
 		Cached *cache = nullptr,
-		Instance *out = nullptr) {
+		Instance *out = nullptr,
+		bool ensureReadable = false) {
 	if (content.size() < 4) {
 		LOG(("Theme Error: Bad theme content size: %1").arg(content.size()));
 		return false;
@@ -285,41 +333,37 @@ bool LoadTheme(
 
 	const auto emptyColorizer = style::colorizer();
 	const auto &paletteColorizer = editedPalette ? emptyColorizer : colorizer;
-
-	unz_global_info globalInfo = { 0 };
-	file.getGlobalInfo(&globalInfo);
+	const auto paletteContent = ReadPaletteContent(
+		file,
+		content,
+		editedPalette);
+	if (!paletteContent) {
+		return false;
+	} else if (!loadColorScheme(*paletteContent, paletteColorizer, out)) {
+		DEBUG_LOG(("Theme: Could not loadColorScheme."));
+		return false;
+	}
+	if (!out) {
+		Background()->saveAdjustableColors();
+	}
 	if (file.error() == UNZ_OK) {
-		auto schemeContent = editedPalette.value_or(QByteArray());
-		if (schemeContent.isEmpty()) {
-			schemeContent = file.readFileContent("colors.tdesktop-theme", zlib::kCaseInsensitive, kThemeSchemeSizeLimit);
-		}
-		if (schemeContent.isEmpty()) {
-			file.clearError();
-			schemeContent = file.readFileContent("colors.tdesktop-palette", zlib::kCaseInsensitive, kThemeSchemeSizeLimit);
-		}
-		if (file.error() != UNZ_OK) {
-			LOG(("Theme Error: could not read 'colors.tdesktop-theme' or 'colors.tdesktop-palette' in the theme file."));
-			return false;
-		}
-		if (!loadColorScheme(schemeContent, paletteColorizer, out)) {
-			return false;
-		}
-		if (!out) {
-			Background()->saveAdjustableColors();
-		}
-
 		auto backgroundTiled = false;
 		auto backgroundContent = QByteArray();
 		if (!loadBackground(file, &backgroundContent, &backgroundTiled)) {
+			DEBUG_LOG(("Theme: Could not loadBackground."));
 			return false;
 		}
 
 		if (!backgroundContent.isEmpty()) {
 			auto check = QBuffer(&backgroundContent);
 			auto reader = QImageReader(&check);
+			if (Images::IsSvgFormat(reader.format())) {
+				LOG(("Theme Error: SVG background is not supported."));
+				return false;
+			}
 			const auto size = reader.size();
 			if (size.isEmpty()
-				|| (size.width() * size.height() > kBackgroundSizeLimit)) {
+				|| (int64(size.width()) * size.height() > kBackgroundSizeLimit)) {
 				LOG(("Theme Error: bad background image size in the theme file."));
 				return false;
 			}
@@ -327,6 +371,7 @@ bool LoadTheme(
 				.content = backgroundContent,
 				.forceOpaque = true,
 			}).image;
+			background = Ui::PreprocessBackgroundImage(std::move(background));
 			if (background.isNull()) {
 				LOG(("Theme Error: could not read background image in the theme file."));
 				return false;
@@ -344,17 +389,14 @@ bool LoadTheme(
 			}
 			applyBackground(std::move(background), backgroundTiled, out);
 		}
-	} else {
-		// Looks like it is not a .zip theme.
-		if (!loadColorScheme(editedPalette.value_or(content), paletteColorizer, out)) {
-			return false;
-		}
-		if (!out) {
-			Background()->saveAdjustableColors();
-		}
 	}
 	if (out) {
 		out->palette.finalize(paletteColorizer);
+	}
+	if (ensureReadable && paletteColorizer) {
+		EnsureAccentReadable(
+			out ? out->palette : *style::main_palette::get(),
+			*paletteContent);
 	}
 	if (cache) {
 		if (out) {
@@ -383,7 +425,14 @@ bool InitializeFromCache(
 		QDataStream stream(cache.background);
 		QImageReader reader(stream.device());
 		reader.setAutoTransform(true);
-		if (!reader.read(&background) || background.isNull()) {
+		const auto size = reader.size();
+		if (size.isEmpty()
+			|| (int64(size.width()) * size.height() > kBackgroundSizeLimit)
+			|| !reader.read(&background)) {
+			return false;
+		}
+		background = Ui::PreprocessBackgroundImage(std::move(background));
+		if (background.isNull()) {
 			return false;
 		}
 	}
@@ -420,8 +469,29 @@ bool InitializeFromSaved(Saved &&saved) {
 		return true;
 	}
 
+	if (!editing
+		&& !saved.object.cloud.emoticon.isEmpty()
+		&& !saved.object.cloud.settings.empty()) {
+		auto preview = PreviewFromChatTheme(saved.object.cloud, IsNightMode());
+		if (preview) {
+			style::main_palette::apply(preview->instance.palette);
+			Background()->saveAdjustableColors();
+			saved.object.content = std::move(preview->object.content);
+			saved.cache = std::move(preview->instance.cached);
+			Local::writeTheme(saved);
+			return true;
+		}
+	}
+
 	const auto colorizer = ColorizerForTheme(saved.object.pathAbsolute);
-	if (!LoadTheme(saved.object.content, colorizer, editing, &saved.cache)) {
+	if (!LoadTheme(
+			saved.object.content,
+			colorizer,
+			editing,
+			&saved.cache,
+			nullptr,
+			true)) {
+		DEBUG_LOG(("Theme: Could not load from saved."));
 		return false;
 	}
 	if (editing) {
@@ -439,7 +509,7 @@ bool InitializeFromSaved(Saved &&saved) {
 		image = std::move(image).convertToFormat(
 			QImage::Format_ARGB32_Premultiplied);
 	}
-	image.setDevicePixelRatio(cRetinaFactor());
+	image.setDevicePixelRatio(style::DevicePixelRatio());
 	if (Data::IsLegacy3DefaultWallPaper(paper)) {
 		return Images::DitherImage(std::move(image));
 	}
@@ -448,70 +518,6 @@ bool InitializeFromSaved(Saved &&saved) {
 
 void ClearApplying() {
 	GlobalApplying = Applying();
-}
-
-SendMediaReady PrepareWallPaper(MTP::DcId dcId, const QImage &image) {
-	PreparedPhotoThumbs thumbnails;
-	QVector<MTPPhotoSize> sizes;
-
-	QByteArray jpeg;
-	QBuffer jpegBuffer(&jpeg);
-	image.save(&jpegBuffer, "JPG", 87);
-
-	const auto scaled = [&](int size) {
-		return image.scaled(
-			size,
-			size,
-			Qt::KeepAspectRatio,
-			Qt::SmoothTransformation);
-	};
-	const auto push = [&](const char *type, QImage &&image) {
-		sizes.push_back(MTP_photoSize(
-			MTP_string(type),
-			MTP_int(image.width()),
-			MTP_int(image.height()), MTP_int(0)));
-		thumbnails.emplace(
-			type[0],
-			PreparedPhotoThumb{ .image = std::move(image) });
-	};
-	push("s", scaled(320));
-
-	const auto filename = qsl("wallpaper.jpg");
-	auto attributes = QVector<MTPDocumentAttribute>(
-		1,
-		MTP_documentAttributeFilename(MTP_string(filename)));
-	attributes.push_back(MTP_documentAttributeImageSize(
-		MTP_int(image.width()),
-		MTP_int(image.height())));
-	const auto id = openssl::RandomValue<DocumentId>();
-	const auto document = MTP_document(
-		MTP_flags(0),
-		MTP_long(id),
-		MTP_long(0),
-		MTP_bytes(),
-		MTP_int(base::unixtime::now()),
-		MTP_string("image/jpeg"),
-		MTP_int(jpeg.size()),
-		MTP_vector<MTPPhotoSize>(sizes),
-		MTPVector<MTPVideoSize>(),
-		MTP_int(dcId),
-		MTP_vector<MTPDocumentAttribute>(attributes));
-
-	return SendMediaReady(
-		SendMediaType::ThemeFile,
-		QString(), // filepath
-		filename,
-		jpeg.size(),
-		jpeg,
-		id,
-		0,
-		QString(),
-		PeerId(),
-		MTP_photoEmpty(MTP_long(0)),
-		thumbnails,
-		document,
-		QByteArray(),
-		0);
 }
 
 void ClearEditingPalette() {
@@ -535,6 +541,8 @@ ChatBackground::ChatBackground() : _adjustableColors({
 		st::historyScrollBarBgOver }) {
 }
 
+ChatBackground::~ChatBackground() = default;
+
 void ChatBackground::setThemeData(QImage &&themeImage, bool themeTile) {
 	_themeImage = PostprocessBackgroundImage(
 		std::move(themeImage),
@@ -545,7 +553,11 @@ void ChatBackground::setThemeData(QImage &&themeImage, bool themeTile) {
 void ChatBackground::initialRead() {
 	if (started()) {
 		return;
-	} else if (!Local::readBackground()) {
+	}
+	if (_themeObject.pathAbsolute.isEmpty() && !nightMode()) {
+		applyDefaultThemeAccentColorizer();
+	}
+	if (!Local::readBackground()) {
 		set(Data::ThemeWallPaper());
 	}
 	if (_localStoredTileDayValue) {
@@ -560,7 +572,8 @@ void ChatBackground::start() {
 	saveAdjustableColors();
 
 	_updates.events(
-	) | rpl::start_with_next([=](const BackgroundUpdate &update) {
+	) | rpl::on_next([=](const BackgroundUpdate &update) {
+		refreshThemeWatcher();
 		if (update.paletteChanged()) {
 			style::NotifyPaletteChanged();
 		}
@@ -571,12 +584,87 @@ void ChatBackground::start() {
 	Core::App().domain().activeSessionValue(
 	) | rpl::filter([=](Main::Session *session) {
 		return session != _session;
-	}) | rpl::start_with_next([=](Main::Session *session) {
+	}) | rpl::on_next([=](Main::Session *session) {
 		_session = session;
 		checkUploadWallPaper();
 	}, _lifetime);
 
-	Core::App().settings().setSystemDarkMode(Platform::IsDarkMode());
+	rpl::combine(
+#if QT_VERSION >= QT_VERSION_CHECK(6, 5, 0)
+		rpl::single(
+			QGuiApplication::styleHints()->colorScheme()
+		) | rpl::then(
+			base::qt_signal_producer(
+				QGuiApplication::styleHints(),
+				&QStyleHints::colorSchemeChanged
+			)
+		),
+#endif // Qt >= 6.5.0
+		rpl::single(
+			QGuiApplication::palette()
+		) | rpl::then(
+			base::qt_signal_producer(
+				qApp,
+				&QGuiApplication::paletteChanged
+			)
+		)
+#if QT_VERSION >= QT_VERSION_CHECK(6, 5, 0)
+	) | rpl::map([](Qt::ColorScheme colorScheme, const QPalette &palette) {
+		return colorScheme != Qt::ColorScheme::Unknown
+			? colorScheme == Qt::ColorScheme::Dark
+#else // Qt >= 6.5.0
+	) | rpl::map([](const QPalette &palette) {
+		const auto dark = Platform::IsDarkMode();
+		return dark
+			? *dark
+#endif // Qt < 6.5.0
+			: palette.windowText().color().lightness()
+				> palette.window().color().lightness();
+	}) | rpl::distinct_until_changed(
+	) | rpl::on_next([](bool dark) {
+		Core::App().settings().setSystemDarkMode(dark);
+	}, _lifetime);
+
+	rpl::single(
+		QGuiApplication::palette()
+	) | rpl::then(
+		base::qt_signal_producer(
+			qApp,
+			&QGuiApplication::paletteChanged
+		)
+	) | rpl::on_next([=] {
+		const auto &settings = Core::App().settings();
+		if (!settings.systemAccentColorEnabled()
+			|| _themeObject.cloud.id
+			|| editingTheme()) {
+			return;
+		}
+		const auto path = _themeObject.pathAbsolute;
+		if (!IsEmbeddedTheme(path)) {
+			return;
+		}
+		ApplyDefaultWithPath(path);
+		KeepApplied();
+	}, _lifetime);
+}
+
+void ChatBackground::refreshThemeWatcher() {
+	const auto path = _themeObject.pathAbsolute;
+	if (path.isEmpty()
+		|| !QFileInfo(path).isNativePath()
+		|| editingTheme()) {
+		_themeWatcher = nullptr;
+	} else if (!_themeWatcher || !_themeWatcher->files().contains(path)) {
+		_themeWatcher = std::make_unique<QFileSystemWatcher>(
+			QStringList(path));
+		QObject::connect(
+			_themeWatcher.get(),
+			&QFileSystemWatcher::fileChanged,
+			[](const QString &path) {
+			Apply(path);
+			KeepApplied();
+		});
+	}
 }
 
 void ChatBackground::checkUploadWallPaper() {
@@ -599,21 +687,24 @@ void ChatBackground::checkUploadWallPaper() {
 	}
 
 	const auto ready = PrepareWallPaper(_session->mainDcId(), _original);
-	const auto documentId = ready.id;
-	_wallPaperUploadId = FullMsgId(0, _session->data().nextLocalMessageId());
-	_session->uploader().uploadMedia(_wallPaperUploadId, ready);
+	const auto documentId = ready->id;
+	_wallPaperUploadId = FullMsgId(
+		_session->userPeerId(),
+		_session->data().nextLocalMessageId());
+	_session->uploader().upload(_wallPaperUploadId, ready);
 	if (_wallPaperUploadLifetime) {
 		return;
 	}
 	_wallPaperUploadLifetime = _session->uploader().documentReady(
-	) | rpl::start_with_next([=](const Storage::UploadedDocument &data) {
+	) | rpl::on_next([=](const Storage::UploadedMedia &data) {
 		if (data.fullId != _wallPaperUploadId) {
 			return;
 		}
 		_wallPaperUploadId = FullMsgId();
 		_wallPaperRequestId = _session->api().request(
 			MTPaccount_UploadWallPaper(
-				data.file,
+				MTP_flags(0),
+				data.info.file,
 				MTP_string("image/jpeg"),
 				_paper.mtpSettings()
 			)
@@ -672,8 +763,8 @@ void ChatBackground::set(const Data::WallPaper &paper, QImage image) {
 		setPreparedAfterPaper(std::move(image));
 	} else {
 		if (Data::IsLegacy1DefaultWallPaper(_paper)) {
-			image.load(qsl(":/gui/art/bg_initial.jpg"));
-			const auto scale = cScale() * cIntRetinaFactor();
+			image.load(u":/gui/art/bg_initial.jpg"_q);
+			const auto scale = cScale() * style::DevicePixelRatio();
 			if (scale != 100) {
 				image = image.scaledToWidth(
 					style::ConvertScale(image.width(), scale),
@@ -800,6 +891,7 @@ std::optional<Data::CloudTheme> ChatBackground::editingTheme() const {
 
 void ChatBackground::setEditingTheme(const Data::CloudTheme &editing) {
 	_editingTheme = editing;
+	refreshThemeWatcher();
 }
 
 void ChatBackground::clearEditingTheme(ClearEditing clear) {
@@ -815,6 +907,7 @@ void ChatBackground::clearEditingTheme(ClearEditing clear) {
 		reapplyWithNightMode(std::nullopt, _nightMode);
 		KeepApplied();
 	}
+	refreshThemeWatcher();
 }
 
 void ChatBackground::adjustPaletteUsingBackground(const QImage &image) {
@@ -848,12 +941,6 @@ std::optional<QColor> ChatBackground::colorForFill() const {
 
 QImage ChatBackground::gradientForFill() const {
 	return _gradient;
-}
-
-void ChatBackground::recacheGradientForFill(QImage gradient) {
-	if (_gradient.size() == gradient.size()) {
-		_gradient = std::move(gradient);
-	}
 }
 
 QImage ChatBackground::createCurrentImage() const {
@@ -891,11 +978,21 @@ QImage ChatBackground::createCurrentImage() const {
 }
 
 bool ChatBackground::tile() const {
+	if (!started()) {
+		const auto &set = nightMode()
+			? _localStoredTileNightValue
+			: _localStoredTileDayValue;
+		if (set.has_value()) {
+			return *set;
+		}
+	}
 	return nightMode() ? _tileNightValue : _tileDayValue;
 }
 
 bool ChatBackground::tileDay() const {
-	if (Data::details::IsTestingThemeWallPaper(_paper) ||
+	if (!started() && _localStoredTileDayValue.has_value()) {
+		return *_localStoredTileDayValue;
+	} else if (Data::details::IsTestingThemeWallPaper(_paper) ||
 		Data::details::IsTestingDefaultWallPaper(_paper)) {
 		if (!nightMode()) {
 			return _tileForRevert;
@@ -905,7 +1002,9 @@ bool ChatBackground::tileDay() const {
 }
 
 bool ChatBackground::tileNight() const {
-	if (Data::details::IsTestingThemeWallPaper(_paper) ||
+	if (!started() && _localStoredTileNightValue.has_value()) {
+		return *_localStoredTileNightValue;
+	} else if (Data::details::IsTestingThemeWallPaper(_paper) ||
 		Data::details::IsTestingDefaultWallPaper(_paper)) {
 		if (nightMode()) {
 			return _tileForRevert;
@@ -1043,13 +1142,26 @@ void ChatBackground::setTestingTheme(Instance &&theme) {
 }
 
 void ChatBackground::setTestingDefaultTheme() {
-	style::main_palette::reset(ColorizerForTheme(QString()));
-	saveAdjustableColors();
+	applyDefaultThemeAccentColorizer();
 
 	saveForRevert();
 	set(Data::details::TestingDefaultWallPaper());
 	setTile(false);
 	_updates.fire({ BackgroundUpdate::Type::TestingTheme, tile() });
+}
+
+void ChatBackground::applyDefaultThemeAccentColorizer() {
+	const auto colorizer = ColorizerForTheme(QString());
+	style::main_palette::reset(colorizer);
+	if (colorizer) {
+		auto reference = style::palette();
+		reference.finalize();
+		Ui::EnsureBubblesReadable(*style::main_palette::get(), {
+			.dark = Ui::IsDarkPalette(reference),
+			.reference = &reference,
+		});
+	}
+	saveAdjustableColors();
 }
 
 void ChatBackground::keepApplied(const Object &object, bool write) {
@@ -1168,7 +1280,8 @@ void ChatBackground::reapplyWithNightMode(
 			ColorizerForTheme(path),
 			std::nullopt,
 			&preview->instance.cached,
-			&preview->instance);
+			&preview->instance,
+			true);
 		if (!loaded) {
 			return false;
 		}
@@ -1227,7 +1340,25 @@ ChatBackground *Background() {
 }
 
 bool IsEmbeddedTheme(const QString &path) {
-	return path.isEmpty() || path.startsWith(qstr(":/gui/"));
+	return path.isEmpty() || path.startsWith(u":/gui/"_q);
+}
+
+std::optional<EmbeddedType> CurrentEmbeddedType() {
+	if (Background()->editingTheme().has_value()) {
+		return std::nullopt;
+	}
+	const auto &object = AreTestingTheme()
+		? GlobalApplying.data.object
+		: Background()->themeObject();
+	if (object.cloud.id) {
+		return std::nullopt;
+	}
+	const auto schemes = EmbeddedThemes();
+	const auto i = ranges::find(
+		schemes,
+		object.pathAbsolute,
+		&EmbeddedScheme::path);
+	return (i != end(schemes)) ? std::make_optional(i->type) : std::nullopt;
 }
 
 bool Initialize(Saved &&saved) {
@@ -1235,6 +1366,7 @@ bool Initialize(Saved &&saved) {
 		Background()->setThemeObject(saved.object);
 		return true;
 	}
+	DEBUG_LOG(("Theme: Could not initialize from saved."));
 	return false;
 }
 
@@ -1366,9 +1498,7 @@ rpl::producer<bool> IsNightModeValue() {
 		return update.type == BackgroundUpdate::Type::ApplyingTheme;
 	}) | rpl::to_empty;
 
-	return rpl::single(
-		rpl::empty_value()
-	) | rpl::then(
+	return rpl::single(rpl::empty) | rpl::then(
 		std::move(changes)
 	) | rpl::map([=] {
 		return IsNightMode();
@@ -1401,10 +1531,11 @@ void ToggleNightModeWithConfirmation(
 			toggle();
 			close();
 		};
-		window->show(Box<ConfirmBox>(
-			tr::lng_settings_auto_night_warning(tr::now),
-			tr::lng_settings_auto_night_disable(tr::now),
-			disableAndToggle));
+		window->show(Ui::MakeConfirmBox({
+			.text = tr::lng_settings_auto_night_warning(),
+			.confirmed = disableAndToggle,
+			.confirmText = tr::lng_settings_auto_night_disable(),
+		}));
 	}
 }
 
@@ -1419,8 +1550,17 @@ bool LoadFromFile(
 		not_null<Instance*> out,
 		Cached *outCache,
 		QByteArray *outContent) {
-	const auto colorizer = ColorizerForTheme(path);
-	return LoadFromFile(path, out, outCache, outContent, colorizer);
+	const auto content = readThemeContent(path);
+	if (outContent) {
+		*outContent = content;
+	}
+	return LoadTheme(
+		content,
+		ColorizerForTheme(path),
+		std::nullopt,
+		outCache,
+		out,
+		true);
 }
 
 bool LoadFromFile(
@@ -1448,6 +1588,23 @@ bool LoadFromContent(
 		out);
 }
 
+std::optional<QByteArray> ReadPaletteContent(const QString &path) {
+	const auto content = readThemeContent(path);
+	if (content.isEmpty()) {
+		return std::nullopt;
+	}
+	auto file = zlib::FileToRead(content);
+	return ReadPaletteContent(file, content, std::nullopt);
+}
+
+rpl::producer<bool> IsThemeDarkValue() {
+	return rpl::single(rpl::empty) | rpl::then(
+		style::PaletteChanged()
+	) | rpl::map([] {
+		return (st::dialogsBg->c.valueF() < kDarkValueThreshold);
+	});
+}
+
 QString EditingPalettePath() {
 	return cWorkingDir() + "tdata/editing-theme.tdesktop-palette";
 }
@@ -1464,6 +1621,7 @@ bool ReadPaletteValues(const QByteArray &content, Fn<bool(QLatin1String name, QL
 		auto name = QLatin1String("");
 		auto value = QLatin1String("");
 		if (!readNameAndValue(from, end, &name, &value)) {
+			DEBUG_LOG(("Theme: Could not readNameAndValue."));
 			return false;
 		}
 		if (name.size() == 0) { // End of content reached.
@@ -1474,6 +1632,166 @@ bool ReadPaletteValues(const QByteArray &content, Fn<bool(QLatin1String name, QL
 		}
 	}
 	return true;
+}
+
+[[nodiscard]] Webview::ThemeParams WebViewParams() {
+	const auto colors = std::vector<std::pair<QString, const style::color&>>{
+		{ "bg_color", st::windowBg },
+		{ "secondary_bg_color", st::boxDividerBg },
+		{ "text_color", st::windowFg },
+		{ "hint_color", st::windowSubTextFg },
+		{ "link_color", st::windowActiveTextFg },
+		{ "button_color", st::windowBgActive },
+		{ "button_text_color", st::windowFgActive },
+		{ "header_bg_color", st::windowBg },
+		{ "accent_text_color", st::lightButtonFg },
+		{ "section_bg_color", st::lightButtonBg },
+		{ "section_header_text_color", st::windowActiveTextFg },
+		{ "subtitle_text_color", st::windowSubTextFg },
+		{ "destructive_text_color", st::attentionButtonFg },
+		{ "bottom_bar_bg_color", st::windowBg },
+	};
+	auto object = QJsonObject();
+	const auto wrap = [](QColor color) {
+		auto r = 0;
+		auto g = 0;
+		auto b = 0;
+		color.getRgb(&r, &g, &b);
+		const auto hex = [](int component) {
+			const auto digit = [](int c) {
+				return QChar((c < 10) ? ('0' + c) : ('a' + c - 10));
+			};
+			return QString() + digit(component / 16) + digit(component % 16);
+		};
+		return '#' + hex(r) + hex(g) + hex(b);
+	};
+	for (const auto &[name, color] : colors) {
+		object.insert(name, wrap(color->c));
+	}
+	{
+		const auto bg = st::windowBg->c;
+		const auto shadow = st::shadowFg->c;
+		const auto shadowAlpha = shadow.alphaF();
+		const auto mix = [&](int a, int b) {
+			return anim::interpolate(a, b, shadowAlpha);
+		};
+		object.insert("section_separator_color", wrap(QColor(
+			mix(bg.red(), shadow.red()),
+			mix(bg.green(), shadow.green()),
+			mix(bg.blue(), shadow.blue()))));
+	}
+	return {
+		.bodyBg = st::windowBg->c,
+		.titleBg = QColor(0, 0, 0, 0),
+		.scrollBg = st::scrollBg->c,
+		.scrollBgOver = st::scrollBgOver->c,
+		.scrollBarBg = st::scrollBarBg->c,
+		.scrollBarBgOver = st::scrollBarBgOver->c,
+
+		.json = QJsonDocument(object).toJson(QJsonDocument::Compact),
+	};
+}
+
+std::shared_ptr<FilePrepareResult> PrepareWallPaper(
+		MTP::DcId dcId,
+		const QImage &image) {
+	PreparedPhotoThumbs thumbnails;
+	QVector<MTPPhotoSize> sizes;
+
+	QByteArray jpeg;
+	QBuffer jpegBuffer(&jpeg);
+	image.save(&jpegBuffer, "JPG", 87);
+
+	const auto scaled = [&](int size) {
+		return image.scaled(
+			size,
+			size,
+			Qt::KeepAspectRatio,
+			Qt::SmoothTransformation);
+	};
+	const auto push = [&](const char *type, QImage &&image) {
+		sizes.push_back(MTP_photoSize(
+			MTP_string(type),
+			MTP_int(image.width()),
+			MTP_int(image.height()), MTP_int(0)));
+		thumbnails.emplace(
+			type[0],
+			PreparedPhotoThumb{ .image = std::move(image) });
+	};
+	push("s", scaled(320));
+
+	const auto id = base::RandomValue<DocumentId>();
+	const auto filename = u"wallpaper.jpg"_q;
+	auto attributes = QVector<MTPDocumentAttribute>(
+		1,
+		MTP_documentAttributeFilename(MTP_string(filename)));
+	attributes.push_back(MTP_documentAttributeImageSize(
+		MTP_int(image.width()),
+		MTP_int(image.height())));
+
+	auto result = MakePreparedFile({
+		.id = id,
+		.type = SendMediaType::ThemeFile,
+	});
+	result->filename = filename;
+	result->content = jpeg;
+	result->filesize = jpeg.size();
+	result->setFileData(jpeg);
+	if (thumbnails.empty()) {
+		result->thumb = thumbnails.front().second.image;
+		result->thumbbytes = thumbnails.front().second.bytes;
+	}
+	result->document = MTP_document(
+		MTP_flags(0),
+		MTP_long(id),
+		MTP_long(0),
+		MTP_bytes(),
+		MTP_int(base::unixtime::now()),
+		MTP_string("image/jpeg"),
+		MTP_long(jpeg.size()),
+		MTP_vector<MTPPhotoSize>(sizes),
+		MTPVector<MTPVideoSize>(),
+		MTP_int(dcId),
+		MTP_vector<MTPDocumentAttribute>(attributes));
+	return result;
+}
+
+std::unique_ptr<Ui::ChatTheme> DefaultChatThemeOn(rpl::lifetime &lifetime) {
+	auto result = std::make_unique<Ui::ChatTheme>();
+
+	// The subscription below lives in the caller-provided lifetime, while
+	// the theme is owned by the returned pointer, and callers may destroy
+	// the theme first (see the font preview in chat settings).
+	const auto push = [=, weak = base::make_weak(result.get())] {
+		const auto raw = weak.get();
+		if (!raw) {
+			return;
+		}
+		const auto background = Background();
+		const auto &paper = background->paper();
+		raw->setBackground({
+			.prepared = background->prepared(),
+			.preparedForTiled = background->preparedForTiled(),
+			.gradientForFill = background->gradientForFill(),
+			.colorForFill = background->colorForFill(),
+			.colors = paper.backgroundColors(),
+			.patternOpacity = paper.patternOpacity(),
+			.gradientRotation = paper.gradientRotation(),
+			.isPattern = paper.isPattern(),
+			.tile = background->tile(),
+			});
+	};
+
+	push();
+	Background()->updates(
+	) | rpl::on_next([=](const BackgroundUpdate &update) {
+		if (update.type == BackgroundUpdate::Type::New
+			|| update.type == BackgroundUpdate::Type::Changed) {
+			push();
+		}
+	}, lifetime);
+
+	return result;
 }
 
 } // namespace Theme

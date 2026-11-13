@@ -8,17 +8,21 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "passport/ui/passport_details_row.h"
 
 #include "lang/lang_keys.h"
+#include "base/invoke_queued.h"
 #include "base/platform/base_platform_info.h"
-#include "ui/widgets/input_fields.h"
+#include "ui/widgets/fields/input_field.h"
+#include "ui/widgets/fields/masked_input_field.h"
 #include "ui/widgets/labels.h"
 #include "ui/widgets/buttons.h"
 #include "ui/widgets/checkbox.h"
 #include "ui/wrap/slide_wrap.h"
 #include "ui/layers/box_content.h"
 #include "ui/boxes/country_select_box.h"
+#include "ui/painter.h"
 #include "countries/countries_instance.h"
 #include "styles/style_layers.h"
 #include "styles/style_passport.h"
+#include "base/qt/qt_common_adapters.h"
 
 #include <QtCore/QRegularExpression>
 
@@ -48,7 +52,9 @@ PostcodeInput::PostcodeInput(
 	rpl::producer<QString> placeholder,
 	const QString &val)
 : MaskedInputField(parent, st, std::move(placeholder), val) {
-	if (!QRegularExpression("^[a-zA-Z0-9\\-]+$").match(val).hasMatch()) {
+	setInputMethodHints(Qt::ImhLatinOnly | Qt::ImhNoPredictiveText);
+	static const auto RegExp = QRegularExpression("^[a-zA-Z0-9\\-]+$");
+	if (!RegExp.match(val).hasMatch()) {
 		setText(QString());
 	}
 }
@@ -61,7 +67,7 @@ void PostcodeInput::correctValue(
 	QString newText;
 	newText.reserve(now.size());
 	auto newPos = nowCursor;
-	for (auto i = 0, l = now.size(); i < l; ++i) {
+	for (auto i = 0, l = int(now.size()); i < l; ++i) {
 		const auto ch = now[i];
 		if ((ch >= '0' && ch <= '9')
 			|| (ch >= 'a' && ch <= 'z')
@@ -133,7 +139,11 @@ private:
 
 class DateInput final : public MaskedInputField {
 public:
-	using MaskedInputField::MaskedInputField;
+	DateInput(
+		QWidget *parent,
+		const style::InputField &st,
+		rpl::producer<QString> placeholder,
+		const QString &val);
 
 	void setMaxValue(int value);
 
@@ -176,6 +186,7 @@ protected:
 
 private:
 	void setInnerFocus();
+	void setFocusQueued(const object_ptr<DateInput> &field);
 	void putNext(const object_ptr<DateInput> &field, QChar ch);
 	void erasePrevious(const object_ptr<DateInput> &field);
 	int resizeInner(int left, int top, int width) override;
@@ -266,9 +277,16 @@ AbstractTextRow<Input>::AbstractTextRow(
 , _field(this, st::passportDetailsField, nullptr, value)
 , _value(value) {
 	_field->setMaxLength(limit);
-	connect(_field, &Input::changed, [=] {
-		_value = valueCurrent();
-	});
+	if constexpr (std::is_same<Input, Ui::InputField>::value) {
+		_field->changes(
+		) | rpl::on_next([=] {
+			_value = valueCurrent();
+		}, _field->lifetime());
+	} else {
+		connect(_field, &Input::changed, [=] {
+			_value = valueCurrent();
+		});
+	}
 }
 
 template <typename Input>
@@ -321,7 +339,7 @@ CountryRow::CountryRow(
 , _link(this, CountryString(value), st::boxLinkButton)
 , _value(value) {
 	_value.changes(
-	) | rpl::start_with_next([=] {
+	) | rpl::on_next([=] {
 		hideCountryError();
 	}, lifetime());
 
@@ -394,7 +412,7 @@ void CountryRow::chooseCountry() {
 		CountrySelectBox::Type::Countries);
 	const auto raw = box.data();
 	raw->countryChosen(
-	) | rpl::start_with_next([=](QString iso) {
+	) | rpl::on_next([=](QString iso) {
 		_value = iso;
 		_link->setText(CountryString(iso));
 		hideCountryError();
@@ -404,18 +422,19 @@ void CountryRow::chooseCountry() {
 }
 
 QDate ValidateDate(const QString &value) {
-	const auto match = QRegularExpression(
-		"^([0-9]{2})\\.([0-9]{2})\\.([0-9]{4})$").match(value);
+	static const auto RegExp = QRegularExpression(
+		"^([0-9]{2})\\.([0-9]{2})\\.([0-9]{4})$");
+	const auto match = RegExp.match(value);
 	if (!match.hasMatch()) {
 		return QDate();
 	}
 	auto result = QDate();
 	const auto readInt = [](const QString &value) {
-		auto ref = value.midRef(0);
-		while (!ref.isEmpty() && ref.at(0) == '0') {
-			ref = ref.mid(1);
+		auto view = QStringView(value);
+		while (!view.isEmpty() && view.at(0) == '0') {
+			view = base::StringViewMid(view, 1);
 		}
-		return ref.toInt();
+		return view.toInt();
 	};
 	result.setDate(
 		readInt(match.captured(3)),
@@ -443,6 +462,15 @@ QString GetYear(const QString &value) {
 		return QString("%1").arg(date.year(), 4, 10, QChar('0'));
 	}
 	return QString();
+}
+
+DateInput::DateInput(
+	QWidget *parent,
+	const style::InputField &st,
+	rpl::producer<QString> placeholder,
+	const QString &val)
+: MaskedInputField(parent, st, std::move(placeholder), val) {
+	setInputMethodHints(Qt::ImhDigitsOnly | Qt::ImhNoPredictiveText);
 }
 
 void DateInput::setMaxValue(int value) {
@@ -515,9 +543,9 @@ void DateInput::correctValue(
 	if (accumulated > _maxValue
 		|| (limit == _maxDigits && oldLength > _maxDigits)) {
 		if (oldCursor > limit) {
-			_putNext.fire('0' + (accumulated % 10));
+			_putNext.fire(QChar('0' + (accumulated % 10)));
 		} else {
-			_putNext.fire(0);
+			_putNext.fire(QChar(0));
 		}
 	}
 }
@@ -559,7 +587,7 @@ DateRow::DateRow(
 	GetYear(value))
 , _value(valueCurrent()) {
 	const auto focused = [=](const object_ptr<DateInput> &field) {
-		return [this, pointer = MakeWeak(field.data())]{
+		return [this, pointer = base::make_weak(field.data())]{
 			_borderAnimationStart = pointer->borderAnimationStart()
 				+ pointer->x()
 				- _day->x();
@@ -582,18 +610,18 @@ DateRow::DateRow(
 	connect(_month, &MaskedInputField::changed, changed);
 	connect(_year, &MaskedInputField::changed, changed);
 	_day->setMaxValue(31);
-	_day->putNext() | rpl::start_with_next([=](QChar ch) {
+	_day->putNext() | rpl::on_next([=](QChar ch) {
 		putNext(_month, ch);
 	}, lifetime());
 	_month->setMaxValue(12);
-	_month->putNext() | rpl::start_with_next([=](QChar ch) {
+	_month->putNext() | rpl::on_next([=](QChar ch) {
 		putNext(_year, ch);
 	}, lifetime());
-	_month->erasePrevious() | rpl::start_with_next([=] {
+	_month->erasePrevious() | rpl::on_next([=] {
 		erasePrevious(_day);
 	}, lifetime());
 	_year->setMaxValue(2999);
-	_year->erasePrevious() | rpl::start_with_next([=] {
+	_year->erasePrevious() | rpl::on_next([=] {
 		erasePrevious(_month);
 	}, lifetime());
 	_separator1->setAttribute(Qt::WA_TransparentForMouseEvents);
@@ -601,9 +629,20 @@ DateRow::DateRow(
 	setMouseTracking(true);
 
 	_value.changes(
-	) | rpl::start_with_next([=] {
+	) | rpl::on_next([=] {
 		setErrorShown(false);
 	}, lifetime());
+}
+
+void DateRow::setFocusQueued(const object_ptr<DateInput> &field) {
+	// Focusing synchronously closes an open IME composition, which on Windows
+	// makes QWindowsInputContext::reset() re-send the commit to the field we
+	// came from, whose correctValue() calls us again, until the stack
+	// overflows. Ui::TimeInput::setFocusQueued() breaks the same loop the
+	// same way - and unlike a re-entrancy flag it still lets a chained
+	// overflow digit reach the field after the next one.
+	const auto raw = field.data();
+	InvokeQueued(raw, [raw] { raw->setFocus(); });
 }
 
 void DateRow::putNext(const object_ptr<DateInput> &field, QChar ch) {
@@ -612,7 +651,7 @@ void DateRow::putNext(const object_ptr<DateInput> &field, QChar ch) {
 		field->setText(ch + field->getLastText());
 		field->setCursorPosition(1);
 	}
-	field->setFocus();
+	setFocusQueued(field);
 }
 
 void DateRow::erasePrevious(const object_ptr<DateInput> &field) {
@@ -621,7 +660,7 @@ void DateRow::erasePrevious(const object_ptr<DateInput> &field) {
 		field->setCursorPosition(text.size() - 1);
 		field->setText(text.mid(0, text.size() - 1));
 	}
-	field->setFocus();
+	setFocusQueued(field);
 }
 
 bool DateRow::setFocusFast() {
@@ -639,11 +678,11 @@ bool DateRow::setFocusFast() {
 
 int DateRow::number(const object_ptr<DateInput> &field) const {
 	const auto text = field->getLastText();
-	auto ref = text.midRef(0);
-	while (!ref.isEmpty() && ref.at(0) == '0') {
-		ref = ref.mid(1);
+	auto view = QStringView(text);
+	while (!view.isEmpty() && view.at(0) == '0') {
+		view = base::StringViewMid(view, 1);
 	}
-	return ref.toInt();
+	return view.toInt();
 }
 
 int DateRow::day() const {
@@ -687,8 +726,12 @@ void DateRow::paintEvent(QPaintEvent *e) {
 	auto borderOpacity = _a_borderOpacity.value(_borderVisible ? 1. : 0.);
 	if (_st.borderActive && (borderOpacity > 0.)) {
 		auto borderStart = std::clamp(_borderAnimationStart, 0, width);
-		auto borderFrom = qRound(borderStart * (1. - borderShownDegree));
-		auto borderTo = borderStart + qRound((width - borderStart) * borderShownDegree);
+		auto borderFrom
+			= int(base::SafeRound(borderStart * (1. - borderShownDegree)));
+		const auto borderRest = width - borderStart;
+		const auto shownTo
+			= int(base::SafeRound(borderRest * borderShownDegree));
+		auto borderTo = borderStart + shownTo;
 		if (borderTo > borderFrom) {
 			auto borderFg = anim::brush(_st.borderFgActive, _st.borderFgError, errorDegree);
 			p.setOpacity(borderOpacity);
@@ -883,9 +926,9 @@ std::unique_ptr<AbstractCheckView> GenderRow::createRadioView(
 
 auto GenderRow::StringToGender(const QString &value)
 -> std::optional<Gender> {
-	if (value == qstr("male")) {
+	if (value == u"male"_q) {
 		return Gender::Male;
-	} else if (value == qstr("female")) {
+	} else if (value == u"female"_q) {
 		return Gender::Female;
 	}
 	return std::nullopt;
@@ -907,7 +950,10 @@ int GenderRow::resizeInner(int left, int top, int width) {
 	top += st::passportDetailsField.textMargins.top();
 	top -= st::defaultCheckbox.textPosition.y();
 	_male->moveToLeft(left, top);
-	left += _male->widthNoMargins() + st::passportDetailsGenderSkip;
+	left += _male->checkRect().width()
+		+ st::defaultCheckbox.style.font->width(
+			tr::lng_passport_gender_male(tr::now))
+		+ st::passportDetailsGenderSkip;
 	_female->moveToLeft(left, top);
 	return st::semiboldFont->height;
 }
@@ -1053,7 +1099,7 @@ void PanelDetailsRow::showError(std::optional<QString> error) {
 		_errorHideSubscription = true;
 
 		value(
-		) | rpl::start_with_next([=] {
+		) | rpl::on_next([=] {
 			hideError();
 		}, lifetime());
 	}
@@ -1078,7 +1124,7 @@ void PanelDetailsRow::showError(std::optional<QString> error) {
 			_error->entity()->setText(*error);
 		}
 		_error->heightValue(
-		) | rpl::start_with_next([=] {
+		) | rpl::on_next([=] {
 			resizeToWidth(width());
 		}, _error->lifetime());
 		_error->show(anim::type::normal);

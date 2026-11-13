@@ -8,60 +8,217 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "window/section_widget.h"
 
 #include "mainwidget.h"
+#include "mainwindow.h"
 #include "ui/ui_utility.h"
 #include "ui/chat/chat_theme.h"
+#include "ui/painter.h"
+#include "boxes/premium_preview_box.h"
+#include "core/application.h"
 #include "data/data_peer.h"
+#include "data/data_user.h"
+#include "data/data_document.h"
+#include "data/data_document_media.h"
 #include "data/data_changes.h"
 #include "data/data_session.h"
 #include "data/data_cloud_themes.h"
+#include "data/data_message_reactions.h"
+#include "data/data_peer_values.h"
+#include "history/history.h"
+#include "history/history_item.h"
+#include "lang/lang_keys.h"
 #include "main/main_session.h"
+#include "menu/menu_send.h"
+#include "settings/sections/settings_premium.h"
+#include "ui/text/text_custom_emoji.h"
+#include "ui/toast/toast.h"
 #include "window/section_memento.h"
+#include "window/window_controller.h"
 #include "window/window_slide_animation.h"
 #include "window/window_session_controller.h"
 #include "window/themes/window_theme.h"
+
+#include "styles/style_polls.h"
 
 #include <rpl/range.h>
 
 namespace Window {
 namespace {
 
-[[nodiscard]] rpl::producer<QString> PeerThemeEmojiValue(
+constexpr auto kReactionRestrictionToastDuration = 5 * crl::time(1000);
+
+[[nodiscard]] rpl::producer<QString> PeerThemeTokenValue(
 		not_null<PeerData*> peer) {
 	return peer->session().changes().peerFlagsValue(
 		peer,
-		Data::PeerUpdate::Flag::ChatThemeEmoji
+		Data::PeerUpdate::Flag::ChatThemeToken
 	) | rpl::map([=] {
-		return peer->themeEmoji();
+		return peer->themeToken();
 	});
+}
+
+struct ResolvedPaper {
+	Data::WallPaper paper;
+	std::shared_ptr<Data::DocumentMedia> media;
+};
+
+[[nodiscard]] rpl::producer<const Data::WallPaper*> PeerWallPaperMapped(
+		not_null<PeerData*> peer) {
+	return peer->session().changes().peerFlagsValue(
+		peer,
+		Data::PeerUpdate::Flag::ChatWallPaper
+	) | rpl::map([=]() -> rpl::producer<const Data::WallPaper*> {
+		return WallPaperResolved(&peer->owner(), peer->wallPaper());
+	}) | rpl::flatten_latest();
+}
+
+[[nodiscard]] rpl::producer<std::optional<ResolvedPaper>> PeerWallPaperValue(
+		not_null<PeerData*> peer) {
+	return PeerWallPaperMapped(
+		peer
+	) | rpl::map([=](const Data::WallPaper *paper)
+	-> rpl::producer<std::optional<ResolvedPaper>> {
+		const auto single = [](std::optional<ResolvedPaper> value) {
+			return rpl::single(std::move(value));
+		};
+		if (!paper) {
+			return single({});
+		}
+		const auto document = paper->document();
+		auto value = ResolvedPaper{
+			*paper,
+			document ? document->createMediaView() : nullptr,
+		};
+		if (!value.media || value.media->loaded(true)) {
+			return single(std::move(value));
+		}
+		paper->loadDocument();
+		return single(
+			value
+		) | rpl::then(document->session().downloaderTaskFinished(
+		) | rpl::filter([=] {
+			return value.media->loaded(true);
+		}) | rpl::take(1) | rpl::map_to(
+			std::optional<ResolvedPaper>(value)
+		));
+	}) | rpl::flatten_latest();
 }
 
 [[nodiscard]] auto MaybeChatThemeDataValueFromPeer(
 	not_null<PeerData*> peer)
--> rpl::producer<std::optional<Data::ChatTheme>> {
-	return PeerThemeEmojiValue(
+-> rpl::producer<std::optional<Data::CloudTheme>> {
+	return PeerThemeTokenValue(
 		peer
-	) | rpl::map([=](const QString &emoji)
-	-> rpl::producer<std::optional<Data::ChatTheme>> {
-		return peer->owner().cloudThemes().themeForEmojiValue(emoji);
+	) | rpl::map([=](const QString &token)
+	-> rpl::producer<std::optional<Data::CloudTheme>> {
+		return peer->owner().cloudThemes().themeForTokenValue(token);
 	}) | rpl::flatten_latest();
 }
 
+[[nodiscard]] rpl::producer<> DebouncedPaletteValue() {
+	return [=](auto consumer) {
+		auto lifetime = rpl::lifetime();
+
+		struct State {
+			base::has_weak_ptr guard;
+			bool scheduled = false;
+		};
+		const auto state = lifetime.make_state<State>();
+
+		consumer.put_next_copy(rpl::empty);
+		style::PaletteChanged(
+		) | rpl::on_next([=] {
+			if (state->scheduled) {
+				return;
+			}
+			state->scheduled = true;
+			Ui::PostponeCall(&state->guard, [=] {
+				state->scheduled = false;
+				consumer.put_next_copy(rpl::empty);
+			});
+		}, lifetime);
+
+		return lifetime;
+	};
+}
+
+struct ResolvedTheme {
+	std::optional<Data::CloudTheme> theme;
+	std::optional<ResolvedPaper> paper;
+	bool dark = false;
+};
+
 [[nodiscard]] auto MaybeCloudThemeValueFromPeer(
 	not_null<PeerData*> peer)
--> rpl::producer<std::optional<Data::CloudTheme>> {
+-> rpl::producer<ResolvedTheme> {
 	return rpl::combine(
 		MaybeChatThemeDataValueFromPeer(peer),
-		Theme::IsNightModeValue()
-	) | rpl::map([](std::optional<Data::ChatTheme> theme, bool night) {
-		return !theme
-			? std::nullopt
-			: night
-			? std::make_optional(std::move(theme->dark))
-			: std::make_optional(std::move(theme->light));
-	});
+		PeerWallPaperValue(peer),
+		Theme::IsThemeDarkValue() | rpl::distinct_until_changed()
+	) | rpl::map([](
+			std::optional<Data::CloudTheme> theme,
+			std::optional<ResolvedPaper> paper,
+			bool night) -> rpl::producer<ResolvedTheme> {
+		if (theme || !paper) {
+			return rpl::single<ResolvedTheme>({
+				std::move(theme),
+				std::move(paper),
+				night,
+			});
+		}
+		return DebouncedPaletteValue(
+		) | rpl::map([=] {
+			return ResolvedTheme{
+				.paper = paper,
+				.dark = night,
+			};
+		});
+	}) | rpl::flatten_latest();
 }
 
 } // namespace
+
+rpl::producer<const Data::WallPaper*> WallPaperResolved(
+		not_null<Data::Session*> owner,
+		const Data::WallPaper *paper) {
+	const auto id = paper ? paper->emojiId() : QString();
+	if (id.isEmpty()) {
+		return rpl::single(paper);
+	}
+	const auto themes = &owner->cloudThemes();
+	auto fromThemes = [=](bool force)
+	-> rpl::producer<const Data::WallPaper*> {
+		if (themes->chatThemes().empty() && !force) {
+			return nullptr;
+		}
+		return Window::Theme::IsNightModeValue(
+		) | rpl::map([=](bool dark) -> const Data::WallPaper* {
+			const auto &list = themes->chatThemes();
+			const auto i = ranges::find(
+				list,
+				id,
+				&Data::CloudTheme::emoticon);
+			if (i != end(list)) {
+				using Type = Data::CloudThemeType;
+				const auto type = dark ? Type::Dark : Type::Light;
+				const auto j = i->settings.find(type);
+				if (j != end(i->settings) && j->second.paper) {
+					return &*j->second.paper;
+				}
+			}
+			return nullptr;
+		});
+	};
+	if (auto result = fromThemes(false)) {
+		return result;
+	}
+	themes->refreshChatThemes();
+	return rpl::single<const Data::WallPaper*>(
+		nullptr
+	) | rpl::then(themes->chatThemesUpdated(
+	) | rpl::take(1) | rpl::map([=] {
+		return fromThemes(true);
+	}) | rpl::flatten_latest());
+}
 
 AbstractSectionWidget::AbstractSectionWidget(
 	QWidget *parent,
@@ -73,9 +230,7 @@ AbstractSectionWidget::AbstractSectionWidget(
 		peerForBackground
 	) | rpl::map([=](PeerData *peer) -> rpl::producer<> {
 		if (!peer) {
-			return rpl::single(
-				rpl::empty_value()
-			) | rpl::then(
+			return rpl::single(rpl::empty) | rpl::then(
 				controller->defaultChatTheme()->repaintBackgroundRequests()
 			);
 		}
@@ -83,19 +238,25 @@ AbstractSectionWidget::AbstractSectionWidget(
 			controller,
 			peer
 		) | rpl::map([](const std::shared_ptr<Ui::ChatTheme> &theme) {
-			return rpl::single(
-				rpl::empty_value()
-			) | rpl::then(
+			return rpl::single(rpl::empty) | rpl::then(
 				theme->repaintBackgroundRequests()
 			);
 		}) | rpl::flatten_latest();
-	}) | rpl::flatten_latest() | rpl::start_with_next([=] {
+	}) | rpl::flatten_latest() | rpl::on_next([=] {
 		update();
 	}, lifetime());
 }
 
 Main::Session &AbstractSectionWidget::session() const {
 	return _controller->session();
+}
+
+SendMenu::Details AbstractSectionWidget::sendMenuDetails() const {
+	return {};
+}
+
+bool AbstractSectionWidget::processChosenSticker(ChatHelpers::FileChosen &&) {
+	return false;
 }
 
 SectionWidget::SectionWidget(
@@ -121,7 +282,7 @@ void SectionWidget::setGeometryWithTopMoved(
 	_topDelta = topDelta;
 	bool willBeResized = (size() != newGeometry.size());
 	if (geometry() != newGeometry) {
-		auto weak = Ui::MakeWeak(this);
+		auto weak = base::make_weak(this);
 		setGeometry(newGeometry);
 		if (!weak) {
 			return;
@@ -136,7 +297,10 @@ void SectionWidget::setGeometryWithTopMoved(
 void SectionWidget::showAnimated(
 		SlideDirection direction,
 		const SectionSlideParams &params) {
-	if (_showAnimation) return;
+	validateSubsectionTabs();
+	if (_showAnimation) {
+		return;
+	}
 
 	showChildren();
 	auto myContentCache = grabForShowAnimation(params);
@@ -152,6 +316,8 @@ void SectionWidget::showAnimated(
 		myContentCache);
 	_showAnimation->setTopBarShadow(params.withTopBarShadow);
 	_showAnimation->setWithFade(params.withFade);
+	_showAnimation->setTopSkip(params.topSkip);
+	_showAnimation->setTopBarMask(params.topMask);
 	_showAnimation->start();
 
 	show();
@@ -162,6 +328,7 @@ std::shared_ptr<SectionMemento> SectionWidget::createMemento() {
 }
 
 void SectionWidget::showFast() {
+	validateSubsectionTabs();
 	show();
 	showFinished();
 }
@@ -176,23 +343,102 @@ void SectionWidget::PaintBackground(
 		not_null<Ui::ChatTheme*> theme,
 		not_null<QWidget*> widget,
 		QRect clip) {
-	Painter p(widget);
+	if (const auto id = theme->background().giftId) {
+		const auto fillHeight = controller->content()->height();
+		const auto fill = QSize(widget->width(), fillHeight);
+		const auto &state = theme->backgroundState(fill);
+		const auto make = [&] {
+			return MakeWrappedEmoji<Ui::Text::LimitedLoopsEmoji>(
+				controller->session().data().customEmojiManager().create(
+					id,
+					crl::guard(widget, [=] { widget->update(); }),
+					Data::CustomEmojiSizeTag::Isolated),
+				1);
+		};
+		if (!state.was.gift) {
+			state.was.gift = make();
+		}
+		if (!state.now.gift) {
+			state.now.gift = make();
+		}
+	}
 
+	PaintBackground(
+		theme,
+		widget,
+		controller->content()->height(),
+		controller->content()->backgroundFromY(),
+		clip,
+		controller->isGifPausedAtLeastFor(GifPauseReason::Any));
+}
+
+void SectionWidget::PaintBackground(
+		not_null<Ui::ChatTheme*> theme,
+		not_null<QWidget*> widget,
+		int fillHeight,
+		int fromy,
+		QRect clip,
+		bool paused) {
+	auto p = QPainter(widget);
+	if (fromy) {
+		p.translate(0, fromy);
+		clip = clip.translated(0, -fromy);
+	}
+	const auto fill = QSize(widget->width(), fillHeight);
+	PaintBackground(p, theme, fill, clip, paused);
+}
+
+void SectionWidget::PaintBackground(
+		QPainter &p,
+		not_null<Ui::ChatTheme*> theme,
+		QSize fill,
+		QRect clip,
+		bool paused) {
 	const auto &background = theme->background();
 	if (background.colorForFill) {
 		p.fillRect(clip, *background.colorForFill);
 		return;
 	}
 	const auto &gradient = background.gradientForFill;
-	const auto fill = QSize(widget->width(), controller->content()->height());
-	auto fromy = controller->content()->backgroundFromY();
-	auto state = theme->backgroundState(fill);
+	const auto &state = theme->backgroundState(fill);
 	const auto paintCache = [&](const Ui::CachedBackground &cache) {
 		const auto to = QRect(
-			QPoint(cache.x, fromy + cache.y),
-			cache.pixmap.size() / cIntRetinaFactor());
-		if (cache.area == fill) {
+			QPoint(cache.x, cache.y),
+			cache.pixmap.size() / style::DevicePixelRatio());
+		const auto paintGift = [&](QRect area) {
+			if (!cache.gift) {
+				return;
+			}
+			auto hq = PainterHighQualityEnabler(p);
+			const auto center = area.center();
+			const auto size = Data::FrameSizeFromTag(
+				Data::CustomEmojiSizeTag::Isolated
+			) / style::DevicePixelRatio();
+			p.save();
+			p.translate(center);
+			p.rotate(cache.giftRotation);
+			p.translate(-center);
+			p.setOpacity(0.5);
+			cache.gift->paint(p, {
+				.textColor = st::windowFg->c,
+				.size = QSize(size, size),
+				.now = crl::now(),
+				.scale = (area.width() / float64(size)),
+				.position = area.topLeft(),
+				.paused = paused,
+				.scaled = true,
+			});
+			p.restore();
+		};
+		if (cache.waitingForNegativePattern) {
+			// While we wait for pattern being loaded we paint just gradient.
+			// But in case of negative patter opacity we just fill-black.
+			p.fillRect(to, Qt::black);
+		} else if (cache.area == fill) {
 			p.drawPixmap(to, cache.pixmap);
+			if (background.giftId && !cache.giftArea.isEmpty()) {
+				paintGift(cache.giftArea.translated(to.topLeft()));
+			}
 		} else {
 			const auto sx = fill.width() / float64(cache.area.width());
 			const auto sy = fill.height() / float64(cache.area.height());
@@ -208,17 +454,28 @@ void SectionWidget::PaintBackground(
 				round((to.x() + to.width()) * sx) - sto.x(),
 				round((to.y() + to.height()) * sy) - sto.y(),
 				cache.pixmap);
+			if (background.giftId && !cache.giftArea.isEmpty()) {
+				paintGift(QRect(
+					(to.x() + cache.giftArea.x()) * sx,
+					(to.y() + cache.giftArea.y()) * sy,
+					cache.giftArea.width() * sx,
+					cache.giftArea.height() * sy));
+			}
 		}
 	};
 	const auto hasNow = !state.now.pixmap.isNull();
 	const auto goodNow = hasNow && (state.now.area == fill);
 	const auto useCache = goodNow || !gradient.isNull();
 	if (useCache) {
-		if (state.shown < 1. && !gradient.isNull()) {
+		const auto fade = (state.shown < 1. && !gradient.isNull());
+		if (fade) {
 			paintCache(state.was);
 			p.setOpacity(state.shown);
 		}
 		paintCache(state.now);
+		if (fade) {
+			p.setOpacity(1.);
+		}
 		return;
 	}
 	const auto &prepared = background.prepared;
@@ -226,7 +483,7 @@ void SectionWidget::PaintBackground(
 		return;
 	} else if (background.isPattern) {
 		const auto w = prepared.width() * fill.height() / prepared.height();
-		const auto cx = qCeil(fill.width() / float64(w));
+		const auto cx = int(std::ceil(fill.width() / float64(w)));
 		const auto cols = (cx / 2) * 2 + 1;
 		const auto xshift = (fill.width() - w * cols) / 2;
 		for (auto i = 0; i != cols; ++i) {
@@ -241,15 +498,15 @@ void SectionWidget::PaintBackground(
 		const auto top = clip.top();
 		const auto right = clip.left() + clip.width();
 		const auto bottom = clip.top() + clip.height();
-		const auto w = tiled.width() / cRetinaFactor();
-		const auto h = tiled.height() / cRetinaFactor();
-		const auto sx = qFloor(left / w);
-		const auto sy = qFloor((top - fromy) / h);
-		const auto cx = qCeil(right / w);
-		const auto cy = qCeil((bottom - fromy) / h);
+		const auto w = tiled.width() / float64(style::DevicePixelRatio());
+		const auto h = tiled.height() / float64(style::DevicePixelRatio());
+		const auto sx = int(std::floor(left / w));
+		const auto sy = int(std::floor(top / h));
+		const auto cx = int(std::ceil(right / w));
+		const auto cy = int(std::ceil(bottom / h));
 		for (auto i = sx; i < cx; ++i) {
 			for (auto j = sy; j < cy; ++j) {
-				p.drawImage(QPointF(i * w, fromy + j * h), tiled);
+				p.drawImage(QPointF(i * w, j * h), tiled);
 			}
 		}
 	} else {
@@ -257,17 +514,19 @@ void SectionWidget::PaintBackground(
 		const auto rects = Ui::ComputeChatBackgroundRects(
 			fill,
 			prepared.size());
-		auto to = rects.to;
-		to.moveTop(to.top() + fromy);
-		p.drawImage(to, prepared, rects.from);
+		p.drawImage(rects.to, prepared, rects.from);
 	}
 }
 
 void SectionWidget::paintEvent(QPaintEvent *e) {
 	if (_showAnimation) {
-		Painter p(this);
-		_showAnimation->paintContents(p, e->rect());
+		auto p = QPainter(this);
+		_showAnimation->paintContents(p);
 	}
+}
+
+bool SectionWidget::animatingShow() const {
+	return (_showAnimation != nullptr);
 }
 
 void SectionWidget::showFinished() {
@@ -277,7 +536,11 @@ void SectionWidget::showFinished() {
 	showChildren();
 	showFinishedHook();
 
-	setInnerFocus();
+	if (isAncestorOf(window()->focusWidget())) {
+		setInnerFocus();
+	} else {
+		controller()->widget()->setInnerFocus();
+	}
 }
 
 rpl::producer<int> SectionWidget::desiredHeight() const {
@@ -286,20 +549,124 @@ rpl::producer<int> SectionWidget::desiredHeight() const {
 
 SectionWidget::~SectionWidget() = default;
 
+void SectionWidget::showHistoryAfterThreadDestroyed(
+		not_null<History*> history) {
+	const auto window = &controller()->window();
+	const auto id = controller()->windowId();
+	const auto weak = base::make_weak(this);
+	auto params = SectionShow(
+		SectionShow::Way::Backward,
+		anim::type::instant,
+		anim::activation::background);
+	params.preferCurrentWindow = true;
+	const auto showing = Core::App().windowForShowingHistory(history->peer);
+	if (!showing || showing == window) {
+		// WHY: background activation bypasses preventsClose(), so a pending
+		// recording cannot defer this; the thread is freed after the event.
+		controller()->showThread(history, ShowAtUnreadMsgId, params);
+	}
+	if (!weak) {
+		return;
+	} else if (id.hasChatsList()) {
+		controller()->clearSectionStack(
+			params.withWay(SectionShow::Way::ClearStack));
+	} else {
+		Core::App().closeWindow(window);
+	}
+}
+
 auto ChatThemeValueFromPeer(
 	not_null<SessionController*> controller,
 	not_null<PeerData*> peer)
 -> rpl::producer<std::shared_ptr<Ui::ChatTheme>> {
-	return MaybeCloudThemeValueFromPeer(
+	auto cloud = MaybeCloudThemeValueFromPeer(
 		peer
-	) | rpl::map([=](std::optional<Data::CloudTheme> theme)
+	) | rpl::map([=](ResolvedTheme resolved)
 	-> rpl::producer<std::shared_ptr<Ui::ChatTheme>> {
-		if (!theme) {
+		if (!resolved.theme && !resolved.paper) {
 			return rpl::single(controller->defaultChatTheme());
 		}
-		return controller->cachedChatThemeValue(*theme);
+		const auto theme = resolved.theme.value_or(Data::CloudTheme());
+		const auto paper = resolved.paper
+			? resolved.paper->paper
+			: Data::WallPaper(0);
+		const auto type = resolved.dark
+			? Data::CloudThemeType::Dark
+			: Data::CloudThemeType::Light;
+		if (paper.document()
+			&& resolved.paper->media
+			&& !resolved.paper->media->loaded()
+			&& !controller->chatThemeAlreadyCached(theme, paper, type)) {
+			return rpl::single(controller->defaultChatTheme());
+		}
+		return controller->cachedChatThemeValue(theme, paper, type);
 	}) | rpl::flatten_latest(
 	) | rpl::distinct_until_changed();
+
+	return rpl::combine(
+		std::move(cloud),
+		controller->peerThemeOverrideValue()
+	) | rpl::map([=](
+			std::shared_ptr<Ui::ChatTheme> &&cloud,
+			PeerThemeOverride &&overriden) {
+		return (overriden.peer == peer.get()
+			&& peer->themeToken() != overriden.token)
+			? std::move(overriden.theme)
+			: std::move(cloud);
+	});
+}
+
+bool ShowSendPremiumError(
+		not_null<SessionController*> controller,
+		not_null<DocumentData*> document) {
+	return ShowSendPremiumError(controller->uiShow(), document);
+}
+
+bool ShowSendPremiumError(
+		std::shared_ptr<ChatHelpers::Show> show,
+		not_null<DocumentData*> document) {
+	if (!document->isPremiumSticker()
+		|| document->session().premium()) {
+		return false;
+	}
+	ShowStickerPreviewBox(std::move(show), document);
+	return true;
+}
+
+void ShowReactRestrictionToast(not_null<SessionController*> controller) {
+	controller->showToast({
+		.text = { tr::lng_restricted_send_reactions_click(tr::now) },
+		.iconLottie = u"ban"_q,
+		.iconLottieSize = st::pollToastIconSize,
+		.duration = kReactionRestrictionToastDuration,
+	});
+}
+
+bool ShowReactPremiumError(
+		not_null<SessionController*> controller,
+		not_null<HistoryItem*> item,
+		const Data::ReactionId &id) {
+	if (item->reactionsAreTags()) {
+		if (controller->session().premium()) {
+			return false;
+		}
+		ShowPremiumPreviewBox(controller, PremiumFeature::TagsForMessages);
+		return true;
+	} else if (!item->canReact()) {
+		ShowReactRestrictionToast(controller);
+		return true;
+	} else if (controller->session().premium()
+		|| ranges::contains(
+			item->reactions(),
+			id,
+			&Data::MessageReaction::id)
+		|| item->history()->peer->isBroadcast()) {
+		return false;
+	} else if (!id.custom()) {
+		return false;
+	}
+	ShowPremiumPreviewBox(controller, PremiumFeature::InfiniteReactions);
+	return true;
 }
 
 } // namespace Window

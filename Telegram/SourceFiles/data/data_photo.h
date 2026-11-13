@@ -9,6 +9,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 #include "data/data_types.h"
 #include "data/data_cloud_file.h"
+#include "core/file_location.h"
 
 namespace Main {
 class Session;
@@ -53,9 +54,11 @@ public:
 
 	void automaticLoadSettingsChanged();
 
+	[[nodiscard]] TimeId date() const;
 	[[nodiscard]] bool loading() const;
 	[[nodiscard]] bool displayLoading() const;
 	void cancel();
+	void clearLocalCache();
 	[[nodiscard]] float64 progress() const;
 	[[nodiscard]] int32 loadOffset() const;
 	[[nodiscard]] bool uploading() const;
@@ -64,8 +67,12 @@ public:
 	void setWaitingForAlbum();
 	[[nodiscard]] bool waitingForAlbum() const;
 
-	[[nodiscard]] Image *getReplyPreview(Data::FileOrigin origin);
-	[[nodiscard]] bool replyPreviewLoaded() const;
+	[[nodiscard]] Image *getReplyPreview(
+		Data::FileOrigin origin,
+		not_null<PeerData*> context,
+		bool spoiler);
+	[[nodiscard]] Image *getReplyPreview(not_null<HistoryItem*> item);
+	[[nodiscard]] bool replyPreviewLoaded(bool spoiler) const;
 
 	void setRemoteLocation(
 		int32 dc,
@@ -85,12 +92,21 @@ public:
 	[[nodiscard]] auto activeMediaView() const
 		-> std::shared_ptr<Data::PhotoMedia>;
 
+	void setFields(TimeId date, bool hasAttachedStickers);
+	void setExtendedMediaPreview(
+		QSize dimensions,
+		const QByteArray &inlineThumbnailBytes,
+		std::optional<TimeId> videoDuration);
+	[[nodiscard]] bool extendedMediaPreview() const;
+	[[nodiscard]] std::optional<TimeId> extendedMediaVideoDuration() const;
+
 	void updateImages(
 		const QByteArray &inlineThumbnailBytes,
 		const ImageWithLocation &small,
 		const ImageWithLocation &thumbnail,
 		const ImageWithLocation &large,
-		const ImageWithLocation &video,
+		const ImageWithLocation &videoSmall,
+		const ImageWithLocation &videoLarge,
 		crl::time videoStartTime);
 	[[nodiscard]] int validSizeIndex(Data::PhotoSize size) const;
 	[[nodiscard]] int existingSizeIndex(Data::PhotoSize size) const;
@@ -123,20 +139,14 @@ public:
 	[[nodiscard]] int imageByteSize(Data::PhotoSize size) const;
 
 	[[nodiscard]] bool hasVideo() const;
-	[[nodiscard]] bool videoLoading() const;
-	[[nodiscard]] bool videoFailed() const;
-	void loadVideo(Data::FileOrigin origin);
-	[[nodiscard]] const ImageLocation &videoLocation() const;
-	[[nodiscard]] int videoByteSize() const;
-	[[nodiscard]] crl::time videoStartPosition() const {
-		return _videoStartTime;
-	}
-	void setVideoPlaybackFailed() {
-		_videoPlaybackFailed = true;
-	}
-	[[nodiscard]] bool videoPlaybackFailed() const {
-		return _videoPlaybackFailed;
-	}
+	[[nodiscard]] bool hasVideoSmall() const;
+	void loadVideo(Data::PhotoSize size, Data::FileOrigin origin);
+	[[nodiscard]] const ImageLocation &videoLocation(
+		Data::PhotoSize size) const;
+	[[nodiscard]] int videoByteSize(Data::PhotoSize size) const;
+	[[nodiscard]] crl::time videoStartPosition() const;
+	void setVideoPlaybackFailed();
+	[[nodiscard]] bool videoPlaybackFailed() const;
 	[[nodiscard]] bool videoCanBePlayed() const;
 	[[nodiscard]] auto createStreamingLoader(
 		Data::FileOrigin origin,
@@ -144,14 +154,16 @@ public:
 	-> std::unique_ptr<Media::Streaming::Loader>;
 
 	[[nodiscard]] bool hasAttachedStickers() const;
-	void setHasAttachedStickers(bool value);
 
 	// For now they return size of the 'large' image.
-	int width() const;
-	int height() const;
+	[[nodiscard]] int width() const;
+	[[nodiscard]] int height() const;
+
+	[[nodiscard]] MediaKey mediaKey() const;
+	[[nodiscard]] const Core::FileLocation &location(bool check) const;
+	void setLocation(const Core::FileLocation &loc);
 
 	PhotoId id = 0;
-	TimeId date = 0;
 
 	PeerData *peer = nullptr; // for chat and channel photos connection
 	// geo, caption
@@ -159,19 +171,33 @@ public:
 	std::unique_ptr<Data::UploadState> uploadingData;
 
 private:
+	[[nodiscard]] Data::CloudFile &videoFile(Data::PhotoSize size);
+	[[nodiscard]] const Data::CloudFile &videoFile(
+		Data::PhotoSize size) const;
+
+	TimeId _dateOrExtendedVideoDuration = 0;
+
+	struct VideoSizes {
+		Data::CloudFile small;
+		Data::CloudFile large;
+		crl::time startTime = 0;
+		bool playbackFailed = false;
+	};
 	QByteArray _inlineThumbnailBytes;
 	std::array<Data::CloudFile, Data::kPhotoSizeCount> _images;
-	Data::CloudFile _video;
-	crl::time _videoStartTime = 0;
-	bool _videoPlaybackFailed = false;
+	std::unique_ptr<VideoSizes> _videoSizes;
 
 	int32 _dc = 0;
 	uint64 _access = 0;
 	bool _hasStickers = false;
+	bool _extendedMediaPreview = false;
+
 	QByteArray _fileReference;
 	std::unique_ptr<Data::ReplyPreview> _replyPreview;
 	std::weak_ptr<Data::PhotoMedia> _media;
 
 	not_null<Data::Session*> _owner;
+
+	Core::FileLocation _location;
 
 };

@@ -7,19 +7,22 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "window/themes/window_theme_editor_block.h"
 
-#include "styles/style_window.h"
-#include "ui/effects/ripple_animation.h"
-#include "ui/widgets/shadow.h"
-#include "boxes/edit_color_box.h"
-#include "lang/lang_keys.h"
 #include "base/call_delayed.h"
-#include "base/qt_adapters.h"
+#include "boxes/abstract_box.h"
+#include "lang/lang_keys.h"
+#include "ui/effects/ripple_animation.h"
+#include "ui/layers/generic_box.h"
+#include "ui/painter.h"
+#include "ui/widgets/color_editor.h"
+#include "ui/widgets/shadow.h"
+#include "styles/style_widgets.h"
+#include "styles/style_window.h"
 
 namespace Window {
 namespace Theme {
 namespace {
 
-auto SearchSplitter = QRegularExpression(qsl("[\\@\\s\\-\\+\\(\\)\\[\\]\\{\\}\\<\\>\\,\\.\\:\\!\\_\\;\\\"\\'\\x0\\#]"));
+auto SearchSplitter = QRegularExpression(u"[\\@\\s\\-\\+\\(\\)\\[\\]\\{\\}\\<\\>\\,\\.\\:\\!\\_\\;\\\"\\'\\x0\\#]"_q);
 
 } // namespace
 
@@ -60,15 +63,15 @@ public:
 	}
 	bool searchWordsContain(const QString &needle) const {
 		for (const auto &word : _searchWords) {
-			if (word.startsWith(needle)) {
+			if (word.contains(needle)) {
 				return true;
 			}
 		}
 		return false;
 	}
 
-	const base::flat_set<QChar> &searchStartChars() const {
-		return _searchStartChars;
+	const base::flat_set<QChar> &searchChars() const {
+		return _searchChars;
 	}
 
 	void setTop(int top) {
@@ -107,7 +110,7 @@ private:
 	Ui::Text::String _description = { st::windowMinWidth / 2 };
 
 	base::flat_set<QString> _searchWords;
-	base::flat_set<QChar> _searchStartChars;
+	base::flat_set<QChar> _searchChars;
 
 	int _top = 0;
 	int _height = 0;
@@ -131,9 +134,9 @@ void EditorBlock::Row::setValue(QColor value) {
 void EditorBlock::Row::fillValueString() {
 	auto addHex = [=](int code) {
 		if (code >= 0 && code < 10) {
-			_valueString.append('0' + code);
+			_valueString.append(QChar('0' + code));
 		} else if (code >= 10 && code < 16) {
-			_valueString.append('a' + (code - 10));
+			_valueString.append(QChar('a' + (code - 10)));
 		}
 	};
 	auto addCode = [=](int code) {
@@ -153,34 +156,41 @@ void EditorBlock::Row::fillValueString() {
 
 void EditorBlock::Row::fillSearchIndex() {
 	_searchWords.clear();
-	_searchStartChars.clear();
+	_searchChars.clear();
 	const auto toIndex = _name
 		+ ' ' + _copyOf
 		+ ' ' + TextUtilities::RemoveAccents(_description.toString())
 		+ ' ' + _valueString;
 	const auto words = toIndex.toLower().split(
 		SearchSplitter,
-		base::QStringSkipEmptyParts);
+		Qt::SkipEmptyParts);
 	for (const auto &word : words) {
 		_searchWords.emplace(word);
-		_searchStartChars.emplace(word[0]);
+		for (const auto &ch : word) {
+			_searchChars.emplace(ch);
+		}
 	}
 }
 
-EditorBlock::EditorBlock(QWidget *parent, Type type, Context *context) : TWidget(parent)
+EditorBlock::EditorBlock(QWidget *parent, Type type, Context *context)
+: RpWidget(parent)
 , _type(type)
 , _context(context)
 , _transparent(style::TransparentPlaceholder()) {
 	setMouseTracking(true);
-	subscribe(_context->updated, [this] {
+
+	_context->updated.events(
+	) | rpl::on_next([=] {
 		if (_mouseSelection) {
 			_lastGlobalPos = QCursor::pos();
 			updateSelected(mapFromGlobal(_lastGlobalPos));
 		}
 		update();
-	});
+	}, lifetime());
+
 	if (_type == Type::Existing) {
-		subscribe(_context->appended, [this](const Context::AppendData &added) {
+		_context->appended.events(
+		) | rpl::on_next([=](const Context::AppendData &added) {
 			auto name = added.name;
 			auto value = added.value;
 			feed(name, value);
@@ -194,14 +204,15 @@ EditorBlock::EditorBlock(QWidget *parent, Type type, Context *context) : TWidget
 			row->setCopyOf(copyOf);
 			addToSearch(*row);
 
-			_context->changed.notify({ QStringList(name), value }, true);
-			_context->resized.notify();
-			_context->pending.notify({ name, copyOf, value }, true);
-		});
+			_context->changed.fire({ QStringList(name), value });
+			_context->resized.fire({});
+			_context->pending.fire({ name, copyOf, value });
+		}, lifetime());
 	} else {
-		subscribe(_context->changed, [this](const Context::ChangeData &data) {
+		_context->changed.events(
+		) | rpl::on_next([=](const Context::ChangeData &data) {
 			checkCopiesChanged(0, data.names, data.value);
-		});
+		}, lifetime());
 	}
 }
 
@@ -216,6 +227,10 @@ void EditorBlock::feed(const QString &name, QColor value, const QString &copyOfE
 
 bool EditorBlock::feedCopy(const QString &name, const QString &copyOf) {
 	if (auto row = findRow(copyOf)) {
+		if (copyOf == name) {
+			LOG(("Theme Warning: Skipping value '%1: %2' (the value refers to itself.)").arg(name, copyOf));
+			return true;
+		}
 		if (findRow(name)) {
 			// Remove the existing row and mark all its copies as unique keys.
 			LOG(("Theme Warning: Color value '%1' appears more than once in the color scheme.").arg(name));
@@ -223,6 +238,10 @@ bool EditorBlock::feedCopy(const QString &name, const QString &copyOf) {
 
 			// row was invalidated by removeRow() call.
 			row = findRow(copyOf);
+			// Should not happen, but still check.
+			if (!row) {
+				return true;
+			}
 		}
 		addRow(name, copyOf, row->value());
 	} else {
@@ -257,7 +276,7 @@ void EditorBlock::addToSearch(const Row &row) {
 	if (!query.isEmpty()) resetSearch();
 
 	auto index = findRowIndex(&row);
-	for (const auto &ch : row.searchStartChars()) {
+	for (const auto &ch : row.searchChars()) {
 		_searchIndex[ch].insert(index);
 	}
 
@@ -269,7 +288,7 @@ void EditorBlock::removeFromSearch(const Row &row) {
 	if (!query.isEmpty()) resetSearch();
 
 	auto index = findRowIndex(&row);
-	for (const auto &ch : row.searchStartChars()) {
+	for (const auto &ch : row.searchChars()) {
 		const auto i = _searchIndex.find(ch);
 		if (i != end(_searchIndex)) {
 			i->second.remove(index);
@@ -294,24 +313,49 @@ void EditorBlock::chooseRow() {
 }
 
 void EditorBlock::activateRow(const Row &row) {
-	if (_context->box) {
+	if (_context->colorEditor.editor) {
 		if (_type == Type::Existing) {
 			_context->possibleCopyOf = row.name();
-			_context->box->showColor(row.value());
+			_context->colorEditor.editor->showColor(row.value());
 		}
 	} else {
 		_editing = findRowIndex(&row);
-		if (auto box = Ui::show(Box<EditColorBox>(row.name(), EditColorBox::Mode::RGBA, row.value()))) {
-			box->setSaveCallback(crl::guard(this, [this](QColor value) {
-				saveEditing(value);
-			}));
-			box->setCancelCallback(crl::guard(this, [this] {
+		const auto name = row.name();
+		const auto value = row.value();
+		Ui::show(Box([=](not_null<Ui::GenericBox*> box) {
+			const auto editor = box->addRow(object_ptr<ColorEditor>(
+				box,
+				ColorEditor::Mode::RGBA,
+				value));
+			struct State {
+				rpl::lifetime cancelLifetime;
+			};
+			const auto state = editor->lifetime().make_state<State>();
+
+			const auto save = crl::guard(this, [=] {
+				state->cancelLifetime.destroy();
+				saveEditing(editor->color());
+			});
+			box->boxClosing(
+			) | rpl::on_next(crl::guard(this, [=] {
 				cancelEditing();
-			}));
-			_context->box = box;
-			_context->name = row.name();
-			_context->updated.notify();
-		}
+			}), state->cancelLifetime);
+			editor->submitRequests(
+			) | rpl::on_next(save, editor->lifetime());
+
+			box->setFocusCallback([=] {
+				editor->setInnerFocus();
+			});
+			box->addButton(tr::lng_settings_save(), save);
+			box->addButton(tr::lng_cancel(), [=] { box->closeBox(); });
+			box->setTitle(name);
+			box->setWidth(editor->width());
+
+			_context->colorEditor.box = box;
+			_context->colorEditor.editor = editor;
+			_context->name = name;
+			_context->updated.fire({});
+		}));
 	}
 }
 
@@ -335,11 +379,8 @@ bool EditorBlock::selectSkip(int direction) {
 
 void EditorBlock::scrollToSelected() {
 	if (_selected >= 0) {
-		Context::ScrollData update;
-		update.type = _type;
-		update.position = rowAtIndex(_selected).top();
-		update.height = rowAtIndex(_selected).height();
-		_context->scroll.notify(update, true);
+		const auto &row = rowAtIndex(_selected);
+		_context->scroll.fire({ _type, row.top(), row.height() });
 	}
 }
 
@@ -383,7 +424,7 @@ void EditorBlock::searchByQuery(QString query) {
 			}
 		}
 
-		_context->resized.notify(true);
+		_context->resized.fire({});
 	}
 }
 
@@ -528,7 +569,7 @@ void EditorBlock::mouseReleaseEvent(QMouseEvent *e) {
 	auto pressed = _pressed;
 	setPressed(-1);
 	if (pressed == _selected) {
-		if (_context->box) {
+		if (_context->colorEditor.box) {
 			chooseRow();
 		} else if (_selected >= 0) {
 			base::call_delayed(st::defaultRippleAnimation.hideDuration, this, [this, index = findRowIndex(&rowAtIndex(_selected))] {
@@ -556,7 +597,7 @@ void EditorBlock::saveEditing(QColor value) {
 
 		removeRow(name, false);
 
-		_context->appended.notify({ name, possibleCopyOf, color, description }, true);
+		_context->appended.fire({ name, possibleCopyOf, color, description });
 	} else if (_type == Type::Existing) {
 		removeFromSearch(row);
 
@@ -576,7 +617,7 @@ void EditorBlock::saveEditing(QColor value) {
 
 		if (valueChanged || copyOfChanged) {
 			checkCopiesChanged(_editing + 1, QStringList(name), value);
-			_context->pending.notify({ name, copyOf, value }, true);
+			_context->pending.fire({ name, copyOf, value });
 		}
 	}
 	cancelEditing();
@@ -593,22 +634,25 @@ void EditorBlock::checkCopiesChanged(int startIndex, QStringList names, QColor v
 		}
 	}
 	if (_type == Type::Existing) {
-		_context->changed.notify({ names, value }, true);
+		_context->changed.fire({ names, value });
 	}
 }
 
 void EditorBlock::cancelEditing() {
-	if (_editing >= 0) {
+	// The only place we need to check for _editing < _data.size(),
+	// because we could remove the row that was edited in New block,
+	// and it could be the last row, making _editing inconsistent.
+	if (_editing >= 0 && _editing < _data.size()) {
 		updateRow(_data[_editing]);
 	}
 	_editing = -1;
-	if (auto box = base::take(_context->box)) {
+	if (const auto box = base::take(_context->colorEditor.box)) {
 		box->closeBox();
 	}
 	_context->possibleCopyOf = QString();
 	if (!_context->name.isEmpty()) {
 		_context->name = QString();
-		_context->updated.notify();
+		_context->updated.fire({});
 	}
 }
 
@@ -745,7 +789,7 @@ void EditorBlock::addRowRipple(int index) {
 	auto &row = rowAtIndex(index);
 	auto ripple = row.ripple();
 	if (!ripple) {
-		auto mask = Ui::RippleAnimation::rectMask(QSize(width(), row.height()));
+		auto mask = Ui::RippleAnimation::RectMask(QSize(width(), row.height()));
 		ripple = row.setRipple(std::make_unique<Ui::RippleAnimation>(st::defaultRippleAnimation, std::move(mask), [this, index = findRowIndex(&row)] {
 			updateRow(_data[index]);
 		}));
@@ -755,7 +799,7 @@ void EditorBlock::addRowRipple(int index) {
 }
 
 void EditorBlock::stopLastRipple(int index) {
-	auto &row = rowAtIndex(index);
+	const auto &row = rowAtIndex(index);
 	if (row.ripple()) {
 		row.ripple()->lastStop();
 	}
@@ -779,7 +823,7 @@ EditorBlock::Row &EditorBlock::rowAtIndex(int index) {
 }
 
 int EditorBlock::findRowIndex(const QString &name) const {
-	return _indices.value(name, -1);;
+	return _indices.value(name, -1);
 }
 
 EditorBlock::Row *EditorBlock::findRow(const QString &name) {

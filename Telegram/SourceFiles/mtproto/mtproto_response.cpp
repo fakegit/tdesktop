@@ -8,6 +8,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "mtproto/mtproto_response.h"
 
 #include <QtCore/QRegularExpression>
+#include <QtCore/QDebug>
 
 namespace MTP {
 namespace {
@@ -25,11 +26,11 @@ namespace {
 Error::Error(const MTPrpcError &error)
 : _code(error.c_rpc_error().verror_code().v) {
 	QString text = qs(error.c_rpc_error().verror_message());
-	const auto expression = QRegularExpression(
+	static const auto Expression = QRegularExpression(
 		"^([A-Z0-9_]+)(: .*)?$",
 		(QRegularExpression::DotMatchesEverythingOption
 			| QRegularExpression::MultilineOption));
-	const auto match = expression.match(text);
+	const auto match = Expression.match(text);
 	if (match.hasMatch()) {
 		_type = match.captured(1);
 		_description = match.captured(2).mid(2);
@@ -74,6 +75,17 @@ Error Error::Local(
 		const QString &type,
 		const QString &description) {
 	return Error(MTPLocal(type, description));
+}
+
+QDebug operator<<(QDebug debug, const Error &error) {
+	return debug.nospace()
+		<< "MTP::Error("
+		<< error.code()
+		<< ", "
+		<< error.type()
+		<< ", "
+		<< error.description()
+		<< ")";
 }
 
 } // namespace MTP

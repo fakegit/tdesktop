@@ -7,6 +7,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "api/api_media.h"
 
+#include "api/api_common.h"
 #include "data/data_document.h"
 #include "data/stickers/data_stickers_set.h"
 #include "history/history_item.h"
@@ -19,10 +20,10 @@ MTPVector<MTPDocumentAttribute> ComposeSendingDocumentAttributes(
 	const auto filenameAttribute = MTP_documentAttributeFilename(
 		MTP_string(document->filename()));
 	const auto dimensions = document->dimensions;
+	const auto animated = (document->type == AnimatedDocument);
 	auto attributes = QVector<MTPDocumentAttribute>(1, filenameAttribute);
 	if (dimensions.width() > 0 && dimensions.height() > 0) {
-		const auto duration = document->getDuration();
-		if (duration >= 0 && !document->hasMimeType(qstr("image/gif"))) {
+		if (document->hasDuration() && !document->hasMimeType(u"image/gif"_q)) {
 			auto flags = MTPDdocumentAttributeVideo::Flags(0);
 			using VideoFlag = MTPDdocumentAttributeVideo::Flag;
 			if (document->isVideoMessage()) {
@@ -31,18 +32,29 @@ MTPVector<MTPDocumentAttribute> ComposeSendingDocumentAttributes(
 			if (document->supportsStreaming()) {
 				flags |= VideoFlag::f_supports_streaming;
 			}
+			if (!animated && document->isSilentVideo()) {
+				flags |= VideoFlag::f_nosound;
+			}
+			const auto video = document->video();
+			const auto startTs = video ? video->startTs : crl::time(0);
+			if (startTs > 0) {
+				flags |= VideoFlag::f_video_start_ts;
+			}
 			attributes.push_back(MTP_documentAttributeVideo(
 				MTP_flags(flags),
-				MTP_int(duration),
+				MTP_double(document->duration() / 1000.),
 				MTP_int(dimensions.width()),
-				MTP_int(dimensions.height())));
+				MTP_int(dimensions.height()),
+				MTPint(), // preload_prefix_size
+				MTP_double(startTs / 1000.), // video_start_ts
+				MTPstring())); // video_codec
 		} else {
 			attributes.push_back(MTP_documentAttributeImageSize(
 				MTP_int(dimensions.width()),
 				MTP_int(dimensions.height())));
 		}
 	}
-	if (document->type == AnimatedDocument) {
+	if (animated) {
 		attributes.push_back(MTP_documentAttributeAnimated());
 	} else if (document->type == StickerDocument && document->sticker()) {
 		attributes.push_back(MTP_documentAttributeSticker(
@@ -55,7 +67,7 @@ MTPVector<MTPDocumentAttribute> ComposeSendingDocumentAttributes(
 			| MTPDdocumentAttributeAudio::Flag::f_performer;
 		attributes.push_back(MTP_documentAttributeAudio(
 			MTP_flags(flags),
-			MTP_int(song->duration),
+			MTP_int(document->duration() / 1000),
 			MTP_string(song->title),
 			MTP_string(song->performer),
 			MTPstring()));
@@ -64,7 +76,7 @@ MTPVector<MTPDocumentAttribute> ComposeSendingDocumentAttributes(
 			| MTPDdocumentAttributeAudio::Flag::f_waveform;
 		attributes.push_back(MTP_documentAttributeAudio(
 			MTP_flags(flags),
-			MTP_int(voice->duration),
+			MTP_int(document->duration() / 1000),
 			MTPstring(),
 			MTPstring(),
 			MTP_bytes(documentWaveformEncode5bit(voice->waveform))));
@@ -75,41 +87,58 @@ MTPVector<MTPDocumentAttribute> ComposeSendingDocumentAttributes(
 } // namespace
 
 MTPInputMedia PrepareUploadedPhoto(
-		const MTPInputFile &file,
-		std::vector<MTPInputDocument> attachedStickers) {
-	const auto flags = attachedStickers.empty()
-		? MTPDinputMediaUploadedPhoto::Flags(0)
-		: MTPDinputMediaUploadedPhoto::Flag::f_stickers;
+		not_null<HistoryItem*> item,
+		RemoteFileInfo info) {
+	using Flag = MTPDinputMediaUploadedPhoto::Flag;
+	const auto spoiler = item->media() && item->media()->hasSpoiler();
+	const auto ttlSeconds = item->media()
+		? item->media()->ttlSeconds()
+		: 0;
+	const auto flags = (spoiler ? Flag::f_spoiler : Flag())
+		| (info.attachedStickers.empty() ? Flag() : Flag::f_stickers)
+		| (ttlSeconds ? Flag::f_ttl_seconds : Flag());
 	return MTP_inputMediaUploadedPhoto(
 		MTP_flags(flags),
-		file,
-		MTP_vector<MTPInputDocument>(ranges::to<QVector>(attachedStickers)),
-		MTP_int(0));
+		info.file,
+		MTP_vector<MTPInputDocument>(
+			ranges::to<QVector<MTPInputDocument>>(info.attachedStickers)),
+		MTP_int(ttlSeconds),
+		MTPInputDocument()); // video
 }
 
 MTPInputMedia PrepareUploadedDocument(
 		not_null<HistoryItem*> item,
-		const MTPInputFile &file,
-		const std::optional<MTPInputFile> &thumb,
-		std::vector<MTPInputDocument> attachedStickers) {
+		RemoteFileInfo info) {
 	if (!item || !item->media() || !item->media()->document()) {
 		return MTP_inputMediaEmpty();
 	}
-	const auto emptyFlag = MTPDinputMediaUploadedDocument::Flags(0);
-	using DocFlags = MTPDinputMediaUploadedDocument::Flag;
-	const auto flags = emptyFlag
-		| (thumb ? DocFlags::f_thumb : emptyFlag)
-		| (item->groupId() ? DocFlags::f_nosound_video : emptyFlag)
-		| (attachedStickers.empty() ? DocFlags::f_stickers : emptyFlag);
+	using Flag = MTPDinputMediaUploadedDocument::Flag;
 	const auto document = item->media()->document();
+	const auto spoiler = item->media() && item->media()->hasSpoiler();
+	const auto ttlSeconds = item->media()
+		? item->media()->ttlSeconds()
+		: 0;
+	const auto animated = (document->type == AnimatedDocument);
+	const auto silent = !animated
+		&& (item->groupId() || document->isSilentVideo());
+	const auto flags = (spoiler ? Flag::f_spoiler : Flag())
+		| (info.thumb ? Flag::f_thumb : Flag())
+		| (silent ? Flag::f_nosound_video : Flag())
+		| (info.forceFile ? Flag::f_force_file : Flag())
+		| (info.attachedStickers.empty() ? Flag() : Flag::f_stickers)
+		| (ttlSeconds ? Flag::f_ttl_seconds : Flag())
+		| (info.videoCover ? Flag::f_video_cover : Flag());
 	return MTP_inputMediaUploadedDocument(
 		MTP_flags(flags),
-		file,
-		thumb.value_or(MTPInputFile()),
+		info.file,
+		info.thumb.value_or(MTPInputFile()),
 		MTP_string(document->mimeString()),
 		ComposeSendingDocumentAttributes(document),
-		MTP_vector<MTPInputDocument>(ranges::to<QVector>(attachedStickers)),
-		MTP_int(0));
+		MTP_vector<MTPInputDocument>(
+			ranges::to<QVector<MTPInputDocument>>(info.attachedStickers)),
+		info.videoCover.value_or(MTPInputPhoto()),
+		MTP_int(0), // video_timestamp
+		MTP_int(ttlSeconds));
 }
 
 bool HasAttachedStickers(MTPInputMedia media) {

@@ -7,30 +7,27 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #pragma once
 
-#include "base/weak_ptr.h"
-#include "base/timer.h"
-#include "base/flags.h"
 #include "base/object_ptr.h"
 #include "calls/group/calls_group_call.h"
 #include "calls/group/calls_group_common.h"
 #include "calls/group/calls_choose_join_as.h"
 #include "calls/group/ui/desktop_capture_choose_source.h"
 #include "ui/effects/animations.h"
-#include "ui/gl/gl_window.h"
-#include "ui/rp_widget.h"
 
 class Image;
 
+namespace ChatHelpers {
+class Show;
+} // namespace ChatHelpers
+
 namespace Data {
 class PhotoMedia;
-class CloudImageView;
 class GroupCall;
 } // namespace Data
 
 namespace Ui {
+class Show;
 class BoxContent;
-enum class LayerOption;
-using LayerOptions = base::flags<LayerOption>;
 class AbstractButton;
 class ImportantTooltip;
 class DropdownMenu;
@@ -39,26 +36,32 @@ class CallMuteButton;
 class IconButton;
 class FlatLabel;
 class RpWidget;
+class RpWindow;
 template <typename Widget>
 class FadeWrap;
 template <typename Widget>
 class PaddingWrap;
 class ScrollArea;
 class GenericBox;
-class LayerManager;
 class GroupCallScheduledLeft;
-namespace Toast {
-class Instance;
-} // namespace Toast
-namespace Platform {
-class TitleControls;
-} // namespace Platform
+struct CallButtonColors;
 } // namespace Ui
+
+namespace Ui::Toast {
+class Instance;
+struct Config;
+} // namespace Ui::Toast
 
 namespace style {
 struct CallSignalBars;
 struct CallBodyLayout;
 } // namespace style
+
+namespace Calls {
+struct InviteRequest;
+struct ConferencePanelMigration;
+class Window;
+} // namespace Calls
 
 namespace Calls::Group {
 
@@ -68,26 +71,35 @@ class Viewport;
 enum class PanelMode;
 enum class StickedTooltip;
 class MicLevelTester;
+class MessageField;
+class MessagesUi;
 
-class Panel final : private Ui::DesktopCapture::ChooseSourceDelegate {
+class Panel final
+	: public base::has_weak_ptr
+	, private Ui::DesktopCapture::ChooseSourceDelegate {
 public:
-	Panel(not_null<GroupCall*> call);
+	explicit Panel(not_null<GroupCall*> call);
+	Panel(not_null<GroupCall*> call, ConferencePanelMigration info);
 	~Panel();
 
+	[[nodiscard]] not_null<Ui::RpWidget*> widget() const;
 	[[nodiscard]] not_null<GroupCall*> call() const;
+	[[nodiscard]] bool isVisible() const;
 	[[nodiscard]] bool isActive() const;
 
-	void showToast(TextWithEntities &&text, crl::time duration = 0);
-	void showBox(object_ptr<Ui::BoxContent> box);
-	void showBox(
-		object_ptr<Ui::BoxContent> box,
-		Ui::LayerOptions options,
-		anim::type animated = anim::type::normal);
+	void migrationShowShareLink();
+	void migrationInviteUsers(std::vector<InviteRequest> users);
 
 	void minimize();
+	void toggleFullScreen();
+	void toggleFullScreen(bool fullscreen);
 	void close();
 	void showAndActivate();
 	void closeBeforeDestroy();
+
+	[[nodiscard]] std::shared_ptr<ChatHelpers::Show> uiShow();
+	[[nodiscard]] not_null<Window*> callWindow() const;
+	[[nodiscard]] not_null<Ui::RpWindow*> window() const;
 
 	rpl::lifetime &lifetime();
 
@@ -105,9 +117,6 @@ private:
 		Discarded,
 	};
 
-	[[nodiscard]] not_null<Ui::RpWindow*> window() const;
-	[[nodiscard]] not_null<Ui::RpWidget*> widget() const;
-
 	[[nodiscard]] PanelMode mode() const;
 
 	void paint(QRect clip);
@@ -116,19 +125,19 @@ private:
 	void initWidget();
 	void initControls();
 	void initShareAction();
-	void initLayout();
-	void initGeometry();
+	void initLayout(ConferencePanelMigration info);
+	void initGeometry(ConferencePanelMigration info);
 	void setupScheduledLabels(rpl::producer<TimeId> date);
 	void setupMembers();
 	void setupVideo(not_null<Viewport*> viewport);
 	void setupRealMuteButtonState(not_null<Data::GroupCall*> real);
+	[[nodiscard]] rpl::producer<QString> titleText();
 
 	bool handleClose();
 	void startScheduledNow();
-	void trackControls(bool track);
+	void trackControls(bool track, bool force = false);
 	void raiseControls();
 	void enlargeVideo();
-	void minimizeVideo();
 
 	void trackControl(Ui::RpWidget *widget, rpl::lifetime &lifetime);
 	void trackControlOver(not_null<Ui::RpWidget*> control, bool over);
@@ -147,16 +156,33 @@ private:
 	void updateButtonsStyles();
 	void updateMembersGeometry();
 	void refreshControlsBackground();
+	void refreshTitleBackground();
 	void setupControlsBackgroundWide();
 	void setupControlsBackgroundNarrow();
 	void showControls();
+	void createMessageButton();
 	void refreshLeftButton();
 	void refreshVideoButtons(
 		std::optional<bool> overrideWideMode = std::nullopt);
 	void refreshTopButton();
+	void createPinOnTop();
+	void createTitleMenu();
+	void createTitleColumn();
+	void toggleMembersColumn();
+	[[nodiscard]] int membersColumnReserve() const;
+	[[nodiscard]] std::vector<not_null<Ui::IconButton*>> titleButtons() const;
+	[[nodiscard]] QRect titleButtonRect(
+		not_null<Ui::IconButton*> button) const;
+	void setupFullScreenBehavior();
+	void setupEmptyRtmp();
 	void toggleWideControls(bool shown);
 	void updateWideControlsVisibility();
 	[[nodiscard]] bool videoButtonInNarrowMode() const;
+	[[nodiscard]] Fn<void()> shareConferenceLinkCallback();
+	void shareConferenceLink();
+	void toggleMessageTyping();
+	[[nodiscard]] rpl::producer<Ui::CallButtonColors> toggleableOverrides(
+		rpl::producer<bool> active);
 
 	void endCall();
 
@@ -170,6 +196,7 @@ private:
 	[[nodiscard]] QRect computeTitleRect() const;
 	void refreshTitle();
 	void refreshTitleGeometry();
+	void refreshTitleColors();
 	void setupRealCallViewers();
 	void subscribeToChanges(not_null<Data::GroupCall*> real);
 
@@ -189,32 +216,36 @@ private:
 	const not_null<GroupCall*> _call;
 	not_null<PeerData*> _peer;
 
-	Ui::GL::Window _window;
-	const std::unique_ptr<Ui::LayerManager> _layerBg;
+	std::shared_ptr<Window> _window;
 	rpl::variable<PanelMode> _mode;
-
-#ifndef Q_OS_MAC
-	std::unique_ptr<Ui::Platform::TitleControls> _controls;
-#endif // !Q_OS_MAC
+	rpl::variable<bool> _fullScreenOrMaximized = false;
+	bool _unpinnedMaximized = false;
+	bool _rtmpFull = false;
 
 	rpl::lifetime _callLifetime;
 
+	object_ptr<Ui::RpWidget> _titleBackground = { nullptr };
 	object_ptr<Ui::FlatLabel> _title = { nullptr };
+	object_ptr<Ui::FlatLabel> _titleSeparator = { nullptr };
+	object_ptr<Ui::FlatLabel> _viewers = { nullptr };
 	object_ptr<Ui::FlatLabel> _subtitle = { nullptr };
 	object_ptr<Ui::AbstractButton> _recordingMark = { nullptr };
 	object_ptr<Ui::IconButton> _menuToggle = { nullptr };
+	object_ptr<Ui::IconButton> _pinOnTop = { nullptr };
+	object_ptr<Ui::IconButton> _titleColumn = { nullptr };
+	object_ptr<Ui::IconButton> _titleMenu = { nullptr };
 	object_ptr<Ui::DropdownMenu> _menu = { nullptr };
 	rpl::variable<bool> _wideMenuShown = false;
-	object_ptr<Ui::AbstractButton> _joinAsToggle = { nullptr };
+	rpl::variable<bool> _messageTyping = false;
 	object_ptr<Members> _members = { nullptr };
 	std::unique_ptr<Viewport> _viewport;
-	rpl::lifetime _trackControlsLifetime;
 	rpl::lifetime _trackControlsOverStateLifetime;
 	rpl::lifetime _trackControlsMenuLifetime;
 	object_ptr<Ui::FlatLabel> _startsIn = { nullptr };
 	object_ptr<Ui::RpWidget> _countdown = { nullptr };
 	std::shared_ptr<Ui::GroupCallScheduledLeft> _countdownData;
 	object_ptr<Ui::FlatLabel> _startsWhen = { nullptr };
+	object_ptr<Ui::RpWidget> _emptyRtmp = { nullptr };
 	ChooseJoinAsProcess _joinAsProcess;
 	std::optional<QRect> _lastSmallGeometry;
 	std::optional<QRect> _lastLargeGeometry;
@@ -222,7 +253,9 @@ private:
 	bool _showWideControls = false;
 	bool _trackControls = false;
 	bool _wideControlsShown = false;
+	bool _membersColumnShown = true;
 	Ui::Animations::Simple _wideControlsAnimation;
+	Ui::Animations::Simple _membersColumnAnimation;
 
 	object_ptr<Ui::RpWidget> _controlsBackgroundWide = { nullptr };
 	std::unique_ptr<ControlsBackgroundNarrow> _controlsBackgroundNarrow;
@@ -231,6 +264,7 @@ private:
 	object_ptr<Ui::CallButton> _callShare = { nullptr };
 	object_ptr<Ui::CallButton> _video = { nullptr };
 	object_ptr<Ui::CallButton> _screenShare = { nullptr };
+	object_ptr<Ui::CallButton> _message = { nullptr };
 	std::unique_ptr<Ui::CallMuteButton> _mute;
 	object_ptr<Ui::CallButton> _hangup;
 	object_ptr<Ui::ImportantTooltip> _niceTooltip = { nullptr };
@@ -239,12 +273,20 @@ private:
 	StickedTooltips _stickedTooltipsShown;
 	Fn<void()> _callShareLinkCallback;
 
+	std::shared_ptr<ChatHelpers::Show> _cachedShow;
+	std::unique_ptr<MessageField> _messageField;
+	std::unique_ptr<MessagesUi> _messages;
+
 	const std::unique_ptr<Toasts> _toasts;
-	base::weak_ptr<Ui::Toast::Instance> _lastToast;
 
 	std::unique_ptr<MicLevelTester> _micLevelTester;
 
+	style::complex_color _controlsBackgroundColor;
+	base::Timer _hideControlsTimer;
+	rpl::lifetime _hideControlsTimerLifetime;
+
 	rpl::lifetime _peerLifetime;
+	rpl::lifetime _lifetime;
 
 };
 

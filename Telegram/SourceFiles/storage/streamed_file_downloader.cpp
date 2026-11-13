@@ -16,7 +16,7 @@ namespace {
 using namespace Media::Streaming;
 
 constexpr auto kPartSize = Loader::kPartSize;
-constexpr auto kRequestPartsCount = 8;
+constexpr auto kRequestPartsCount = 32;
 
 } // namespace
 
@@ -27,12 +27,12 @@ StreamedFileDownloader::StreamedFileDownloader(
 	MTP::DcId dcId,
 	Data::FileOrigin origin,
 	Cache::Key cacheKey,
-	MediaKey fileLocationKey,
+	std::optional<MediaKey> fileLocationKey,
 	std::shared_ptr<Reader> reader,
 
 	// For FileLoader
 	const QString &toFile,
-	int32 size,
+	int64 size,
 	LocationType locationType,
 	LoadToCacheSetting toCache,
 	LoadFromCloudSetting fromCloud,
@@ -57,9 +57,9 @@ StreamedFileDownloader::StreamedFileDownloader(
 	_partIsSaved.resize(_partsCount, false);
 
 	_reader->partsForDownloader(
-	) | rpl::start_with_next([=](const LoadedPart &part) {
+	) | rpl::on_next([=](const LoadedPart &part) {
 		if (part.offset == LoadedPart::kFailedOffset) {
-			cancel(true);
+			cancel(FailureReason::OtherFailure);
 		} else {
 			savePart(std::move(part));
 		}
@@ -88,6 +88,7 @@ void StreamedFileDownloader::requestParts() {
 		&& _partsRequested < kRequestPartsCount) {
 		requestPart();
 	}
+	_reader->continueDownloaderFromMainThread();
 }
 
 void StreamedFileDownloader::requestPart() {
@@ -107,7 +108,7 @@ void StreamedFileDownloader::requestPart() {
 	++_partsRequested;
 }
 
-QByteArray StreamedFileDownloader::readLoadedPart(int offset) {
+QByteArray StreamedFileDownloader::readLoadedPart(int64 offset) {
 	Expects(offset >= 0 && offset < _fullSize);
 	Expects(!(offset % kPartSize));
 

@@ -14,16 +14,24 @@ namespace Window {
 enum class SlideDirection {
 	FromRight,
 	FromLeft,
+	FromBottom,
 };
 
 class SlideAnimation {
 public:
-	void paintContents(Painter &p, const QRect &update) const;
+	void paintContents(QPainter &p) const;
+
+	[[nodiscard]] float64 progress() const;
 
 	void setDirection(SlideDirection direction);
-	void setPixmaps(const QPixmap &oldContentCache, const QPixmap &newContentCache);
+	void setPixmaps(
+		const QPixmap &oldContentCache,
+		const QPixmap &newContentCache);
 	void setTopBarShadow(bool enabled);
+	void setTopSkip(int skip);
+	void setTopBarMask(const QPixmap &mask);
 	void setWithFade(bool withFade);
+	void setDuration(crl::time duration);
 
 	using RepaintCallback = Fn<void()>;
 	void setRepaintCallback(RepaintCallback &&callback);
@@ -41,11 +49,14 @@ private:
 	void animationCallback();
 
 	SlideDirection _direction = SlideDirection::FromRight;
+	int _topSkip = 0;
 	bool _topBarShadowEnabled = false;
 	bool _withFade = false;
+	crl::time _duration = 0;
 
 	mutable Ui::Animations::Simple _animation;
 	QPixmap _cacheUnder, _cacheOver;
+	QPixmap _mask;
 
 	RepaintCallback _repaintCallback;
 	FinishedCallback _finishedCallback;

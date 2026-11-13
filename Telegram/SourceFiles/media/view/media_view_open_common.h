@@ -8,6 +8,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #pragma once
 
 #include "data/data_cloud_themes.h"
+#include "data/data_stories.h"
 
 class DocumentData;
 class PeerData;
@@ -28,10 +29,16 @@ public:
 	OpenRequest(
 		Window::SessionController *controller,
 		not_null<PhotoData*> photo,
-		HistoryItem *item)
+		HistoryItem *item,
+		MsgId topicRootId,
+		PeerId monoforumPeerId,
+		bool showDrawButton = false)
 	: _controller(controller)
 	, _photo(photo)
-	, _item(item) {
+	, _item(item)
+	, _topicRootId(topicRootId)
+	, _monoforumPeerId(monoforumPeerId)
+	, _showDrawButton(showDrawButton) {
 	}
 	OpenRequest(
 		Window::SessionController *controller,
@@ -46,11 +53,19 @@ public:
 		Window::SessionController *controller,
 		not_null<DocumentData*> document,
 		HistoryItem *item,
-		bool continueStreaming = false)
+		MsgId topicRootId,
+		PeerId monoforumPeerId,
+		bool continueStreaming = false,
+		crl::time startTime = 0,
+		bool showDrawButton = false)
 	: _controller(controller)
 	, _document(document)
 	, _item(item)
-	, _continueStreaming(continueStreaming) {
+	, _topicRootId(topicRootId)
+	, _monoforumPeerId(monoforumPeerId)
+	, _continueStreaming(continueStreaming)
+	, _startTime(startTime)
+	, _showDrawButton(showDrawButton) {
 	}
 	OpenRequest(
 		Window::SessionController *controller,
@@ -61,43 +76,109 @@ public:
 	, _cloudTheme(cloudTheme) {
 	}
 
-	PeerData *peer() const {
+	OpenRequest(
+		Window::SessionController *controller,
+		not_null<Data::Story*> story,
+		Data::StoriesContext context)
+	: _controller(controller)
+	, _story(story)
+	, _storiesContext(context) {
+	}
+
+	OpenRequest(
+		Window::SessionController *controller,
+		std::shared_ptr<Data::GroupCall> call,
+		QString linkSlug,
+		MsgId joinMessageId)
+	: _controller(controller)
+	, _call(std::move(call))
+	, _callLinkSlug(std::move(linkSlug))
+	, _callJoinMessageId(joinMessageId) {
+	}
+
+	[[nodiscard]] PeerData *peer() const {
 		return _peer;
 	}
 
-	PhotoData *photo() const {
+	[[nodiscard]] PhotoData *photo() const {
 		return _photo;
 	}
 
-	HistoryItem *item() const {
+	[[nodiscard]] HistoryItem *item() const {
 		return _item;
 	}
 
-	DocumentData *document() const {
+	[[nodiscard]] MsgId topicRootId() const {
+		return _topicRootId;
+	}
+	[[nodiscard]] PeerId monoforumPeerId() const {
+		return _monoforumPeerId;
+	}
+
+	[[nodiscard]] DocumentData *document() const {
 		return _document;
 	}
 
-	std::optional<Data::CloudTheme> cloudTheme() const {
+	[[nodiscard]] Data::Story *story() const {
+		return _story;
+	}
+	[[nodiscard]] Data::StoriesContext storiesContext() const {
+		return _storiesContext;
+	}
+
+	[[nodiscard]] const std::shared_ptr<Data::GroupCall> &call() const {
+		return _call;
+	}
+	[[nodiscard]] const QString &callLinkSlug() const {
+		return _callLinkSlug;
+	}
+	[[nodiscard]] MsgId callJoinMessageId() const {
+		return _callJoinMessageId;
+	}
+
+	[[nodiscard]] std::optional<Data::CloudTheme> cloudTheme() const {
 		return _cloudTheme;
 	}
 
-	Window::SessionController *controller() const {
+	[[nodiscard]] Window::SessionController *controller() const {
 		return _controller;
 	}
 
-	bool continueStreaming() const {
+	[[nodiscard]] bool continueStreaming() const {
 		return _continueStreaming;
+	}
+
+	[[nodiscard]] crl::time startTime() const {
+		return _startTime;
+	}
+
+	[[nodiscard]] bool showDrawButton() const {
+		return _showDrawButton;
 	}
 
 private:
 	Window::SessionController *_controller = nullptr;
 	DocumentData *_document = nullptr;
 	PhotoData *_photo = nullptr;
+	Data::Story *_story = nullptr;
+	Data::StoriesContext _storiesContext;
 	PeerData *_peer = nullptr;
 	HistoryItem *_item = nullptr;
+	MsgId _topicRootId = 0;
+	PeerId _monoforumPeerId = 0;
 	std::optional<Data::CloudTheme> _cloudTheme = std::nullopt;
 	bool _continueStreaming = false;
+	crl::time _startTime = 0;
+	bool _showDrawButton = false;
+
+	std::shared_ptr<Data::GroupCall> _call;
+	QString _callLinkSlug;
+	MsgId _callJoinMessageId = 0;
 
 };
+
+[[nodiscard]] TimeId ExtractVideoTimestamp(not_null<HistoryItem*> item);
+
+[[nodiscard]] TextWithEntities StripQuoteEntities(TextWithEntities text);
 
 } // namespace Media::View

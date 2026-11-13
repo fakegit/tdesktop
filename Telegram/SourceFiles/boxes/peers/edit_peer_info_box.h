@@ -7,8 +7,11 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #pragma once
 
-#include <rpl/event_stream.h>
-#include "boxes/abstract_box.h"
+#include "ui/layers/box_content.h"
+
+namespace Settings {
+struct IconDescriptor;
+} // namespace Settings
 
 namespace style {
 struct SettingsCountButton;
@@ -42,7 +45,14 @@ public:
 		rpl::producer<QString> &&count,
 		Fn<void()> callback,
 		const style::SettingsCountButton &st,
-		const style::icon *icon = nullptr);
+		Settings::IconDescriptor &&descriptor);
+	[[nodiscard]] static object_ptr<Ui::SettingsButton> CreateButton(
+		not_null<QWidget*> parent,
+		rpl::producer<QString> &&text,
+		rpl::producer<TextWithEntities> &&labelText,
+		Fn<void()> callback,
+		const style::SettingsCountButton &st,
+		Settings::IconDescriptor &&descriptor);
 
 protected:
 	void prepare() override;
@@ -53,3 +63,7 @@ private:
 	not_null<PeerData*> _peer;
 
 };
+
+void ShowEditChatPermissions(
+	not_null<Window::SessionNavigation*> navigation,
+	not_null<PeerData*> peer);

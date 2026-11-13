@@ -9,6 +9,9 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 #include "base/platform/win/base_windows_safe_library.h"
 
+#include <limits>
+#include <memory>
+
 bool _debug = false;
 
 wstring updaterName, updaterDir, updateTo, exeName, customWorkingDir, customKeyFile;
@@ -17,28 +20,28 @@ bool equal(const wstring &a, const wstring &b) {
 	return !_wcsicmp(a.c_str(), b.c_str());
 }
 
-void updateError(const WCHAR *msg, DWORD errorCode) {
-	WCHAR errMsg[2048];
-	LPWSTR errorTextFormatted = nullptr;
-	auto formatFlags = FORMAT_MESSAGE_FROM_SYSTEM
-		| FORMAT_MESSAGE_ALLOCATE_BUFFER
-		| FORMAT_MESSAGE_IGNORE_INSERTS;
+wstring FormatUpdateError(const wstring &message, DWORD errorCode) {
+	auto errorText = LPWSTR(nullptr);
 	FormatMessage(
-		formatFlags,
-		NULL,
+		FORMAT_MESSAGE_FROM_SYSTEM
+			| FORMAT_MESSAGE_ALLOCATE_BUFFER
+			| FORMAT_MESSAGE_IGNORE_INSERTS,
+		nullptr,
 		errorCode,
 		MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
-		(LPWSTR)&errorTextFormatted,
+		reinterpret_cast<LPWSTR>(&errorText),
 		0,
-		0);
-	auto errorText = errorTextFormatted
-		? errorTextFormatted
-		: L"(Unknown error)";
-	wsprintf(errMsg, L"%s, error code: %d\nError message: %s", msg, errorCode, errorText);
+		nullptr);
+	const auto guard = std::unique_ptr<void, decltype(&LocalFree)>(
+		errorText,
+		&LocalFree);
+	return message + L"\nError code: " + std::to_wstring(errorCode)
+		+ L"\nError message: " + (errorText ? errorText : L"(Unknown error)");
+}
 
-	MessageBox(0, errMsg, L"Update error!", MB_ICONERROR);
-
-	LocalFree(errorTextFormatted);
+void updateError(const WCHAR *msg, DWORD errorCode) {
+	const auto text = FormatUpdateError(msg, errorCode);
+	MessageBox(0, text.c_str(), L"Update error!", MB_ICONERROR);
 }
 
 HANDLE _logFile = 0;
@@ -96,6 +99,114 @@ void writeLog(const wstring &msg) {
 	}
 }
 
+namespace {
+
+constexpr auto kProcessExitTimeout = DWORD(5000);
+
+bool ParsePositiveInteger(const WCHAR *text, ULONGLONG &result) {
+	result = 0;
+	for (; *text; ++text) {
+		if (*text < L'0' || *text > L'9') {
+			return false;
+		}
+		const auto digit = ULONGLONG(*text - L'0');
+		if (result > (std::numeric_limits<ULONGLONG>::max() - digit) / 10) {
+			return false;
+		}
+		result = result * 10 + digit;
+	}
+	return result != 0;
+}
+
+} // namespace
+
+bool ParseUpdateProcess(
+		const WCHAR *id,
+		const WCHAR *created,
+		DWORD &processId,
+		ULONGLONG &creationTime) {
+	auto parsedId = ULONGLONG(0);
+	auto parsedTime = ULONGLONG(0);
+	if (!ParsePositiveInteger(id, parsedId)
+		|| parsedId > std::numeric_limits<DWORD>::max()
+		|| !ParsePositiveInteger(created, parsedTime)) {
+		return false;
+	}
+	processId = DWORD(parsedId);
+	creationTime = parsedTime;
+	return true;
+}
+
+DWORD FinishUpdateProcess(DWORD processId, ULONGLONG creationTime) {
+	if (!processId || !creationTime || processId == GetCurrentProcessId()) {
+		return ERROR_INVALID_PARAMETER;
+	}
+	writeLog(L"Waiting for update parent " + std::to_wstring(processId)
+		+ L" (created " + std::to_wstring(creationTime) + L").");
+	const auto process = std::unique_ptr<void, decltype(&CloseHandle)>(
+		OpenProcess(
+			SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+			FALSE,
+			processId),
+		&CloseHandle);
+	if (!process) {
+		const auto error = GetLastError();
+		return (error == ERROR_INVALID_PARAMETER) ? ERROR_SUCCESS : error;
+	}
+	auto created = FILETIME();
+	auto exited = FILETIME();
+	auto kernel = FILETIME();
+	auto user = FILETIME();
+	if (!GetProcessTimes(process.get(), &created, &exited, &kernel, &user)) {
+		return GetLastError();
+	}
+	const auto actualTime = (ULONGLONG(created.dwHighDateTime) << 32)
+		| created.dwLowDateTime;
+	if (actualTime != creationTime) {
+		writeLog(L"Update parent already exited; process id was reused.");
+		return ERROR_SUCCESS;
+	}
+	auto wait = WaitForSingleObject(process.get(), kProcessExitTimeout);
+	if (wait == WAIT_TIMEOUT) {
+		const auto termination = std::unique_ptr<void, decltype(&CloseHandle)>(
+			OpenProcess(
+				PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
+				FALSE,
+				processId),
+			&CloseHandle);
+		if (!termination) {
+			return GetLastError();
+		}
+		if (!GetProcessTimes(
+				termination.get(),
+				&created,
+				&exited,
+				&kernel,
+				&user)) {
+			return GetLastError();
+		}
+		const auto terminationTime = (ULONGLONG(created.dwHighDateTime) << 32)
+			| created.dwLowDateTime;
+		if (terminationTime != creationTime) {
+			return ERROR_SUCCESS;
+		}
+		writeLog(L"Update parent teardown timed out; terminating it.");
+		if (!TerminateProcess(termination.get(), ERROR_PROCESS_ABORTED)) {
+			const auto error = GetLastError();
+			wait = WaitForSingleObject(process.get(), kProcessExitTimeout);
+			return (wait == WAIT_OBJECT_0)
+				? ERROR_SUCCESS
+				: error;
+		}
+		wait = WaitForSingleObject(process.get(), kProcessExitTimeout);
+	}
+	return (wait == WAIT_OBJECT_0)
+		? ERROR_SUCCESS
+		: (wait == WAIT_TIMEOUT)
+		? ERROR_TIMEOUT
+		: GetLastError();
+}
+
 void fullClearPath(const wstring &dir) {
 	WCHAR path[4096];
 	memcpy(path, dir.c_str(), (dir.size() + 1) * sizeof(WCHAR));
@@ -147,6 +258,8 @@ bool update() {
 			versionNum = 0;
 		} else {
 			if (versionNum == 0x7FFFFFFF) { // alpha version
+
+			} else if (versionNum == 0x7FFFFFFE) { // v2 canary version
 
 			} else if (!ReadFile(versionFile, &versionLen, sizeof(DWORD), &readLen, NULL) || readLen != sizeof(DWORD) || versionLen > 63) {
 				versionNum = 0;
@@ -249,9 +362,11 @@ bool update() {
 		do {
 			writeLog(L"Copying file '" + fname + L"' to '" + tofname + L"'..");
 			int copyTries = 0;
+			auto errorCode = DWORD(0);
 			do {
 				copyResult = CopyFile(fname.c_str(), tofname.c_str(), FALSE);
 				if (!copyResult) {
+					errorCode = GetLastError();
 					++copyTries;
 					Sleep(100);
 				} else {
@@ -259,10 +374,16 @@ bool update() {
 				}
 			} while (copyTries < 100);
 			if (!copyResult) {
-				writeLog(L"Error: failed to copy, asking to retry..");
-				WCHAR errMsg[2048];
-				wsprintf(errMsg, L"Failed to update Telegram :(\n%s is not accessible.", tofname.c_str());
-				if (MessageBox(0, errMsg, L"Update error!", MB_ICONERROR | MB_RETRYCANCEL) != IDRETRY) {
+				const auto error = FormatUpdateError(
+					L"Failed to update Telegram :(\nCould not copy:\n"
+						+ fname + L"\nTo:\n" + tofname,
+					errorCode);
+				writeLog(error);
+				if (MessageBox(
+						0,
+						error.c_str(),
+						L"Update error!",
+						MB_ICONERROR | MB_RETRYCANCEL) != IDRETRY) {
 					delFolder();
 					return false;
 				}
@@ -276,7 +397,7 @@ bool update() {
 }
 
 void updateRegistry() {
-	if (versionNum && versionNum != 0x7FFFFFFF) {
+	if (versionNum && versionNum != 0x7FFFFFFF && versionNum != 0x7FFFFFFE) {
 		writeLog(L"Updating registry..");
 		versionStr[versionLen / 2] = 0;
 		HKEY rkey;
@@ -307,7 +428,7 @@ void updateRegistry() {
 								SYSTEMTIME stLocalTime;
 								GetLocalTime(&stLocalTime);
 								RegSetValueEx(rkey, L"DisplayVersion", 0, REG_SZ, (const BYTE*)versionStr, ((versionLen / 2) + 1) * sizeof(WCHAR));
-								wsprintf(nameStr, L"Telegram Desktop version %s", versionStr);
+								wsprintf(nameStr, L"Telegram Desktop");
 								RegSetValueEx(rkey, L"DisplayName", 0, REG_SZ, (const BYTE*)nameStr, (wcslen(nameStr) + 1) * sizeof(WCHAR));
 								wsprintf(publisherStr, L"Telegram FZ-LLC");
 								RegSetValueEx(rkey, L"Publisher", 0, REG_SZ, (const BYTE*)publisherStr, (wcslen(publisherStr) + 1) * sizeof(WCHAR));
@@ -340,16 +461,34 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE prevInstance, LPWSTR cmdPara
 
 	writeLog(L"Updaters started..");
 
-	LPWSTR *args;
-	int argsCount;
+	auto argsCount = 0;
+	auto processId = DWORD(0);
+	auto processCreated = ULONGLONG(0);
+	auto processArgumentsValid = true;
 
-	bool needupdate = false, autostart = false, debug = false, writeprotected = false, startintray = false, freetype = false;
-	args = CommandLineToArgvW(GetCommandLine(), &argsCount);
+	bool needupdate = false, autostart = false, debug = false, writeprotected = false, startintray = false;
+	const auto args = CommandLineToArgvW(GetCommandLine(), &argsCount);
+	const auto argsGuard = std::unique_ptr<void, decltype(&LocalFree)>(
+		args,
+		&LocalFree);
 	if (args) {
 		for (int i = 1; i < argsCount; ++i) {
 			writeLog(std::wstring(L"Argument: ") + args[i]);
 			if (equal(args[i], L"-update")) {
 				needupdate = true;
+			} else if (equal(args[i], L"-finishprocess")) {
+				if (processId
+					|| i + 2 >= argsCount
+					|| !ParseUpdateProcess(
+						args[i + 1],
+						args[i + 2],
+						processId,
+						processCreated)) {
+					processArgumentsValid = false;
+				} else {
+					writeLog(std::wstring(L"Argument: ") + args[++i]);
+					writeLog(std::wstring(L"Argument: ") + args[++i]);
+				}
 			} else if (equal(args[i], L"-autostart")) {
 				autostart = true;
 			} else if (equal(args[i], L"-debug")) {
@@ -357,8 +496,6 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE prevInstance, LPWSTR cmdPara
 				openLog();
 			} else if (equal(args[i], L"-startintray")) {
 				startintray = true;
-			} else if (equal(args[i], L"-freetype")) {
-				freetype = true;
 			} else if (equal(args[i], L"-writeprotected") && ++i < argsCount) {
 				writeLog(std::wstring(L"Argument: ") + args[i]);
 				writeprotected = true;
@@ -388,6 +525,10 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE prevInstance, LPWSTR cmdPara
 		if (exeName.empty()) {
 			exeName = L"Telegram.exe";
 		}
+		if (!processArgumentsValid) {
+			writeLog(L"Invalid update process arguments; "
+				L"continuing without process handoff.");
+		}
 		if (needupdate) writeLog(L"Need to update!");
 		if (autostart) writeLog(L"From autostart!");
 		if (writeprotected) writeLog(L"Write Protected folder!");
@@ -403,6 +544,16 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE prevInstance, LPWSTR cmdPara
 					updateTo = updaterDir;
 				}
 				writeLog(L"Update to: " + updateTo);
+				if (needupdate && processId && processArgumentsValid) {
+					const auto error = FinishUpdateProcess(
+						processId,
+						processCreated);
+					if (error != ERROR_SUCCESS) {
+						writeLog(FormatUpdateError(
+							L"Could not finish closing Telegram; continuing with copy retries.",
+							error));
+					}
+				}
 				if (needupdate && update()) {
 					updateRegistry();
 				}
@@ -419,7 +570,6 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE prevInstance, LPWSTR cmdPara
 		} else {
 			writeLog(L"Error: short exe name!");
 		}
-		LocalFree(args);
 	} else {
 		writeLog(L"Error: No command line arguments!");
 	}
@@ -428,7 +578,6 @@ int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE prevInstance, LPWSTR cmdPara
 	if (autostart) targs += L" -autostart";
 	if (debug) targs += L" -debug";
 	if (startintray) targs += L" -startintray";
-	if (freetype) targs += L" -freetype";
 	if (!customWorkingDir.empty()) {
 		targs += L" -workdir \"" + customWorkingDir + L"\"";
 	}
@@ -540,11 +689,12 @@ HANDLE _generateDumpFileAtPath(const WCHAR *path) {
 
 	GetLocalTime(&stLocalTime);
 
-	wsprintf(szFileName, L"%s%s-%s-%04d%02d%02d-%02d%02d%02d-%ld-%ld.dmp",
-	         szPath, szExeName, updaterVersionStr,
-	         stLocalTime.wYear, stLocalTime.wMonth, stLocalTime.wDay,
-	         stLocalTime.wHour, stLocalTime.wMinute, stLocalTime.wSecond,
-	         GetCurrentProcessId(), GetCurrentThreadId());
+	wsprintf(
+		szFileName, L"%s%s-%s-%04d%02d%02d-%02d%02d%02d-%ld-%ld.dmp",
+		szPath, szExeName, updaterVersionStr,
+		stLocalTime.wYear, stLocalTime.wMonth, stLocalTime.wDay,
+		stLocalTime.wHour, stLocalTime.wMinute, stLocalTime.wSecond,
+		GetCurrentProcessId(), GetCurrentThreadId());
 	return CreateFile(szFileName, GENERIC_READ|GENERIC_WRITE, FILE_SHARE_WRITE|FILE_SHARE_READ, 0, CREATE_ALWAYS, 0, 0);
 }
 
@@ -565,7 +715,7 @@ void _generateDump(EXCEPTION_POINTERS* pExceptionPointers) {
 	DWORD len = GetModuleFileName(GetModuleHandle(0), szPath, maxFileLen);
 	if (!len) return;
 
-	WCHAR *pathEnd = szPath  + len;
+	WCHAR *pathEnd = szPath + len;
 
 	if (!_wcsicmp(pathEnd - wcslen(_exeName), _exeName)) {
 		wsprintf(pathEnd - wcslen(_exeName), L"");
@@ -573,8 +723,8 @@ void _generateDump(EXCEPTION_POINTERS* pExceptionPointers) {
 	}
 	if (!hDumpFile || hDumpFile == INVALID_HANDLE_VALUE) {
 		WCHAR wstrPath[maxFileLen];
-		DWORD wstrPathLen;
-		if (wstrPathLen = GetEnvironmentVariable(L"APPDATA", wstrPath, maxFileLen)) {
+		DWORD wstrPathLen = GetEnvironmentVariable(L"APPDATA", wstrPath, maxFileLen);
+		if (wstrPathLen) {
 			wsprintf(wstrPath + wstrPathLen, L"\\%s\\", _programName);
 			hDumpFile = _generateDumpFileAtPath(wstrPath);
 		}

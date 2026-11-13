@@ -20,35 +20,63 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "lottie/lottie_single_player.h"
 #include "media/audio/media_audio.h"
 #include "media/clip/media_clip_reader.h"
+#include "media/media_common.h"
 #include "media/player/media_player_instance.h"
 #include "history/history_location_manager.h"
 #include "history/view/history_view_cursor_state.h"
 #include "history/view/media/history_view_document.h" // DrawThumbnailAsSongCover
+#include "history/view/media/history_view_media_common.h"
 #include "ui/image/image.h"
 #include "ui/text/format_values.h"
 #include "ui/cached_round_corners.h"
+#include "ui/painter.h"
 #include "main/main_session.h"
 #include "lang/lang_keys.h"
+#include "styles/style_chat_style.h"
 #include "styles/style_overview.h"
 #include "styles/style_chat.h"
 #include "styles/style_chat_helpers.h"
-#include "styles/style_widgets.h"
 
 namespace InlineBots {
 namespace Layout {
 namespace internal {
+namespace {
 
 using TextState = HistoryView::TextState;
 
 constexpr auto kMaxInlineArea = 1280 * 720;
+constexpr auto kMaxInlineFrameSide = 4096;
 
-[[nodiscard]] bool CanPlayInline(not_null<DocumentData*> document) {
-	const auto dimensions = document->dimensions;
-	return dimensions.width() * dimensions.height() <= kMaxInlineArea;
+using ::Media::ValidFrameSize;
+
+[[nodiscard]] QSize ScaleDown(int w, int h, int maxW, int maxH) {
+	if (w * maxH > h * maxW) {
+		if (maxH < h) {
+			w = w * maxH / h;
+			h = maxH;
+		}
+	} else {
+		if (maxW < w) {
+			h = h * maxW / w;
+			w = maxW;
+		}
+	}
+	return { w, h };
 }
 
-FileBase::FileBase(not_null<Context*> context, not_null<Result*> result)
-: ItemBase(context, result) {
+[[nodiscard]] QSize BoundFrameSize(int w, int h) {
+	const auto side = kMaxInlineFrameSide / style::DevicePixelRatio();
+	return HistoryView::DownscaledSize({ w, h }, { side, side });
+}
+
+[[nodiscard]] bool CanPlayInline(not_null<DocumentData*> document) {
+	return ValidFrameSize(document->dimensions, kMaxInlineArea);
+}
+
+} // namespace
+
+FileBase::FileBase(not_null<Context*> context, std::shared_ptr<Result> result)
+: ItemBase(context, std::move(result)) {
 }
 
 FileBase::FileBase(
@@ -86,15 +114,15 @@ int FileBase::content_height() const {
 
 int FileBase::content_duration() const {
 	if (const auto document = getShownDocument()) {
-		if (document->getDuration() > 0) {
-			return document->getDuration();
+		if (document->hasDuration()) {
+			return document->duration() / 1000;
 		}
 	}
 	return getResultDuration();
 }
 
-Gif::Gif(not_null<Context*> context, not_null<Result*> result)
-: FileBase(context, result) {
+Gif::Gif(not_null<Context*> context, std::shared_ptr<Result> result)
+: FileBase(context, std::move(result)) {
 	Expects(getResultDocument() != nullptr);
 }
 
@@ -113,8 +141,9 @@ void Gif::initDimensions() {
 	if (w <= 0 || h <= 0) {
 		_maxw = 0;
 	} else {
-		w = w * st::inlineMediaHeight / h;
-		_maxw = qMax(w, int32(st::inlineResultsMinWidth));
+		const auto bounded = BoundFrameSize(w, h);
+		w = bounded.width() * st::inlineMediaHeight / bounded.height();
+		_maxw = std::max(w, int32(st::inlineResultsMinWidth));
 	}
 	_minh = st::inlineMediaHeight + st::inlineResultsSkip;
 }
@@ -128,7 +157,8 @@ void Gif::setPosition(int32 position) {
 
 void DeleteSavedGifClickHandler::onClickImpl() const {
 	ChatHelpers::AddGifAction(
-		[](QString, Fn<void()> &&done) { done(); },
+		[](QString, Fn<void()> &&done, const style::icon*) { done(); },
+		nullptr,
 		_data);
 }
 
@@ -136,6 +166,15 @@ int Gif::resizeGetHeight(int width) {
 	_width = width;
 	_height = _minh;
 	return _height;
+}
+
+QRect Gif::innerContentRect() const {
+	ensureDataMediaCreated(getShownDocument());
+
+	const auto size = (!_thumb.isNull())
+		? (_thumb.size() / style::DevicePixelRatio())
+		: countFrameSize();
+	return QRect(QPoint(), size);
 }
 
 void Gif::paint(Painter &p, const QRect &clip, const PaintContext *context) const {
@@ -151,6 +190,7 @@ void Gif::paint(Painter &p, const QRect &clip, const PaintContext *context) cons
 	if (loaded
 		&& !_gif
 		&& !_gif.isBad()
+		&& !_inlineOverCap
 		&& CanPlayInline(document)) {
 		auto that = const_cast<Gif*>(this);
 		that->_gif = preview.makeAnimation([=](
@@ -168,23 +208,24 @@ void Gif::paint(Painter &p, const QRect &clip, const PaintContext *context) cons
 	}
 	const auto radial = isRadialAnimation();
 
-	int32 height = st::inlineMediaHeight;
-	QSize frame = countFrameSize();
-
-	QRect r(0, 0, _width, height);
+	const auto frame = countFrameSize();
+	const auto r = QRect(0, 0, _width, st::inlineMediaHeight);
 	if (animating) {
-		const auto pixmap = _gif->current(frame.width(), frame.height(), _width, height, ImageRoundRadius::None, RectPart::None, context->paused ? 0 : context->ms);
+		const auto pixmap = _gif->current({
+			.frame = frame,
+			.outer = r.size(),
+		}, context->paused ? 0 : context->ms);
 		if (_thumb.isNull()) {
 			_thumb = pixmap;
 			_thumbGood = true;
 		}
-		p.drawPixmap(r.topLeft(), pixmap);
+		p.drawImage(r.topLeft(), pixmap);
 	} else {
-		prepareThumbnail({ _width, height }, frame);
+		prepareThumbnail(r.size(), frame);
 		if (_thumb.isNull()) {
 			p.fillRect(r, st::overviewPhotoBg);
 		} else {
-			p.drawPixmap(r.topLeft(), _thumb);
+			p.drawImage(r.topLeft(), _thumb);
 		}
 	}
 
@@ -211,7 +252,11 @@ void Gif::paint(Painter &p, const QRect &clip, const PaintContext *context) cons
 			return &st::historyFileInDownload;
 		}();
 		const auto size = st::inlineRadialSize;
-		QRect inner((_width - size) / 2, (height - size) / 2, size, size);
+		QRect inner(
+			(r.width() - size) / 2,
+			(r.height() - size) / 2,
+			size,
+			size);
 		icon->paintInCenter(p, inner);
 		if (radial) {
 			p.setOpacity(1);
@@ -282,6 +327,16 @@ void Gif::clickHandlerActiveChanged(const ClickHandlerPtr &p, bool active) {
 QSize Gif::countFrameSize() const {
 	bool animating = (_gif && _gif->ready());
 	int32 framew = animating ? _gif->width() : content_width(), frameh = animating ? _gif->height() : content_height(), height = st::inlineMediaHeight;
+	if (framew <= 0 || frameh <= 0) {
+		framew = content_width();
+		frameh = content_height();
+	}
+	if (framew <= 0 || frameh <= 0) {
+		return { _width, height };
+	}
+	const auto bounded = BoundFrameSize(framew, frameh);
+	framew = bounded.width();
+	frameh = bounded.height();
 	if (framew * height > frameh * _width) {
 		if (framew < st::maxStickerSize || frameh > height) {
 			if (frameh > height || (framew * height / frameh) <= st::maxStickerSize) {
@@ -303,7 +358,7 @@ QSize Gif::countFrameSize() const {
 			}
 		}
 	}
-	return QSize(framew, frameh);
+	return BoundFrameSize(framew, frameh);
 }
 
 void Gif::validateThumbnail(
@@ -313,18 +368,18 @@ void Gif::validateThumbnail(
 		bool good) const {
 	if (!image || (_thumbGood && !good)) {
 		return;
-	} else if ((_thumb.size() == size * cIntRetinaFactor())
+	} else if ((_thumb.size() == size * style::DevicePixelRatio())
 		&& (_thumbGood || !good)) {
 		return;
 	}
 	_thumbGood = good;
 	_thumb = image->pixNoCache(
-		frame.width() * cIntRetinaFactor(),
-		frame.height() * cIntRetinaFactor(),
-		(Images::Option::Smooth
-			| (good ? Images::Option::None : Images::Option::Blurred)),
-		size.width(),
-		size.height());
+		frame * style::DevicePixelRatio(),
+		{
+			.options = (Images::Option::TransparentBackground
+				| (good ? Images::Option() : Images::Option::Blur)),
+			.outer = size,
+		}).toImage();
 }
 
 void Gif::prepareThumbnail(QSize size, QSize frame) const {
@@ -393,20 +448,20 @@ void Gif::unloadHeavyPart() {
 void Gif::clipCallback(Media::Clip::Notification notification) {
 	using namespace Media::Clip;
 	switch (notification) {
-	case NotificationReinit: {
+	case Notification::Reinit: {
 		if (_gif) {
 			if (_gif->state() == State::Error) {
 				_gif.setBad();
 			} else if (_gif->ready() && !_gif->started()) {
-				if (_gif->width() * _gif->height() > kMaxInlineArea) {
-					getShownDocument()->dimensions = QSize(
-						_gif->width(),
-						_gif->height());
+				const auto size = QSize(_gif->width(), _gif->height());
+				if (!ValidFrameSize(size, kMaxInlineArea)) {
+					_inlineOverCap = true;
 					_gif.reset();
 				} else {
-					auto height = st::inlineMediaHeight;
-					auto frame = countFrameSize();
-					_gif->start(frame.width(), frame.height(), _width, height, ImageRoundRadius::None, RectPart::None);
+					_gif->start({
+						.frame = countFrameSize(),
+						.outer = { _width, st::inlineMediaHeight },
+					});
 				}
 			} else if (_gif->autoPausedGif() && !context()->inlineItemVisible(this)) {
 				unloadHeavyPart();
@@ -416,7 +471,7 @@ void Gif::clipCallback(Media::Clip::Notification notification) {
 		update();
 	} break;
 
-	case NotificationRepaint: {
+	case Notification::Repaint: {
 		if (_gif && !_gif->currentDisplayed()) {
 			update();
 		}
@@ -424,8 +479,8 @@ void Gif::clipCallback(Media::Clip::Notification notification) {
 	}
 }
 
-Sticker::Sticker(not_null<Context*> context, not_null<Result*> result)
-: FileBase(context, result) {
+Sticker::Sticker(not_null<Context*> context, std::shared_ptr<Result> result)
+: FileBase(context, std::move(result)) {
 	Expects(getResultDocument() != nullptr);
 }
 
@@ -455,6 +510,21 @@ void Sticker::unloadHeavyPart() {
 	_dataMedia = nullptr;
 	_lifetime.destroy();
 	_lottie = nullptr;
+	_webm = nullptr;
+}
+
+QRect Sticker::innerContentRect() const {
+	ensureDataMediaCreated(getShownDocument());
+
+	const auto size = (_lottie && _lottie->ready())
+		? (_lottie->frame().size() / style::DevicePixelRatio())
+		: (!_thumb.isNull())
+		? (_thumb.size() / style::DevicePixelRatio())
+		: getThumbSize();
+	const auto pos = QPoint(
+		(st::stickerPanSize.width() - size.width()) / 2,
+		(st::stickerPanSize.height() - size.height()) / 2);
+	return QRect(pos, size);
 }
 
 void Sticker::paint(Painter &p, const QRect &clip, const PaintContext *context) const {
@@ -470,17 +540,32 @@ void Sticker::paint(Painter &p, const QRect &clip, const PaintContext *context) 
 	prepareThumbnail();
 	if (_lottie && _lottie->ready()) {
 		const auto frame = _lottie->frame();
-		_lottie->markFrameShown();
-		const auto size = frame.size() / cIntRetinaFactor();
+		const auto size = frame.size() / style::DevicePixelRatio();
 		const auto pos = QPoint(
 			(st::stickerPanSize.width() - size.width()) / 2,
 			(st::stickerPanSize.height() - size.height()) / 2);
 		p.drawImage(
 			QRect(pos, size),
 			frame);
+		if (!context->paused) {
+			_lottie->markFrameShown();
+		}
+	} else if (_webm && _webm->started()) {
+		const auto size = getThumbSize();
+		const auto frame = _webm->current({
+			.frame = size,
+			.keepAlpha = true,
+		}, context->paused ? 0 : context->ms);
+		p.drawImage(
+			(st::stickerPanSize.width() - size.width()) / 2,
+			(st::stickerPanSize.height() - size.width()) / 2,
+			frame);
 	} else if (!_thumb.isNull()) {
-		int w = _thumb.width() / cIntRetinaFactor(), h = _thumb.height() / cIntRetinaFactor();
-		QPoint pos = QPoint((st::stickerPanSize.width() - w) / 2, (st::stickerPanSize.height() - h) / 2);
+		const auto w = _thumb.width() / style::DevicePixelRatio();
+		const auto h = _thumb.height() / style::DevicePixelRatio();
+		const auto pos = QPoint(
+			(st::stickerPanSize.width() - w) / 2,
+			(st::stickerPanSize.height() - h) / 2);
 		p.drawPixmap(pos, _thumb);
 	} else if (context->pathGradient) {
 		const auto thumbSize = getThumbSize();
@@ -521,13 +606,15 @@ void Sticker::clickHandlerActiveChanged(const ClickHandlerPtr &p, bool active) {
 	ItemBase::clickHandlerActiveChanged(p, active);
 }
 
+QSize Sticker::boundingBox() const {
+	const auto size = st::stickerPanSize.width() - st::roundRadiusSmall * 2;
+	return { size, size };
+}
+
 QSize Sticker::getThumbSize() const {
-	int width = qMax(content_width(), 1), height = qMax(content_height(), 1);
-	float64 coefw = (st::stickerPanSize.width() - st::roundRadiusSmall * 2) / float64(width);
-	float64 coefh = (st::stickerPanSize.height() - st::roundRadiusSmall * 2) / float64(height);
-	float64 coef = qMin(qMin(coefw, coefh), 1.);
-	int w = qRound(coef * content_width()), h = qRound(coef * content_height());
-	return QSize(qMax(w, 1), qMax(h, 1));
+	const auto width = std::max(content_width(), 1);
+	const auto height = std::max(content_height(), 1);
+	return HistoryView::DownscaledSize({ width, height }, boundingBox());
 }
 
 void Sticker::setupLottie() const {
@@ -536,15 +623,25 @@ void Sticker::setupLottie() const {
 	_lottie = ChatHelpers::LottiePlayerFromDocument(
 		_dataMedia.get(),
 		ChatHelpers::StickerLottieSize::InlineResults,
-		QSize(
-			st::stickerPanSize.width() - st::roundRadiusSmall * 2,
-			st::stickerPanSize.height() - st::roundRadiusSmall * 2
-		) * cIntRetinaFactor());
+		boundingBox() * style::DevicePixelRatio());
 
 	_lottie->updates(
-	) | rpl::start_with_next([=] {
+	) | rpl::on_next([=] {
 		update();
 	}, _lifetime);
+}
+
+void Sticker::setupWebm() const {
+	Expects(_dataMedia != nullptr);
+
+	const auto that = const_cast<Sticker*>(this);
+	auto callback = [=](Media::Clip::Notification notification) {
+		that->clipCallback(notification);
+	};
+	that->_webm = Media::Clip::MakeReader(
+		_dataMedia->owner()->location(),
+		_dataMedia->bytes(),
+		std::move(callback));
 }
 
 void Sticker::prepareThumbnail() const {
@@ -552,26 +649,50 @@ void Sticker::prepareThumbnail() const {
 	Assert(document != nullptr);
 
 	ensureDataMediaCreated(document);
-	if (!_lottie
-		&& document->sticker()
-		&& document->sticker()->animated
-		&& _dataMedia->loaded()) {
-		setupLottie();
+	const auto sticker = document->sticker();
+	if (sticker && _dataMedia->loaded()) {
+		if (!_lottie && sticker->isLottie()) {
+			setupLottie();
+		} else if (!_webm && !_webm.isBad() && sticker->isWebm()) {
+			setupWebm();
+		}
 	}
 	_dataMedia->checkStickerSmall();
-	if (const auto sticker = _dataMedia->getStickerSmall()) {
+	if (const auto image = _dataMedia->getStickerSmall()) {
 		if (!_lottie && !_thumbLoaded) {
 			const auto thumbSize = getThumbSize();
-			_thumb = sticker->pix(
-				thumbSize.width(),
-				thumbSize.height());
+			_thumb = image->pix(thumbSize);
 			_thumbLoaded = true;
 		}
 	}
 }
 
-Photo::Photo(not_null<Context*> context, not_null<Result*> result)
-: ItemBase(context, result) {
+void Sticker::clipCallback(Media::Clip::Notification notification) {
+	using namespace Media::Clip;
+	switch (notification) {
+	case Notification::Reinit: {
+		if (!_webm) {
+			break;
+		} else if (_webm->state() == State::Error) {
+			_webm.setBad();
+		} else if (_webm->ready() && !_webm->started()) {
+			_webm->start({
+				.frame = getThumbSize(),
+				.keepAlpha = true,
+			});
+		} else if (_webm->autoPausedGif()
+			&& !context()->inlineItemVisible(this)) {
+			unloadHeavyPart();
+		}
+	} break;
+
+	case Notification::Repaint: break;
+	}
+	update();
+}
+
+Photo::Photo(not_null<Context*> context, std::shared_ptr<Result> result)
+: ItemBase(context, std::move(result)) {
 	Expects(getShownPhoto() != nullptr);
 }
 
@@ -579,11 +700,11 @@ void Photo::initDimensions() {
 	const auto photo = getShownPhoto();
 	int32 w = photo->width(), h = photo->height();
 	if (w <= 0 || h <= 0) {
-		_maxw = 0;
-	} else {
-		w = w * st::inlineMediaHeight / h;
-		_maxw = qMax(w, int32(st::inlineResultsMinWidth));
+		w = h = 1;
 	}
+	const auto bounded = BoundFrameSize(w, h);
+	w = bounded.width() * st::inlineMediaHeight / bounded.height();
+	_maxw = std::max(w, int32(st::inlineResultsMinWidth));
 	_minh = st::inlineMediaHeight + st::inlineResultsSkip;
 }
 
@@ -624,6 +745,25 @@ PhotoData *Photo::getShownPhoto() const {
 QSize Photo::countFrameSize() const {
 	const auto photo = getShownPhoto();
 	int32 framew = photo->width(), frameh = photo->height(), height = st::inlineMediaHeight;
+	if ((framew <= 0 || frameh <= 0) && _photoMedia) {
+		using PhotoSize = Data::PhotoSize;
+		if (const auto image = _photoMedia->image(PhotoSize::Thumbnail)) {
+			framew = image->width();
+			frameh = image->height();
+		} else if (const auto image = _photoMedia->image(PhotoSize::Small)) {
+			framew = image->width();
+			frameh = image->height();
+		} else if (const auto image = _photoMedia->thumbnailInline()) {
+			framew = image->width();
+			frameh = image->height();
+		}
+	}
+	if (framew <= 0 || frameh <= 0) {
+		return { _width, height };
+	}
+	const auto bounded = BoundFrameSize(framew, frameh);
+	framew = bounded.width();
+	frameh = bounded.height();
 	if (framew * height > frameh * _width) {
 		if (framew < st::maxStickerSize || frameh > height) {
 			if (frameh > height || (framew * height / frameh) <= st::maxStickerSize) {
@@ -645,7 +785,7 @@ QSize Photo::countFrameSize() const {
 			}
 		}
 	}
-	return QSize(framew, frameh);
+	return BoundFrameSize(framew, frameh);
 }
 
 void Photo::validateThumbnail(
@@ -655,17 +795,18 @@ void Photo::validateThumbnail(
 		bool good) const {
 	if (!image || (_thumbGood && !good)) {
 		return;
-	} else if ((_thumb.size() == size * cIntRetinaFactor())
+	} else if ((_thumb.size() == size * style::DevicePixelRatio())
 		&& (_thumbGood || !good)) {
 		return;
 	}
 	const auto origin = fileOrigin();
 	_thumb = image->pixNoCache(
-		frame.width() * cIntRetinaFactor(),
-		frame.height() * cIntRetinaFactor(),
-		Images::Option::Smooth | (good ? Images::Option(0) : Images::Option::Blurred),
-		size.width(),
-		size.height());
+		frame * style::DevicePixelRatio(),
+		{
+			.options = (Images::Option::TransparentBackground
+				| (good ? Images::Option() : Images::Option::Blur)),
+			.outer = size,
+		});
 	_thumbGood = good;
 }
 
@@ -684,10 +825,10 @@ void Photo::prepareThumbnail(QSize size, QSize frame) const {
 	validateThumbnail(_photoMedia->thumbnailInline(), size, frame, false);
 }
 
-Video::Video(not_null<Context*> context, not_null<Result*> result)
-: FileBase(context, result)
+Video::Video(not_null<Context*> context, std::shared_ptr<Result> result)
+: FileBase(context, std::move(result))
 , _link(getResultPreviewHandler())
-, _title(st::emojiPanWidth - st::emojiScroll.width - st::inlineResultsLeft - st::inlineThumbSize - st::inlineThumbSkip)
+, _title(1)
 , _description(st::emojiPanWidth - st::emojiScroll.width - st::inlineResultsLeft - st::inlineThumbSize - st::inlineThumbSkip) {
 	if (int duration = content_duration()) {
 		_duration = Ui::FormatDurationText(duration);
@@ -715,7 +856,9 @@ void Video::initDimensions() {
 		title = tr::lng_media_video(tr::now);
 	}
 	_title.setText(st::semiboldTextStyle, title, titleOpts);
-	int32 titleHeight = qMin(_title.countHeight(textWidth), 2 * st::semiboldFont->height);
+	int32 titleHeight = std::min(
+		_title.countHeight(textWidth),
+		2 * st::semiboldFont->height);
 
 	int32 descriptionLines = withThumb ? (titleHeight > st::semiboldFont->height ? 1 : 2) : 3;
 
@@ -757,7 +900,9 @@ void Video::paint(Painter &p, const QRect &clip, const PaintContext *context) co
 
 	p.setPen(st::inlineTitleFg);
 	_title.drawLeftElided(p, left, st::inlineRowMargin, _width - left, _width, 2);
-	int32 titleHeight = qMin(_title.countHeight(_width - left), st::semiboldFont->height * 2);
+	int32 titleHeight = std::min(
+		_title.countHeight(_width - left),
+		st::semiboldFont->height * 2);
 
 	p.setPen(st::inlineDescriptionFg);
 	int32 descriptionLines = withThumb ? (titleHeight > st::semiboldFont->height ? 1 : 2) : 3;
@@ -797,17 +942,25 @@ void Video::prepareThumbnail(QSize size) const {
 			}
 		}
 	}
+	auto resultThumbnailImage = _documentMedia
+		? nullptr
+		: getResultThumb(fileOrigin());
+	const auto resultThumbnail = Image(resultThumbnailImage
+		? base::duplicate(*resultThumbnailImage)
+		: QImage());
 	const auto thumb = _documentMedia
 		? _documentMedia->thumbnail()
-		: getResultThumb(fileOrigin());
+		: resultThumbnailImage
+		? &resultThumbnail
+		: nullptr;
 	if (!thumb) {
 		return;
 	}
-	if (_thumb.size() != size * cIntRetinaFactor()) {
+	if (_thumb.size() != size * style::DevicePixelRatio()) {
 		const auto width = size.width();
 		const auto height = size.height();
-		auto w = qMax(style::ConvertScale(thumb->width()), 1);
-		auto h = qMax(style::ConvertScale(thumb->height()), 1);
+		auto w = std::max(style::ConvertScale(thumb->width()), 1);
+		auto h = std::max(style::ConvertScale(thumb->height()), 1);
 		if (w * height > h * width) {
 			if (height < h) {
 				w = w * height / h;
@@ -819,7 +972,12 @@ void Video::prepareThumbnail(QSize size) const {
 				w = width;
 			}
 		}
-		_thumb = thumb->pixNoCache(w * cIntRetinaFactor(), h * cIntRetinaFactor(), Images::Option::Smooth, width, height);
+		_thumb = thumb->pixNoCache(
+			QSize(w, h) * style::DevicePixelRatio(),
+			{
+				.options = Images::Option::TransparentBackground,
+				.outer = size,
+			});
 	}
 }
 
@@ -827,11 +985,11 @@ void CancelFileClickHandler::onClickImpl() const {
 	_result->cancelFile();
 }
 
-File::File(not_null<Context*> context, not_null<Result*> result)
-: FileBase(context, result)
+File::File(not_null<Context*> context, std::shared_ptr<Result> result)
+: FileBase(context, std::move(result))
 , _title(st::emojiPanWidth - st::emojiScroll.width - st::inlineResultsLeft - st::inlineFileSize - st::inlineThumbSkip)
 , _description(st::emojiPanWidth - st::emojiScroll.width - st::inlineResultsLeft - st::inlineFileSize - st::inlineThumbSkip)
-, _cancel(std::make_shared<CancelFileClickHandler>(result))
+, _cancel(std::make_shared<CancelFileClickHandler>(_result.get()))
 , _document(getShownDocument()) {
 	Expects(getResultDocument() != nullptr);
 
@@ -1019,8 +1177,9 @@ void File::checkAnimationFinished() const {
 
 bool File::updateStatusText() const {
 	ensureDataMediaCreated();
-	bool showPause = false;
-	int32 statusSize = 0, realDuration = 0;
+	auto showPause = false;
+	auto statusSize = int64();
+	auto realDuration = TimeId();
 	if (_document->status == FileDownloadFailed || _document->status == FileUploadFailed) {
 		statusSize = Ui::FileStatusSizeFailed;
 	} else if (_document->uploading()) {
@@ -1047,22 +1206,24 @@ bool File::updateStatusText() const {
 	}
 
 	if (statusSize != _statusSize) {
-		int32 duration = _document->isSong()
-			? _document->song()->duration
-			: (_document->isVoiceMessage()
-				? _document->voice()->duration
-				: -1);
-		setStatusSize(statusSize, _document->size, duration, realDuration);
+		const auto duration = _document->isSong()
+			? _document->duration()
+			: (_document->isVoiceMessage() ? _document->duration() : -1);
+		setStatusSize(statusSize, _document->size, (duration >= 0) ? (duration / 1000) : -1, realDuration);
 	}
 	return showPause;
 }
 
-void File::setStatusSize(int32 newSize, int32 fullSize, int32 duration, qint64 realDuration) const {
+void File::setStatusSize(
+		int64 newSize,
+		int64 fullSize,
+		TimeId duration,
+		TimeId realDuration) const {
 	_statusSize = newSize;
 	if (_statusSize == Ui::FileStatusSizeReady) {
 		_statusText = (duration >= 0) ? Ui::FormatDurationAndSizeText(duration, fullSize) : (duration < -1 ? Ui::FormatGifAndSizeText(fullSize) : Ui::FormatSizeText(fullSize));
 	} else if (_statusSize == Ui::FileStatusSizeLoaded) {
-		_statusText = (duration >= 0) ? Ui::FormatDurationText(duration) : (duration < -1 ? qsl("GIF") : Ui::FormatSizeText(fullSize));
+		_statusText = (duration >= 0) ? Ui::FormatDurationText(duration) : (duration < -1 ? u"GIF"_q : Ui::FormatSizeText(fullSize));
 	} else if (_statusSize == Ui::FileStatusSizeFailed) {
 		_statusText = tr::lng_attach_failed(tr::now);
 	} else if (_statusSize >= 0) {
@@ -1072,8 +1233,8 @@ void File::setStatusSize(int32 newSize, int32 fullSize, int32 duration, qint64 r
 	}
 }
 
-Contact::Contact(not_null<Context*> context, not_null<Result*> result)
-: ItemBase(context, result)
+Contact::Contact(not_null<Context*> context, std::shared_ptr<Result> result)
+: ItemBase(context, std::move(result))
 , _title(st::emojiPanWidth - st::emojiScroll.width - st::inlineResultsLeft - st::inlineThumbSize - st::inlineThumbSkip)
 , _description(st::emojiPanWidth - st::emojiScroll.width - st::inlineResultsLeft - st::inlineThumbSize - st::inlineThumbSkip) {
 }
@@ -1092,7 +1253,7 @@ void Contact::initDimensions() {
 }
 
 void Contact::paint(Painter &p, const QRect &clip, const PaintContext *context) const {
-	int32 left = st::emojiPanHeaderLeft - st::inlineResultsLeft;
+	int32 left = st::defaultEmojiPan.headerLeft - st::inlineResultsLeft;
 
 	left = st::inlineFileSize + st::inlineThumbSkip;
 	prepareThumbnail(st::inlineFileSize, st::inlineFileSize);
@@ -1127,7 +1288,8 @@ TextState Contact::getState(
 
 void Contact::prepareThumbnail(int width, int height) const {
 	if (!hasResultThumb()) {
-		if (_thumb.width() != width * cIntRetinaFactor() || _thumb.height() != height * cIntRetinaFactor()) {
+		if ((_thumb.width() != width * style::DevicePixelRatio())
+			|| (_thumb.height() != height * style::DevicePixelRatio())) {
 			_thumb = getResultContactAvatar(width, height);
 		}
 		return;
@@ -1136,82 +1298,250 @@ void Contact::prepareThumbnail(int width, int height) const {
 	const auto origin = fileOrigin();
 	const auto thumb = getResultThumb(origin);
 	if (!thumb
-		|| ((_thumb.width() == width * cIntRetinaFactor())
-			&& (_thumb.height() == height * cIntRetinaFactor()))) {
+		|| ((_thumb.width() == width * style::DevicePixelRatio())
+			&& (_thumb.height() == height * style::DevicePixelRatio()))) {
 		return;
 	}
-	auto w = qMax(style::ConvertScale(thumb->width()), 1);
-	auto h = qMax(style::ConvertScale(thumb->height()), 1);
-	if (w * height > h * width) {
-		if (height < h) {
-			w = w * height / h;
-			h = height;
-		}
+	const auto scaled = ScaleDown(
+		std::max(style::ConvertScale(thumb->width()), 1),
+		std::max(style::ConvertScale(thumb->height()), 1),
+		width,
+		height);
+	_thumb = Image(base::duplicate(*thumb)).pixNoCache(
+		scaled * style::DevicePixelRatio(),
+		{
+			.options = Images::Option::TransparentBackground,
+			.outer = { width, height },
+		});
+}
+
+Thumbnail::Thumbnail(
+	not_null<Context*> context,
+	std::shared_ptr<Result> result)
+: ItemBase(context, std::move(result)) {
+}
+
+void Thumbnail::initDimensions() {
+	int w = 0, h = 0;
+	if (const auto photo = getResultPhoto()) {
+		w = photo->width();
+		h = photo->height();
+	} else if (const auto document = getResultDocument()) {
+		w = document->dimensions.width();
+		h = document->dimensions.height();
+	}
+	if (w <= 0 || h <= 0) {
+		w = h = 1;
+	}
+	const auto bounded = BoundFrameSize(w, h);
+	w = bounded.width() * st::inlineMediaHeight / bounded.height();
+	_maxw = std::max(w, int32(st::inlineResultsMinWidth));
+	_minh = st::inlineMediaHeight + st::inlineResultsSkip;
+}
+
+QSize Thumbnail::countFrameSize() const {
+	int w = 0, h = 0;
+	if (const auto photo = getResultPhoto()) {
+		w = photo->width();
+		h = photo->height();
+	} else if (const auto document = getResultDocument()) {
+		w = document->dimensions.width();
+		h = document->dimensions.height();
+	}
+	if (w <= 0 || h <= 0) {
+		return { _width, st::inlineMediaHeight };
+	}
+	const auto bounded = BoundFrameSize(w, h);
+	w = bounded.width();
+	h = bounded.height();
+	// Aspect-fill: scale so the smaller dimension covers the cell.
+	const auto targetHeight = st::inlineMediaHeight;
+	if (w * targetHeight > h * _width) {
+		w = w * targetHeight / h;
+		h = targetHeight;
 	} else {
-		if (width < w) {
-			h = h * width / w;
-			w = width;
+		h = h * _width / w;
+		w = _width;
+	}
+	return BoundFrameSize(w, h);
+}
+
+void Thumbnail::validateThumbnail(
+		Image *image,
+		QSize size,
+		QSize frame,
+		bool good) const {
+	if (!image || (_thumbGood && !good)) {
+		return;
+	} else if ((_thumb.size() == size * style::DevicePixelRatio())
+		&& (_thumbGood || !good)) {
+		return;
+	}
+	_thumb = image->pixNoCache(
+		frame * style::DevicePixelRatio(),
+		{
+			.options = (Images::Option::TransparentBackground
+				| (good ? Images::Option() : Images::Option::Blur)),
+			.outer = size,
+		});
+	_thumbGood = good;
+}
+
+void Thumbnail::prepareThumbnail(QSize size, QSize frame) const {
+	if (const auto photo = getResultPhoto()) {
+		if (!_photoMedia) {
+			_photoMedia = photo->createMediaView();
+			_photoMedia->wanted(Data::PhotoSize::Thumbnail, fileOrigin());
+		}
+		using PhotoSize = Data::PhotoSize;
+		validateThumbnail(
+			_photoMedia->image(PhotoSize::Thumbnail),
+			size,
+			frame,
+			true);
+		validateThumbnail(
+			_photoMedia->image(PhotoSize::Small),
+			size,
+			frame,
+			false);
+		validateThumbnail(
+			_photoMedia->thumbnailInline(),
+			size,
+			frame,
+			false);
+	} else if (const auto document = getResultDocument()) {
+		if (!_documentMedia) {
+			_documentMedia = document->createMediaView();
+			document->loadThumbnail(fileOrigin());
+		}
+		validateThumbnail(
+			_documentMedia->thumbnail(),
+			size,
+			frame,
+			true);
+		validateThumbnail(
+			_documentMedia->thumbnailInline(),
+			size,
+			frame,
+			false);
+	} else if (const auto thumb = getResultThumb(fileOrigin())) {
+		if (_thumb.isNull()) {
+			const auto scaled = ScaleDown(
+				std::max(style::ConvertScale(thumb->width()), 1),
+				std::max(style::ConvertScale(thumb->height()), 1),
+				frame.width(),
+				frame.height());
+			_thumb = Image(base::duplicate(*thumb)).pixNoCache(
+				scaled * style::DevicePixelRatio(),
+				{
+					.options = Images::Option::TransparentBackground,
+					.outer = size,
+				});
 		}
 	}
-	_thumb = thumb->pixNoCache(w * cIntRetinaFactor(), h * cIntRetinaFactor(), Images::Option::Smooth, width, height);
+}
+
+void Thumbnail::paint(
+		Painter &p,
+		const QRect &clip,
+		const PaintContext *context) const {
+	const auto height = st::inlineMediaHeight;
+	const auto frame = countFrameSize();
+
+	QRect r(0, 0, _width, height);
+	prepareThumbnail({ _width, height }, frame);
+	if (_thumb.isNull()) {
+		p.fillRect(r, st::overviewPhotoBg);
+	} else {
+		p.drawPixmap(r.topLeft(), _thumb);
+	}
+}
+
+TextState Thumbnail::getState(
+		QPoint point,
+		StateRequest request) const {
+	if (QRect(0, 0, _width, st::inlineMediaHeight).contains(point)) {
+		return { nullptr, _send };
+	}
+	return {};
+}
+
+void Thumbnail::unloadHeavyPart() {
+	_photoMedia = nullptr;
+	_documentMedia = nullptr;
+	ItemBase::unloadHeavyPart();
 }
 
 Article::Article(
 	not_null<Context*> context,
-	not_null<Result*> result,
+	std::shared_ptr<Result> result,
 	bool withThumb)
-: ItemBase(context, result)
+: ItemBase(context, std::move(result))
 , _url(getResultUrlHandler())
 , _link(getResultPreviewHandler())
 , _withThumb(withThumb)
-, _title(st::emojiPanWidth - st::emojiScroll.width - st::inlineResultsLeft - st::inlineThumbSize - st::inlineThumbSkip)
-, _description(st::emojiPanWidth - st::emojiScroll.width - st::inlineResultsLeft - st::inlineThumbSize - st::inlineThumbSkip) {
+, _title(1)
+, _description(1) {
 	if (!_link) {
-		if (const auto point = result->getLocationPoint()) {
+		if (const auto point = _result->getLocationPoint()) {
 			_link = std::make_shared<LocationClickHandler>(*point);
 		}
 	}
 	_thumbLetter = getResultThumbLetter();
 }
 
+int Article::textLeft() const {
+	return _withThumb
+		? (st::inlineThumbSize + st::inlineThumbSkip)
+		: (st::defaultEmojiPan.headerLeft - st::inlineResultsLeft);
+}
+
+int Article::countHeight(int textWidth) const {
+	int32 titleHeight = std::min(
+		_title.countHeight(textWidth),
+		2 * st::semiboldFont->height);
+
+	int32 descriptionLines = (_withThumb || _url) ? 2 : 3;
+	int32 descriptionHeight = std::min(
+		_description.countHeight(textWidth),
+		descriptionLines * st::normalFont->height);
+
+	int32 result = titleHeight + descriptionHeight;
+	if (_url) result += st::normalFont->height;
+	if (_withThumb) result = std::max(result, int32(st::inlineThumbSize));
+	return result + st::inlineRowMargin * 2 + st::inlineRowBorder;
+}
+
 void Article::initDimensions() {
 	_maxw = st::emojiPanWidth - st::emojiScroll.width - st::inlineResultsLeft;
-	int32 textWidth = _maxw - (_withThumb ? (st::inlineThumbSize + st::inlineThumbSkip) : (st::emojiPanHeaderLeft - st::inlineResultsLeft));
+	const auto textWidth = _maxw - textLeft();
 	TextParseOptions titleOpts = { 0, textWidth, 2 * st::semiboldFont->height, Qt::LayoutDirectionAuto };
 	_title.setText(st::semiboldTextStyle, TextUtilities::SingleLine(_result->getLayoutTitle()), titleOpts);
-	int32 titleHeight = qMin(_title.countHeight(textWidth), 2 * st::semiboldFont->height);
 
 	int32 descriptionLines = (_withThumb || _url) ? 2 : 3;
 	QString description = _result->getLayoutDescription();
 	TextParseOptions descriptionOpts = { TextParseMultiline, textWidth, descriptionLines * st::normalFont->height, Qt::LayoutDirectionAuto };
 	_description.setText(st::defaultTextStyle, description, descriptionOpts);
-	int32 descriptionHeight = qMin(_description.countHeight(textWidth), descriptionLines * st::normalFont->height);
-
-	_minh = titleHeight + descriptionHeight;
-	if (_url) _minh += st::normalFont->height;
-	if (_withThumb) _minh = qMax(_minh, int32(st::inlineThumbSize));
-	_minh += st::inlineRowMargin * 2 + st::inlineRowBorder;
 }
 
-int32 Article::resizeGetHeight(int32 width) {
-	_width = qMin(width, _maxw);
+int Article::resizeGetHeight(int width) {
+	_width = std::min(width, _maxw);
+	const auto textWidth = _width - textLeft();
 	if (_url) {
 		_urlText = getResultUrl();
 		_urlWidth = st::normalFont->width(_urlText);
-		int32 textWidth = _width - (_withThumb ? (st::inlineThumbSize + st::inlineThumbSkip) : (st::emojiPanHeaderLeft - st::inlineResultsLeft));
 		if (_urlWidth > textWidth) {
 			_urlText = st::normalFont->elided(_urlText, textWidth);
 			_urlWidth = st::normalFont->width(_urlText);
 		}
 	}
-	_height = _minh;
+	_height = countHeight(textWidth);
 	return _height;
 }
 
 void Article::paint(Painter &p, const QRect &clip, const PaintContext *context) const {
-	int32 left = st::emojiPanHeaderLeft - st::inlineResultsLeft;
+	const auto left = textLeft();
 	if (_withThumb) {
-		left = st::inlineThumbSize + st::inlineThumbSkip;
 		prepareThumbnail(st::inlineThumbSize, st::inlineThumbSize);
 		QRect rthumb(style::rtlrect(0, st::inlineRowMargin, st::inlineThumbSize, st::inlineThumbSize, _width));
 		if (_thumb.isNull()) {
@@ -1240,14 +1570,18 @@ void Article::paint(Painter &p, const QRect &clip, const PaintContext *context) 
 
 	p.setPen(st::inlineTitleFg);
 	_title.drawLeftElided(p, left, st::inlineRowMargin, _width - left, _width, 2);
-	int32 titleHeight = qMin(_title.countHeight(_width - left), st::semiboldFont->height * 2);
+	int32 titleHeight = std::min(
+		_title.countHeight(_width - left),
+		st::semiboldFont->height * 2);
 
 	p.setPen(st::inlineDescriptionFg);
 	int32 descriptionLines = (_withThumb || _url) ? 2 : 3;
 	_description.drawLeftElided(p, left, st::inlineRowMargin + titleHeight, _width - left, _width, descriptionLines);
 
 	if (_url) {
-		int32 descriptionHeight = qMin(_description.countHeight(_width - left), st::normalFont->height * descriptionLines);
+		int32 descriptionHeight = std::min(
+			_description.countHeight(_width - left),
+			st::normalFont->height * descriptionLines);
 		p.drawTextLeft(left, st::inlineRowMargin + titleHeight + descriptionHeight, _width, _urlText, _urlWidth);
 	}
 
@@ -1265,11 +1599,21 @@ TextState Article::getState(
 	auto left = _withThumb ? (st::inlineThumbSize + st::inlineThumbSkip) : 0;
 	if (QRect(left, 0, _width - left, _height).contains(point)) {
 		if (_url) {
-			auto left = st::inlineThumbSize + st::inlineThumbSkip;
-			auto titleHeight = qMin(_title.countHeight(_width - left), st::semiboldFont->height * 2);
-			auto descriptionLines = 2;
-			auto descriptionHeight = qMin(_description.countHeight(_width - left), st::normalFont->height * descriptionLines);
-			if (style::rtlrect(left, st::inlineRowMargin + titleHeight + descriptionHeight, _urlWidth, st::normalFont->height, _width).contains(point)) {
+			const auto textWidth = _width - textLeft();
+			const auto titleHeight = std::min(
+				_title.countHeight(textWidth),
+				st::semiboldFont->height * 2);
+			const auto descriptionLines = 2;
+			const auto descriptionHeight = std::min(
+				_description.countHeight(textWidth),
+				st::normalFont->height * descriptionLines);
+			const auto urlRect = style::rtlrect(
+				textLeft(),
+				st::inlineRowMargin + titleHeight + descriptionHeight,
+				_urlWidth,
+				st::normalFont->height,
+				_width);
+			if (urlRect.contains(point)) {
 				return { nullptr, _url };
 			}
 		}
@@ -1280,7 +1624,12 @@ TextState Article::getState(
 
 void Article::prepareThumbnail(int width, int height) const {
 	if (!hasResultThumb()) {
-		if (_thumb.width() != width * cIntRetinaFactor() || _thumb.height() != height * cIntRetinaFactor()) {
+		prepareMediaThumbnail(width, height);
+		if (!_thumb.isNull()) {
+			return;
+		}
+		if ((_thumb.width() != width * style::DevicePixelRatio())
+			|| (_thumb.height() != height * style::DevicePixelRatio())) {
 			_thumb = getResultContactAvatar(width, height);
 		}
 		return;
@@ -1289,30 +1638,81 @@ void Article::prepareThumbnail(int width, int height) const {
 	const auto origin = fileOrigin();
 	const auto thumb = getResultThumb(origin);
 	if (!thumb
-		|| ((_thumb.width() == width * cIntRetinaFactor())
-			&& (_thumb.height() == height * cIntRetinaFactor()))) {
+		|| ((_thumb.width() == width * style::DevicePixelRatio())
+			&& (_thumb.height() == height * style::DevicePixelRatio()))) {
 		return;
 	}
-	auto w = qMax(style::ConvertScale(thumb->width()), 1);
-	auto h = qMax(style::ConvertScale(thumb->height()), 1);
-	if (w * height > h * width) {
-		if (height < h) {
-			w = w * height / h;
-			h = height;
-		}
-	} else {
-		if (width < w) {
-			h = h * width / w;
-			w = width;
-		}
-	}
-	_thumb = thumb->pixNoCache(w * cIntRetinaFactor(), h * cIntRetinaFactor(), Images::Option::Smooth, width, height);
+	const auto scaled = ScaleDown(
+		std::max(style::ConvertScale(thumb->width()), 1),
+		std::max(style::ConvertScale(thumb->height()), 1),
+		width,
+		height);
+	_thumb = Image(base::duplicate(*thumb)).pixNoCache(
+		scaled * style::DevicePixelRatio(),
+		{
+			.options = Images::Option::TransparentBackground,
+			.outer = { width, height },
+		});
 }
 
-Game::Game(not_null<Context*> context, not_null<Result*> result)
-: ItemBase(context, result)
-, _title(st::emojiPanWidth - st::emojiScroll.width - st::inlineResultsLeft - st::inlineThumbSize - st::inlineThumbSkip)
-, _description(st::emojiPanWidth - st::emojiScroll.width - st::inlineResultsLeft - st::inlineThumbSize - st::inlineThumbSkip) {
+void Article::prepareMediaThumbnail(int width, int height) const {
+	auto thumbGood = false;
+	const auto make = [&](Image *image, bool good) {
+		if (!image || (thumbGood && !good)) {
+			return;
+		}
+		if (!_thumb.isNull() && !good) {
+			return;
+		}
+		const auto scaled = ScaleDown(
+			std::max(style::ConvertScale(image->width()), 1),
+			std::max(style::ConvertScale(image->height()), 1),
+			width,
+			height);
+		_thumb = image->pixNoCache(
+			scaled * style::DevicePixelRatio(),
+			{
+				.options = (Images::Option::TransparentBackground
+					| (good
+						? Images::Option()
+						: Images::Option::Blur)),
+				.outer = { width, height },
+			});
+		if (good) {
+			thumbGood = true;
+		}
+	};
+	if (const auto photo = getResultPhoto()) {
+		if (!_photoMedia) {
+			_photoMedia = photo->createMediaView();
+			_photoMedia->wanted(Data::PhotoSize::Thumbnail, fileOrigin());
+		}
+		using PhotoSize = Data::PhotoSize;
+		make(_photoMedia->image(PhotoSize::Thumbnail), true);
+		make(_photoMedia->image(PhotoSize::Small), false);
+		make(_photoMedia->thumbnailInline(), false);
+	} else if (const auto document = getResultDocument()) {
+		if (document->hasThumbnail()) {
+			if (!_documentMedia) {
+				_documentMedia = document->createMediaView();
+				document->loadThumbnail(fileOrigin());
+			}
+			make(_documentMedia->thumbnail(), true);
+			make(_documentMedia->thumbnailInline(), false);
+		}
+	}
+}
+
+void Article::unloadHeavyPart() {
+	_photoMedia = nullptr;
+	_documentMedia = nullptr;
+	ItemBase::unloadHeavyPart();
+}
+
+Game::Game(not_null<Context*> context, std::shared_ptr<Result> result)
+: ItemBase(context, std::move(result))
+, _title(1)
+, _description(1) {
 	countFrameSize();
 }
 
@@ -1323,6 +1723,9 @@ void Game::countFrameSize() {
 			if (documentSize.isEmpty()) {
 				documentSize = QSize(st::inlineThumbSize, st::inlineThumbSize);
 			}
+			documentSize = BoundFrameSize(
+				documentSize.width(),
+				documentSize.height());
 			auto resizeByHeight1 = (documentSize.width() > documentSize.height()) && (documentSize.height() >= st::inlineThumbSize);
 			auto resizeByHeight2 = (documentSize.height() >= documentSize.width()) && (documentSize.width() < st::inlineThumbSize);
 			if (resizeByHeight1 || resizeByHeight2) {
@@ -1340,25 +1743,45 @@ void Game::countFrameSize() {
 			if (!_frameSize.height()) {
 				_frameSize.setHeight(1);
 			}
+			if (_frameSize.isValid()) {
+				_frameSize = BoundFrameSize(
+					_frameSize.width(),
+					_frameSize.height());
+			}
 		}
 	}
+}
+
+int Game::countHeight(int textWidth) const {
+	int32 titleHeight = std::min(
+		_title.countHeight(textWidth),
+		2 * st::semiboldFont->height);
+
+	int32 descriptionLines = 2;
+	int32 descriptionHeight = std::min(
+		_description.countHeight(textWidth),
+		descriptionLines * st::normalFont->height);
+
+	int32 result = titleHeight + descriptionHeight;
+	accumulate_max(result, st::inlineThumbSize);
+	return result + st::inlineRowMargin * 2 + st::inlineRowBorder;
 }
 
 void Game::initDimensions() {
 	_maxw = st::emojiPanWidth - st::emojiScroll.width - st::inlineResultsLeft;
 	TextParseOptions titleOpts = { 0, _maxw, 2 * st::semiboldFont->height, Qt::LayoutDirectionAuto };
 	_title.setText(st::semiboldTextStyle, TextUtilities::SingleLine(_result->getLayoutTitle()), titleOpts);
-	int32 titleHeight = qMin(_title.countHeight(_maxw), 2 * st::semiboldFont->height);
 
 	int32 descriptionLines = 2;
 	QString description = _result->getLayoutDescription();
 	TextParseOptions descriptionOpts = { TextParseMultiline, _maxw, descriptionLines * st::normalFont->height, Qt::LayoutDirectionAuto };
 	_description.setText(st::defaultTextStyle, description, descriptionOpts);
-	int32 descriptionHeight = qMin(_description.countHeight(_maxw), descriptionLines * st::normalFont->height);
+}
 
-	_minh = titleHeight + descriptionHeight;
-	accumulate_max(_minh, st::inlineThumbSize);
-	_minh += st::inlineRowMargin * 2 + st::inlineRowBorder;
+int Game::resizeGetHeight(int width) {
+	_width = std::min(width, _maxw);
+	_height = countHeight(_width - (st::inlineThumbSize + st::inlineThumbSkip));
+	return _height;
 }
 
 void Game::setPosition(int32 position) {
@@ -1369,7 +1792,7 @@ void Game::setPosition(int32 position) {
 }
 
 void Game::paint(Painter &p, const QRect &clip, const PaintContext *context) const {
-	int32 left = st::emojiPanHeaderLeft - st::inlineResultsLeft;
+	int32 left = st::defaultEmojiPan.headerLeft - st::inlineResultsLeft;
 
 	left = st::inlineThumbSize + st::inlineThumbSkip;
 	auto rthumb = style::rtlrect(0, st::inlineRowMargin, st::inlineThumbSize, st::inlineThumbSize, _width);
@@ -1388,7 +1811,7 @@ void Game::paint(Painter &p, const QRect &clip, const PaintContext *context) con
 		_documentMedia->automaticLoad(fileOrigin(), nullptr);
 
 		bool loaded = _documentMedia->loaded(), displayLoading = document->displayLoading();
-		if (loaded && !_gif && !_gif.isBad()) {
+		if (loaded && !_gif && !_gif.isBad() && !_inlineOverCap) {
 			auto that = const_cast<Game*>(this);
 			that->_gif = Media::Clip::MakeReader(
 				_documentMedia->owner()->location(),
@@ -1410,12 +1833,15 @@ void Game::paint(Painter &p, const QRect &clip, const PaintContext *context) con
 		radial = isRadialAnimation();
 
 		if (animating) {
-			const auto pixmap = _gif->current(_frameSize.width(), _frameSize.height(), st::inlineThumbSize, st::inlineThumbSize, ImageRoundRadius::None, RectPart::None, context->paused ? 0 : context->ms);
+			const auto pixmap = _gif->current({
+				.frame = _frameSize,
+				.outer = { st::inlineThumbSize, st::inlineThumbSize },
+			}, context->paused ? 0 : context->ms);
 			if (_thumb.isNull()) {
 				_thumb = pixmap;
 				_thumbGood = true;
 			}
-			p.drawPixmapLeft(rthumb.topLeft(), _width, pixmap);
+			p.drawImage(rthumb.topLeft(), pixmap);
 			thumbDisplayed = true;
 		}
 	}
@@ -1425,7 +1851,7 @@ void Game::paint(Painter &p, const QRect &clip, const PaintContext *context) con
 		if (_thumb.isNull()) {
 			p.fillRect(rthumb, st::overviewPhotoBg);
 		} else {
-			p.drawPixmapLeft(rthumb.topLeft(), _width, _thumb);
+			p.drawImage(rthumb.topLeft(), _thumb);
 		}
 	}
 
@@ -1441,7 +1867,9 @@ void Game::paint(Painter &p, const QRect &clip, const PaintContext *context) con
 
 	p.setPen(st::inlineTitleFg);
 	_title.drawLeftElided(p, left, st::inlineRowMargin, _width - left, _width, 2);
-	int32 titleHeight = qMin(_title.countHeight(_width - left), st::semiboldFont->height * 2);
+	int32 titleHeight = std::min(
+		_title.countHeight(_width - left),
+		st::semiboldFont->height * 2);
 
 	p.setPen(st::inlineDescriptionFg);
 	int32 descriptionLines = 2;
@@ -1466,11 +1894,11 @@ TextState Game::getState(
 }
 
 void Game::prepareThumbnail(QSize size) const {
-	if (const auto document = getResultDocument()) {
+	if ([[maybe_unused]] const auto document = getResultDocument()) {
 		Assert(_documentMedia != nullptr);
 		validateThumbnail(_documentMedia->thumbnail(), size, true);
 		validateThumbnail(_documentMedia->thumbnailInline(), size, false);
-	} else if (const auto photo = getResultPhoto()) {
+	} else if ([[maybe_unused]] const auto photo = getResultPhoto()) {
 		using Data::PhotoSize;
 		Assert(_photoMedia != nullptr);
 		validateThumbnail(_photoMedia->image(PhotoSize::Thumbnail), size, true);
@@ -1498,14 +1926,14 @@ void Game::ensureDataMediaCreated(not_null<PhotoData*> photo) const {
 void Game::validateThumbnail(Image *image, QSize size, bool good) const {
 	if (!image || (_thumbGood && !good)) {
 		return;
-	} else if ((_thumb.size() == size * cIntRetinaFactor())
+	} else if ((_thumb.size() == size * style::DevicePixelRatio())
 		&& (_thumbGood || !good)) {
 		return;
 	}
 	const auto width = size.width();
 	const auto height = size.height();
-	auto w = qMax(style::ConvertScale(image->width()), 1);
-	auto h = qMax(style::ConvertScale(image->height()), 1);
+	auto w = std::max(style::ConvertScale(image->width()), 1);
+	auto h = std::max(style::ConvertScale(image->height()), 1);
 	auto resizeByHeight1 = (w * height > h * width) && (h >= height);
 	auto resizeByHeight2 = (h * width >= w * height) && (w < width);
 	if (resizeByHeight1 || resizeByHeight2) {
@@ -1521,12 +1949,12 @@ void Game::validateThumbnail(Image *image, QSize size, bool good) const {
 	}
 	_thumbGood = good;
 	_thumb = image->pixNoCache(
-		w * cIntRetinaFactor(),
-		h * cIntRetinaFactor(),
-		(Images::Option::Smooth
-			| (good ? Images::Option::None : Images::Option::Blurred)),
-		size.width(),
-		size.height());
+		QSize(w, h) * style::DevicePixelRatio(),
+		{
+			.options = (Images::Option::TransparentBackground
+				| (good ? Images::Option() : Images::Option::Blur)),
+			.outer = size,
+		}).toImage();
 }
 
 bool Game::isRadialAnimation() const {
@@ -1569,24 +1997,20 @@ void Game::unloadHeavyPart() {
 void Game::clipCallback(Media::Clip::Notification notification) {
 	using namespace Media::Clip;
 	switch (notification) {
-	case NotificationReinit: {
+	case Notification::Reinit: {
 		if (_gif) {
 			if (_gif->state() == State::Error) {
 				_gif.setBad();
 			} else if (_gif->ready() && !_gif->started()) {
-				if (_gif->width() * _gif->height() > kMaxInlineArea) {
-					getResultDocument()->dimensions = QSize(
-						_gif->width(),
-						_gif->height());
+				const auto size = QSize(_gif->width(), _gif->height());
+				if (!ValidFrameSize(size, kMaxInlineArea)) {
+					_inlineOverCap = true;
 					_gif.reset();
 				} else {
-					_gif->start(
-						_frameSize.width(),
-						_frameSize.height(),
-						st::inlineThumbSize,
-						st::inlineThumbSize,
-						ImageRoundRadius::None,
-						RectPart::None);
+					_gif->start({
+						.frame = _frameSize,
+						.outer = { st::inlineThumbSize, st::inlineThumbSize },
+					});
 				}
 			} else if (_gif->autoPausedGif() && !context()->inlineItemVisible(this)) {
 				unloadHeavyPart();
@@ -1596,7 +2020,7 @@ void Game::clipCallback(Media::Clip::Notification notification) {
 		update();
 	} break;
 
-	case NotificationRepaint: {
+	case Notification::Repaint: {
 		if (_gif && !_gif->currentDisplayed()) {
 			update();
 		}

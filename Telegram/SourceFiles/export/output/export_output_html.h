@@ -35,6 +35,7 @@ private:
 };
 
 struct UserpicData;
+struct StoryData;
 class PeersMap;
 struct MediaData;
 
@@ -58,6 +59,14 @@ public:
 	Result writeUserpicsStart(const Data::UserpicsInfo &data) override;
 	Result writeUserpicsSlice(const Data::UserpicsSlice &data) override;
 	Result writeUserpicsEnd() override;
+
+	Result writeStoriesStart(const Data::StoriesInfo &data) override;
+	Result writeStoriesSlice(const Data::StoriesSlice &data) override;
+	Result writeStoriesEnd() override;
+
+	Result writeProfileMusicStart(const Data::ProfileMusicInfo &data) override;
+	Result writeProfileMusicSlice(const Data::ProfileMusicSlice &data) override;
+	Result writeProfileMusicEnd() override;
 
 	Result writeContactsList(const Data::ContactsList &data) override;
 
@@ -125,8 +134,12 @@ private:
 		const Data::PersonalInfo &data,
 		const QString &userpicPath);
 	void pushUserpicsSection();
+	void pushStoriesSection();
+	void pushProfileMusicSection();
 
 	[[nodiscard]] QString userpicsFilePath() const;
+	[[nodiscard]] QString storiesFilePath() const;
+	[[nodiscard]] QString profileMusicFilePath() const;
 
 	[[nodiscard]] QByteArray wrapMessageLink(
 		int messageId,
@@ -143,11 +156,17 @@ private:
 	bool _summaryNeedDivider = false;
 	bool _haveSections = false;
 
-	int _selfColorIndex = 0;
+	uint8 _selfColorIndex = 0;
 	std::unique_ptr<Data::PersonalInfo> _delayedPersonalInfo;
 
 	int _userpicsCount = 0;
 	std::unique_ptr<Wrap> _userpics;
+
+	int _storiesCount = 0;
+	std::unique_ptr<Wrap> _stories;
+
+	int _profileMusicCount = 0;
+	std::unique_ptr<Wrap> _profileMusic;
 
 	QString _dialogsRelativePath;
 	Data::DialogInfo _dialog;

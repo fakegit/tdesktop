@@ -14,6 +14,70 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 namespace Serialize {
 
+class ByteArrayWriter final {
+public:
+	explicit ByteArrayWriter(int expectedSize = 0);
+
+	[[nodiscard]] QDataStream &underlying() {
+		return _stream;
+	}
+	[[nodiscard]] operator QDataStream &() {
+		return _stream;
+	}
+	[[nodiscard]] QByteArray result() &&;
+
+private:
+	QByteArray _result;
+	QDataStream _stream;
+
+};
+
+template <typename T>
+inline ByteArrayWriter &operator<<(ByteArrayWriter &stream, const T &data) {
+	stream.underlying() << data;
+	return stream;
+}
+
+class ByteArrayReader final {
+public:
+	explicit ByteArrayReader(QByteArray data);
+
+	[[nodiscard]] QDataStream &underlying() {
+		return _stream;
+	}
+	[[nodiscard]] operator QDataStream &() {
+		return _stream;
+	}
+
+	[[nodiscard]] bool atEnd() const {
+		return _stream.atEnd();
+	}
+	[[nodiscard]] bool status() const {
+		return _stream.status();
+	}
+	[[nodiscard]] bool ok() const {
+		return _stream.status() == QDataStream::Ok;
+	}
+
+private:
+	QByteArray _data;
+	QDataStream _stream;
+
+};
+
+template <typename T>
+inline ByteArrayReader &operator>>(ByteArrayReader &stream, T &data) {
+	if (!stream.ok()) {
+		data = T();
+	} else {
+		stream.underlying() >> data;
+		if (!stream.ok()) {
+			data = T();
+		}
+	}
+	return stream;
+}
+
 inline int stringSize(const QString &str) {
 	return sizeof(quint32) + str.size() * sizeof(ushort);
 }
@@ -53,7 +117,7 @@ inline QDataStream &operator>>(QDataStream &stream, ReadBytesVectorWrap data) {
 
 	constexpr auto kStep = quint32(1024 * 1024);
 	for (auto allocated = quint32(0); allocated < len;) {
-		auto blockSize = qMin(kStep, len - allocated);
+		auto blockSize = std::min(kStep, len - allocated);
 		bytes.resize(allocated + blockSize);
 		if (stream.readRawData(reinterpret_cast<char*>(bytes.data()) + allocated, blockSize) != blockSize) {
 			bytes.clear();

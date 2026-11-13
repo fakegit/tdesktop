@@ -7,17 +7,24 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "window/themes/window_theme_preview.h"
 
+#include "dialogs/dialogs_three_state_icon.h"
 #include "lang/lang_keys.h"
+#include "lottie/lottie_icon.h"
 #include "platform/platform_window_title.h"
 #include "ui/text/text_options.h"
-#include "ui/image/image_prepare.h"
+#include "ui/text/text_utilities.h"
+#include "ui/empty_userpic.h"
 #include "ui/emoji_config.h"
+#include "ui/painter.h"
+#include "ui/rect.h"
 #include "ui/chat/chat_theme.h"
-#include "ui/image/image_prepare.h"
+#include "ui/chat/chat_style.h"
+#include "ui/chat/message_bubble.h"
+#include "styles/style_chat_style.h"
 #include "styles/style_widgets.h"
-#include "styles/style_window.h"
 #include "styles/style_media_view.h"
 #include "styles/style_chat.h"
+#include "styles/style_chat_helpers.h"
 #include "styles/style_dialogs.h"
 #include "styles/style_info.h"
 
@@ -25,7 +32,7 @@ namespace Window {
 namespace Theme {
 namespace {
 
-QString fillLetters(const QString &name) {
+[[nodiscard]] QString FillLetters(const QString &name) {
 	QList<QString> letters;
 	QList<int> levels;
 	auto level = 0;
@@ -42,7 +49,7 @@ QString fillLetters(const QString &name) {
 			}
 		} else if (!letterFound && ch->isLetterOrNumber()) {
 			letterFound = true;
-			if (ch + 1 != end && Ui::Text::IsDiac(*(ch + 1))) {
+			if (ch + 1 != end && Ui::Text::IsDiacritic(*(ch + 1))) {
 				letters.push_back(QString(ch, 2));
 				levels.push_back(level);
 				++ch;
@@ -122,7 +129,8 @@ private:
 		bool outbg = false;
 		Status status = Status::None;
 		QString date;
-		bool attached = false;
+		bool attachToTop = false;
+		bool attachToBottom = false;
 		bool tail = true;
 		Ui::Text::String text = { st::msgMinWidth };
 		QVector<int> waveform;
@@ -138,7 +146,11 @@ private:
 	[[nodiscard]] bool extended() const;
 	void prepare();
 
-	void addRow(QString name, int peerIndex, QString date, QString text);
+	void addRow(
+		QString name,
+		int peerIndex,
+		QString date,
+		const TextWithEntities &text);
 	void addBubble(Bubble bubble, int width, int height, QString date, Status status);
 	void addAudioBubble(QVector<int> waveform, int waveactive, QString wavestatus, QString date, Status status);
 	void addTextBubble(QString text, QString date, Status status);
@@ -169,6 +181,7 @@ private:
 	const style::palette &_palette;
 	const CurrentData _current;
 	const PreviewType _type;
+	Ui::ChatStyle _st;
 	Painter *_p = nullptr;
 
 	QRect _rect;
@@ -208,7 +221,7 @@ void Generator::prepare() {
 	_inner = extended() ? _rect.marginsRemoved(st::themePreviewMargin) : _rect;
 	_body = extended() ? _inner.marginsRemoved(QMargins(0, Platform::PreviewTitleHeight(), 0, 0)) : _inner;
 	_dialogs = QRect(_body.x(), _body.y(), st::themePreviewDialogsWidth, _body.height());
-	_dialogsList = _dialogs.marginsRemoved(QMargins(0, st::dialogsFilterPadding.y() + st::dialogsMenuToggle.height + st::dialogsFilterPadding.y(), 0, st::dialogsPadding.y()));
+	_dialogsList = _dialogs.marginsRemoved(QMargins(0, st::dialogsFilterPadding.y() + st::dialogsMenuToggle.height + st::dialogsFilterPadding.y(), 0, st::defaultDialogRow.padding.bottom()));
 	_topBar = QRect(_dialogs.x() + _dialogs.width(), _dialogs.y(), _body.width() - _dialogs.width(), st::topBarHeight);
 	_composeArea = QRect(_topBar.x(), _body.y() + _body.height() - st::historySendSize.height(), _topBar.width(), st::historySendSize.height());
 	_history = QRect(_topBar.x(), _topBar.y() + _topBar.height(), _topBar.width(), _body.height() - _topBar.height() - _composeArea.height());
@@ -216,15 +229,22 @@ void Generator::prepare() {
 	generateData();
 }
 
-void Generator::addRow(QString name, int peerIndex, QString date, QString text) {
+void Generator::addRow(
+		QString name,
+		int peerIndex,
+		QString date,
+		const TextWithEntities &text) {
 	Row row;
 	row.name.setText(st::msgNameStyle, name, Ui::NameTextOptions());
 
-	row.letters = fillLetters(name);
+	row.letters = FillLetters(name);
 
 	row.peerIndex = peerIndex;
 	row.date = date;
-	row.text.setRichText(st::dialogsTextStyle, text, Ui::DialogTextOptions());
+	row.text.setMarkedText(
+		st::dialogsTextStyle,
+		text,
+		Ui::DialogTextOptions());
 	_rows.push_back(std::move(row));
 }
 
@@ -246,7 +266,7 @@ void Generator::addAudioBubble(QVector<int> waveform, int waveactive, QString wa
 
 	auto width = st::msgFileMinWidth;
 	const auto &st = st::msgFileLayout;
-	auto tleft = st.padding.left() + st.thumbSize + st.padding.right();
+	auto tleft = st.padding.left() + st.thumbSize + st.thumbSkip;
 	accumulate_max(width, tleft + st::normalFont->width(wavestatus) + skipBlock.width() + st::msgPadding.right());
 	accumulate_min(width, st::msgMaxWidth);
 
@@ -272,13 +292,20 @@ int Generator::computeInfoWidth(Status status, QString date) {
 void Generator::addTextBubble(QString text, QString date, Status status) {
 	Bubble bubble;
 	auto skipBlock = computeSkipBlock(status, date);
-	bubble.text.setRichText(st::messageTextStyle, text + textcmdSkipBlock(skipBlock.width(), skipBlock.height()), Ui::ItemTextDefaultOptions());
+	auto marked = TextWithEntities{ std::move(text) };
+	bubble.text.setMarkedText(
+		st::messageTextStyle,
+		std::move(marked),
+		Ui::ItemTextDefaultOptions());
+	bubble.text.updateSkipBlock(skipBlock.width(), skipBlock.height());
 
 	auto width = _history.width() - st::msgMargin.left() - st::msgMargin.right();
 	accumulate_min(width, st::msgPadding.left() + bubble.text.maxWidth() + st::msgPadding.right());
 	accumulate_min(width, st::msgMaxWidth);
 
-	auto textWidth = qMax(width - st::msgPadding.left() - st::msgPadding.right(), 1);
+	auto textWidth = std::max(
+		width - st::msgPadding.left() - st::msgPadding.right(),
+		1);
 	auto textHeight = bubble.text.countHeight(textWidth);
 
 	auto height = st::msgPadding.top() + textHeight + st::msgPadding.bottom();
@@ -296,13 +323,20 @@ void Generator::addPhotoBubble(QString image, QString caption, QString date, Sta
 	bubble.photoWidth = style::ConvertScale(bubble.photo.width() / 2);
 	bubble.photoHeight = style::ConvertScale(bubble.photo.height() / 2);
 	auto skipBlock = computeSkipBlock(status, date);
-	bubble.text.setRichText(st::messageTextStyle, caption + textcmdSkipBlock(skipBlock.width(), skipBlock.height()), Ui::ItemTextDefaultOptions());
+	auto marked = TextWithEntities{ std::move(caption) };
+	bubble.text.setMarkedText(
+		st::messageTextStyle,
+		std::move(marked),
+		Ui::ItemTextDefaultOptions());
+	bubble.text.updateSkipBlock(skipBlock.width(), skipBlock.height());
 
 	auto width = _history.width() - st::msgMargin.left() - st::msgMargin.right();
 	accumulate_min(width, bubble.photoWidth);
 	accumulate_min(width, st::msgMaxWidth);
 
-	auto textWidth = qMax(width - st::msgPadding.left() - st::msgPadding.right(), 1);
+	auto textWidth = std::max(
+		width - st::msgPadding.left() - st::msgPadding.right(),
+		1);
 	auto textHeight = bubble.text.countHeight(textWidth);
 
 	auto height = st::mediaCaptionSkip + textHeight + st::msgPadding.bottom();
@@ -311,29 +345,45 @@ void Generator::addPhotoBubble(QString image, QString caption, QString date, Sta
 
 void Generator::generateData() {
 	_rows.reserve(9);
-	addRow("Eva Summer", 0, "11:00", "Reminds me of a Chinese proverb: the best time to plant a tree was 20 years ago.");
+	addRow(
+		"Eva Summer",
+		0,
+		"11:00",
+		{ .text = "We are too smart for this world. "
+			+ QString::fromUtf8("\xf0\x9f\xa4\xa3\xf0\x9f\x98\x82") });
 	_rows.back().active = true;
 	_rows.back().pinned = true;
-	addRow("Alexandra Smith", 7, "10:00", "This is amazing!");
+	addRow("Alexandra Smith", 7, "10:00", { .text = "This is amazing!" });
 	_rows.back().unreadCounter = 2;
-	addRow("Mike Apple", 2, "9:00", textcmdLink(1, QChar(55357) + QString() + QChar(56836) + " Sticker"));
+	addRow(
+		"Mike Apple",
+		2,
+		"9:00",
+		Ui::Text::Colorized(QChar(55357)
+			+ QString()
+			+ QChar(56836)
+			+ " Sticker"));
 	_rows.back().unreadCounter = 2;
 	_rows.back().muted = true;
-	addRow("Evening Club", 1, "8:00", textcmdLink(1, "Eva: Photo"));
+	addRow("Evening Club", 1, "8:00", Ui::Text::Colorized("Eva: Photo"));
 	_rows.back().type = Row::Type::Group;
-	addRow("Old Pirates", 6, "7:00", textcmdLink(1, "Max:") + " Yo-ho-ho!");
+	addRow(
+		"Old Pirates",
+		6,
+		"7:00",
+		Ui::Text::Colorized("Max:").append(" Yo-ho-ho!"));
 	_rows.back().type = Row::Type::Group;
-	addRow("Max Bright", 3, "6:00", "How about some coffee?");
+	addRow("Max Bright", 3, "6:00", { .text = "How about some coffee?" });
 	_rows.back().status = Status::Received;
-	addRow("Natalie Parker", 4, "5:00", "OK, great)");
+	addRow("Natalie Parker", 4, "5:00", { .text = "OK, great)" });
 	_rows.back().status = Status::Received;
-	addRow("Davy Jones", 5, "4:00", textcmdLink(1, "Keynote.pdf"));
+	addRow("Davy Jones", 5, "4:00", Ui::Text::Colorized("Keynote.pdf"));
 
 	_topBarName.setText(st::msgNameStyle, "Eva Summer", Ui::NameTextOptions());
 	_topBarStatus = "online";
 	_topBarStatusActive = true;
 
-	addPhotoBubble(":/gui/art/sunrise.jpg", "Nearly missed this sunrise", "7:00", Status::None);
+	addPhotoBubble(":/gui/art/themeimage.jpg", "To reach a port, we must sail. " + QString::fromUtf8("\xf0\x9f\xa5\xb8"), "7:00", Status::None);
 	int wavedata[] = { 0, 0, 0, 0, 27, 31, 4, 1, 0, 0, 23, 30, 18, 9, 7, 19, 4, 2, 2, 2, 0, 0, 15, 15, 15, 15, 3, 15, 19, 3, 2, 0, 0, 0, 0, 0, 3, 12, 16, 6, 4, 6, 14, 12, 2, 12, 12, 11, 3, 0, 7, 5, 7, 4, 7, 5, 2, 4, 0, 9, 5, 7, 6, 2, 2, 0, 0 };
 	auto waveform = QVector<int>(base::array_size(wavedata));
 	memcpy(waveform.data(), wavedata, sizeof(wavedata));
@@ -341,16 +391,17 @@ void Generator::generateData() {
 	_bubbles.back().outbg = true;
 	_bubbles.back().status = Status::Received;
 	addDateBubble("December 26");
-	addTextBubble("Twenty years from now you will be more disappointed by the things that you didn't do than by the ones you did do, so throw off the bowlines, sail away from safe harbor, catch the trade winds in your sails.", "10:00", Status::Received);
+	addTextBubble("Twenty years from now you will be more disappointed by the things that you didn't do than by the ones you did do. " + QString::fromUtf8("\xf0\x9f\xa7\x90"), "10:00", Status::Received);
 	_bubbles.back().tail = false;
 	_bubbles.back().outbg = true;
-	addTextBubble("Mark Twain said that " + QString() + QChar(9757) + QChar(55356) + QChar(57339), "10:00", Status::Received);
+	_bubbles.back().attachToBottom = true;
+	addTextBubble("Mark Twain said that " + QString::fromUtf8("\xe2\x98\x9d\xef\xb8\x8f"), "10:00", Status::Received);
 	_bubbles.back().outbg = true;
-	_bubbles.back().attached = true;
+	_bubbles.back().attachToTop = true;
 	_bubbles.back().tail = true;
-	addTextBubble("Reminds me of a Chinese proverb: the best time to plant a tree was 20 years ago. The second best time is now.", "11:00", Status::None);
+	addTextBubble("We are too smart for this world. " + QString::fromUtf8("\xf0\x9f\xa4\xa3\xf0\x9f\x98\x82"), "11:00", Status::None);
 	_bubbles.back().replyName.setText(st::msgNameStyle, "Alex Cassio", Ui::NameTextOptions());
-	_bubbles.back().replyText.setText(st::messageTextStyle, "Mark Twain said that " + QString() + QChar(9757) + QChar(55356) + QChar(57339), Ui::DialogTextOptions());
+	_bubbles.back().replyText.setText(st::messageTextStyle, "Mark Twain said that " + QString::fromUtf8("\xe2\x98\x9d\xef\xb8\x8f"), Ui::DialogTextOptions());
 }
 
 Generator::Generator(
@@ -360,22 +411,27 @@ Generator::Generator(
 : _theme(theme)
 , _palette(_theme.palette)
 , _current(std::move(current))
-, _type(type) {
+, _type(type)
+, _st(&_palette) {
 }
 
 QImage Generator::generate() {
 	prepare();
 
 	auto result = QImage(
-		_rect.size() * cIntRetinaFactor(),
+		_rect.size() * style::DevicePixelRatio(),
 		QImage::Format_ARGB32_Premultiplied);
-	result.setDevicePixelRatio(cRetinaFactor());
-	result.fill(st::themePreviewBg->c);
+	result.setDevicePixelRatio(style::DevicePixelRatio());
+	const auto bg = _current.previewBg.isValid()
+		? _current.previewBg
+		: st::themePreviewBg[_palette]->c;
+	result.fill(bg);
 
 	{
 		Painter p(&result);
 		PainterHighQualityEnabler hq(p);
 		_p = &p;
+		setTextPalette(st::defaultTextPalette);
 
 		_p->fillRect(_body, QColor(0, 0, 0));
 		_p->fillRect(_body, st::windowBg[_palette]);
@@ -387,7 +443,7 @@ QImage Generator::generate() {
 		paintHistoryShadows();
 	}
 	if (extended()) {
-		Platform::PreviewWindowFramePaint(result, _palette, _body, _rect.width());
+		Platform::PreviewWindowFramePaint(result, _palette, bg, _body, _rect.width());
 	}
 
 	return result;
@@ -400,7 +456,7 @@ void Generator::paintHistoryList() {
 	_historyBottom -= st::historyPaddingBottom;
 	_p->setClipping(true);
 	for (auto i = _bubbles.size(); i != 0;) {
-		auto &bubble = _bubbles[--i];
+		const auto &bubble = _bubbles[--i];
 		if (bubble.width > 0) {
 			paintBubble(bubble);
 		} else {
@@ -421,7 +477,8 @@ void Generator::paintHistoryBackground() {
 			background = Ui::ReadBackgroundImage(
 				u":/gui/art/background.tgv"_q,
 				QByteArray(),
-				true);
+				true
+			).image;
 			const auto paper = Data::DefaultWallPaper();
 			background = Ui::PreparePatternImage(
 				std::move(background),
@@ -436,34 +493,46 @@ void Generator::paintHistoryBackground() {
 	}
 	background = std::move(background).convertToFormat(
 		QImage::Format_ARGB32_Premultiplied);
-	background.setDevicePixelRatio(cRetinaFactor());
+	if (background.isNull()) {
+		return;
+	}
+	background.setDevicePixelRatio(style::DevicePixelRatio());
 	_p->setClipRect(_history);
 	if (tiled) {
 		auto width = background.width();
 		auto height = background.height();
-		auto repeatTimesX = qCeil(_history.width() * cIntRetinaFactor() / float64(width));
-		auto repeatTimesY = qCeil((_history.height() - fromy) * cIntRetinaFactor() / float64(height));
+		auto repeatTimesX = int(std::ceil(_history.width()
+			* style::DevicePixelRatio()
+			/ float64(width)));
+		auto repeatTimesY = int(std::ceil((_history.height() - fromy)
+			* style::DevicePixelRatio()
+			/ float64(height)));
 		auto imageForTiled = QImage(
 			width * repeatTimesX,
 			height * repeatTimesY,
 			QImage::Format_ARGB32_Premultiplied);
-		imageForTiled.setDevicePixelRatio(background.devicePixelRatio());
-		auto imageForTiledBytes = imageForTiled.bits();
-		auto bytesInLine = width * sizeof(uint32);
-		for (auto timesY = 0; timesY != repeatTimesY; ++timesY) {
-			auto imageBytes = background.constBits();
-			for (auto y = 0; y != height; ++y) {
-				for (auto timesX = 0; timesX != repeatTimesX; ++timesX) {
-					memcpy(imageForTiledBytes, imageBytes, bytesInLine);
-					imageForTiledBytes += bytesInLine;
+		if (imageForTiled.isNull()) {
+			tiled = false;
+		} else {
+			imageForTiled.setDevicePixelRatio(background.devicePixelRatio());
+			auto imageForTiledBytes = imageForTiled.bits();
+			auto bytesInLine = width * sizeof(uint32);
+			for (auto timesY = 0; timesY != repeatTimesY; ++timesY) {
+				auto imageBytes = background.constBits();
+				for (auto y = 0; y != height; ++y) {
+					for (auto timesX = 0; timesX != repeatTimesX; ++timesX) {
+						memcpy(imageForTiledBytes, imageBytes, bytesInLine);
+						imageForTiledBytes += bytesInLine;
+					}
+					imageBytes += background.bytesPerLine();
+					imageForTiledBytes += imageForTiled.bytesPerLine()
+						- (repeatTimesX * bytesInLine);
 				}
-				imageBytes += background.bytesPerLine();
-				imageForTiledBytes += imageForTiled.bytesPerLine()
-					- (repeatTimesX * bytesInLine);
 			}
+			_p->drawImage(_history.x(), _history.y() + fromy, imageForTiled);
 		}
-		_p->drawImage(_history.x(), _history.y() + fromy, imageForTiled);
-	} else {
+	}
+	if (!tiled) {
 		PainterHighQualityEnabler hq(*_p);
 
 		auto fill = QSize(_topBar.width(), _body.height());
@@ -482,11 +551,23 @@ void Generator::paintTopBar() {
 	_p->fillRect(_topBar, st::topBarBg[_palette]);
 
 	auto right = st::topBarMenuToggle.width;
-	st::topBarMenuToggle.icon[_palette].paint(*_p, _topBar.x() + _topBar.width() - right + st::topBarMenuToggle.iconPosition.x(), _topBar.y() + st::topBarMenuToggle.iconPosition.y(), _rect.width());
+	st::topBarMenuToggle.icon.withPalette(_palette).paint(
+		*_p,
+		_topBar.x() + _topBar.width() - right + st::topBarMenuToggle.iconPosition.x(),
+		_topBar.y() + st::topBarMenuToggle.iconPosition.y(),
+		_rect.width());
 	right += st::topBarSkip + st::topBarCall.width;
-	st::topBarCall.icon[_palette].paint(*_p, _topBar.x() + _topBar.width() - right + st::topBarCall.iconPosition.x(), _topBar.y() + st::topBarCall.iconPosition.y(), _rect.width());
+	st::topBarCall.icon.withPalette(_palette).paint(
+		*_p,
+		_topBar.x() + _topBar.width() - right + st::topBarCall.iconPosition.x(),
+		_topBar.y() + st::topBarCall.iconPosition.y(),
+		_rect.width());
 	right += st::topBarSearch.width;
-	st::topBarSearch.icon[_palette].paint(*_p, _topBar.x() + _topBar.width() - right + st::topBarSearch.iconPosition.x(), _topBar.y() + st::topBarSearch.iconPosition.y(), _rect.width());
+	st::topBarSearch.icon.withPalette(_palette).paint(
+		*_p,
+		_topBar.x() + _topBar.width() - right + st::topBarSearch.iconPosition.x(),
+		_topBar.y() + st::topBarSearch.iconPosition.y(),
+		_rect.width());
 
 	auto decreaseWidth = st::topBarCall.width + st::topBarCallSkip + st::topBarSearch.width + st::topBarMenuToggle.width;
 	auto nameleft = _topBar.x() + st::topBarArrowPadding.right();
@@ -505,24 +586,38 @@ void Generator::paintComposeArea() {
 	_p->fillRect(_composeArea, st::historyReplyBg[_palette]);
 
 	auto controlsTop = _composeArea.y() + _composeArea.height() - st::historySendSize.height();
-	st::historyAttach.icon[_palette].paint(*_p, _composeArea.x() + st::historyAttach.iconPosition.x(), controlsTop + st::historyAttach.iconPosition.y(), _rect.width());
+	const auto attach = st::historyAttach.icon.withPalette(_palette);
+	const auto attachIconLeft = (st::historyAttach.iconPosition.x() < 0)
+		? ((st::historyAttach.width - attach.width()) / 2)
+		: st::historyAttach.iconPosition.x();
+	const auto attachIconTop = (st::historyAttach.iconPosition.y() < 0)
+		? ((st::historyAttach.height - attach.height()) / 2)
+		: st::historyAttach.iconPosition.y();
+	attach.paint(*_p, _composeArea.x() + attachIconLeft, controlsTop + attachIconTop, _rect.width());
 	auto right = st::historySendRight + st::historySendSize.width();
-	st::historyRecordVoice[_palette].paintInCenter(*_p, QRect(_composeArea.x() + _composeArea.width() - right, controlsTop, st::historySendSize.width(), st::historySendSize.height()));
 
-	const auto emojiIconLeft = (st::historyAttachEmoji.iconPosition.x() < 0)
-		? ((st::historyAttachEmoji.width - st::historyAttachEmoji.icon.width()) / 2)
-		: st::historyAttachEmoji.iconPosition.x();
-	const auto emojiIconTop = (st::historyAttachEmoji.iconPosition.y() < 0)
-		? ((st::historyAttachEmoji.height - st::historyAttachEmoji.icon.height()) / 2)
-		: st::historyAttachEmoji.iconPosition.y();
-	const auto &emojiIcon = st::historyAttachEmoji.icon[_palette];
-	right += st::historyAttachEmoji.width;
+	const auto recordIcon = Lottie::MakeIcon({
+		.path = u":/animations/chat/voice_to_video.tgs"_q,
+		.sizeOverride = st::historySend.recordSize,
+		.colorizeUsingAlpha = true,
+	});
+	recordIcon->paintInCenter(*_p, QRect(_composeArea.x() + _composeArea.width() - right, controlsTop, st::historySendSize.width(), st::historySendSize.height()), st::historyRecordVoiceFg[_palette]->c);
+
+	const auto &emojiButton = st::historyAttachEmoji.inner;
+	const auto emojiIcon = emojiButton.icon.withPalette(_palette);
+	const auto emojiIconLeft = (emojiButton.iconPosition.x() < 0)
+		? ((emojiButton.width - emojiIcon.width()) / 2)
+		: emojiButton.iconPosition.x();
+	const auto emojiIconTop = (emojiButton.iconPosition.y() < 0)
+		? ((emojiButton.height - emojiIcon.height()) / 2)
+		: emojiButton.iconPosition.y();
+	right += emojiButton.width;
 	auto attachEmojiLeft = _composeArea.x() + _composeArea.width() - right;
-	_p->fillRect(attachEmojiLeft, controlsTop, st::historyAttachEmoji.width, st::historyAttachEmoji.height, st::historyComposeAreaBg[_palette]);
+	_p->fillRect(attachEmojiLeft, controlsTop, emojiButton.width, emojiButton.height, st::historyComposeAreaBg[_palette]);
 	emojiIcon.paint(*_p, attachEmojiLeft + emojiIconLeft, controlsTop + emojiIconTop, _rect.width());
 
 	auto pen = st::historyEmojiCircleFg[_palette]->p;
-	pen.setWidth(st::historyEmojiCircleLine);
+	pen.setWidthF(style::ConvertScaleExact(st::historyEmojiCircleLine));
 	pen.setCapStyle(Qt::RoundCap);
 	_p->setPen(pen);
 	_p->setBrush(Qt::NoBrush);
@@ -539,14 +634,14 @@ void Generator::paintComposeArea() {
 
 	auto fieldLeft = _composeArea.x() + st::historyAttach.width;
 	auto fieldTop = _composeArea.y() + _composeArea.height() - st::historyAttach.height + st::historySendPadding;
-	auto fieldWidth = _composeArea.width() - st::historyAttach.width - st::historySendSize.width() - st::historySendRight - st::historyAttachEmoji.width;
+	auto fieldWidth = _composeArea.width() - st::historyAttach.width - st::historySendSize.width() - st::historySendRight - emojiButton.width;
 	auto fieldHeight = st::historySendSize.height() - 2 * st::historySendPadding;
 	auto field = QRect(fieldLeft, fieldTop, fieldWidth, fieldHeight);
 	_p->fillRect(field, st::historyComposeField.textBg[_palette]);
 
-	_p->save();
 	_p->setClipRect(field);
-	_p->setFont(st::historyComposeField.font);
+	_p->save();
+	_p->setFont(st::historyComposeField.style.font);
 	_p->setPen(st::historyComposeField.placeholderFg[_palette]);
 
 	auto placeholderRect = QRect(
@@ -563,34 +658,47 @@ void Generator::paintComposeArea() {
 void Generator::paintDialogs() {
 	_p->fillRect(_dialogs, st::dialogsBg[_palette]);
 
-	st::dialogsMenuToggle.icon[_palette].paint(*_p, _dialogs.x() + st::dialogsFilterPadding.x() + st::dialogsMenuToggle.iconPosition.x(), _dialogs.y() + st::dialogsFilterPadding.y() + st::dialogsMenuToggle.iconPosition.y(), _rect.width());
+	const auto menuToggle = st::dialogsMenuToggle.icon.withPalette(_palette);
+	const auto iconLeft = (st::dialogsMenuToggle.iconPosition.x() < 0)
+		? (st::dialogsMenuToggle.width - menuToggle.width()) / 2
+		: st::dialogsMenuToggle.iconPosition.x();
+	const auto iconTop = (st::dialogsMenuToggle.iconPosition.y() < 0)
+		? (st::dialogsMenuToggle.height - menuToggle.height()) / 2
+		: st::dialogsMenuToggle.iconPosition.y();
+	menuToggle.paint(*_p, _dialogs.x() + st::dialogsFilterPadding.x() + iconLeft, _dialogs.y() + st::dialogsFilterPadding.y() + iconTop, _rect.width());
 
 	auto filterLeft = _dialogs.x() + st::dialogsFilterPadding.x() + st::dialogsMenuToggle.width + st::dialogsFilterPadding.x();
 	auto filterRight = st::dialogsFilterSkip + st::dialogsFilterPadding.x();
 	auto filterWidth = _dialogs.x() + _dialogs.width() - filterLeft - filterRight;
 	auto filterAreaHeight = st::topBarHeight;
-	auto filterTop = _dialogs.y() + (filterAreaHeight - st::dialogsFilter.height) / 2;
-	auto filter = QRect(filterLeft, filterTop, filterWidth, st::dialogsFilter.height);
+	auto filterTop = _dialogs.y() + (filterAreaHeight - st::dialogsFilter.heightMin) / 2;
+	auto filter = QRect(filterLeft, filterTop, filterWidth, st::dialogsFilter.heightMin);
 
-	auto pen = st::dialogsFilter.borderColor[_palette]->p;
-	pen.setWidth(st::dialogsFilter.borderWidth);
+	auto pen = st::dialogsFilter.borderFg[_palette]->p;
+	pen.setWidth(st::dialogsFilter.border);
 	_p->setPen(pen);
-	_p->setBrush(st::dialogsFilter.bgColor[_palette]);
+	_p->setBrush(st::dialogsFilter.textBg[_palette]);
 	{
 		PainterHighQualityEnabler hq(*_p);
-		_p->drawRoundedRect(QRectF(filter).marginsRemoved(QMarginsF(st::dialogsFilter.borderWidth / 2., st::dialogsFilter.borderWidth / 2., st::dialogsFilter.borderWidth / 2., st::dialogsFilter.borderWidth / 2.)), st::roundRadiusSmall - (st::dialogsFilter.borderWidth / 2.), st::roundRadiusSmall - (st::dialogsFilter.borderWidth / 2.));
-	}
-
-	if (!st::dialogsFilter.icon.empty()) {
-		st::dialogsFilter.icon[_palette].paint(*_p, filter.x(), filter.y(), _rect.width());
+		const auto radius = st::dialogsFilter.borderRadius
+			- (st::dialogsFilter.border / 2.);
+		_p->drawRoundedRect(
+			QRectF(filter).marginsRemoved(
+				QMarginsF(
+					st::dialogsFilter.border / 2.,
+					st::dialogsFilter.border / 2.,
+					st::dialogsFilter.border / 2.,
+					st::dialogsFilter.border / 2.)),
+			radius,
+			radius);
 	}
 
 	_p->save();
 	_p->setClipRect(filter);
-	auto phRect = QRect(filter.x() + st::dialogsFilter.textMrg.left() + st::dialogsFilter.phPos.x(), filter.y() + st::dialogsFilter.textMrg.top() + st::dialogsFilter.phPos.y(), filter.width() - st::dialogsFilter.textMrg.left() - st::dialogsFilter.textMrg.right(), filter.height() - st::dialogsFilter.textMrg.top() - st::dialogsFilter.textMrg.bottom());;
-	_p->setFont(st::dialogsFilter.font);
-	_p->setPen(st::dialogsFilter.phColor[_palette]);
-	_p->drawText(phRect, tr::lng_dlg_filter(tr::now), QTextOption(st::dialogsFilter.phAlign));
+	auto phRect = QRect(filter.x() + st::dialogsFilter.textMargins.left() + st::dialogsFilter.placeholderMargins.left(), filter.y() + st::dialogsFilter.textMargins.top() + st::dialogsFilter.placeholderMargins.top(), filter.width() - st::dialogsFilter.textMargins.left() - st::dialogsFilter.textMargins.right(), filter.height() - st::dialogsFilter.textMargins.top() - st::dialogsFilter.textMargins.bottom());
+	_p->setFont(st::dialogsFilter.style.font);
+	_p->setPen(st::dialogsFilter.placeholderFg[_palette]);
+	_p->drawText(phRect, tr::lng_dlg_filter(tr::now), QTextOption(st::dialogsFilter.placeholderAlign));
 	_p->restore();
 	_p->setClipping(false);
 
@@ -615,26 +723,41 @@ void Generator::paintRow(const Row &row) {
 	if (row.active || row.selected) {
 		_p->fillRect(fullRect, row.active ? st::dialogsBgActive[_palette] : st::dialogsBgOver[_palette]);
 	}
-	paintUserpic(x + st::dialogsPadding.x(), y + st::dialogsPadding.y(), row.type, row.peerIndex, row.letters);
+	const auto &st = st::defaultDialogRow;
+	paintUserpic(
+		x + st.padding.left(),
+		y + st.padding.top(),
+		row.type,
+		row.peerIndex,
+		row.letters);
 
-	auto nameleft = x + st::dialogsPadding.x() + st::dialogsPhotoSize + st::dialogsPhotoPadding;
-	auto namewidth = x + fullWidth - nameleft - st::dialogsPadding.x();
-	auto rectForName = QRect(nameleft, y + st::dialogsPadding.y() + st::dialogsNameTop, namewidth, st::msgNameFont->height);
+	auto nameleft = x + st.nameLeft;
+	auto namewidth = x + fullWidth - nameleft - st.padding.right();
+	auto rectForName = QRect(nameleft, y + st.nameTop, namewidth, st::msgNameFont->height);
 
 	auto chatTypeIcon = ([&row]() -> const style::icon * {
 		if (row.type == Row::Type::Group) {
-			return &(row.active ? st::dialogsChatIconActive : (row.selected ? st::dialogsChatIconOver : st::dialogsChatIcon));
+			return &Dialogs::ThreeStateIcon(
+				st::dialogsChatIcon,
+				row.active,
+				row.selected);
 		} else if (row.type == Row::Type::Channel) {
-			return &(row.active ? st::dialogsChannelIconActive : (row.selected ? st::dialogsChannelIconOver : st::dialogsChannelIcon));
+			return &Dialogs::ThreeStateIcon(
+				st::dialogsChannelIcon,
+				row.active,
+				row.selected);
 		}
 		return nullptr;
 	})();
 	if (chatTypeIcon) {
-		(*chatTypeIcon)[_palette].paint(*_p, rectForName.topLeft(), fullWidth);
-		rectForName.setLeft(rectForName.left() + st::dialogsChatTypeSkip);
+		const auto icon = chatTypeIcon->withPalette(_palette);
+		icon.paint(*_p, rectForName.topLeft(), fullWidth);
+		rectForName.setLeft(rectForName.left()
+			+ icon.width()
+			+ st::dialogsChatTypeSkip);
 	}
 
-	auto texttop = y + st::dialogsPadding.y() + st::msgNameFont->height + st::dialogsSkip;
+	auto texttop = y + st.textTop;
 
 	auto dateWidth = st::dialogsDateFont->width(row.date);
 	rectForName.setWidth(rectForName.width() - dateWidth - st::dialogsDateSkip);
@@ -645,7 +768,7 @@ void Generator::paintRow(const Row &row) {
 	auto availableWidth = namewidth;
 	if (row.unreadCounter) {
 		auto counter = QString::number(row.unreadCounter);
-		auto unreadRight = x + fullWidth - st::dialogsPadding.x();
+		auto unreadRight = x + fullWidth - st.padding.right();
 		auto unreadTop = texttop + st::dialogsTextFont->ascent - st::dialogsUnreadFont->ascent - (st::dialogsUnreadHeight - st::dialogsUnreadFont->height) / 2;
 
 		auto unreadWidth = st::dialogsUnreadFont->width(counter);
@@ -676,8 +799,11 @@ void Generator::paintRow(const Row &row) {
 		_p->setPen(row.active ? st::dialogsUnreadFgActive[_palette] : (row.selected ? st::dialogsUnreadFgOver[_palette] : st::dialogsUnreadFg[_palette]));
 		_p->drawText(unreadRectLeft + (unreadRectWidth - unreadWidth) / 2, unreadRectTop + textTop + st::dialogsUnreadFont->ascent, counter);
 	} else if (row.pinned) {
-		auto icon = (row.active ? st::dialogsPinnedIconActive[_palette] : (row.selected ? st::dialogsPinnedIconOver[_palette] : st::dialogsPinnedIcon[_palette]));
-		icon.paint(*_p, x + fullWidth - st::dialogsPadding.x() - icon.width(), texttop, fullWidth);
+		const auto icon = Dialogs::ThreeStateIcon(
+			st::dialogsPinnedIcon,
+			row.active,
+			row.selected).withPalette(_palette);
+		icon.paint(*_p, x + fullWidth - st.padding.right() - icon.width(), texttop, fullWidth);
 		availableWidth -= icon.width() + st::dialogsUnreadPadding;
 	}
 	auto textRect = QRect(nameleft, texttop, availableWidth, st::dialogsTextFont->height);
@@ -689,15 +815,24 @@ void Generator::paintRow(const Row &row) {
 
 	auto sendStateIcon = ([&row]() -> const style::icon* {
 		if (row.status == Status::Sent) {
-			return &(row.active ? st::dialogsSentIconActive : (row.selected ? st::dialogsSentIconOver : st::dialogsSentIcon));
+			return &Dialogs::ThreeStateIcon(
+				st::dialogsSentIcon,
+				row.active,
+				row.selected);
 		} else if (row.status == Status::Received) {
-			return &(row.active ? st::dialogsReceivedIconActive : (row.selected ? st::dialogsReceivedIconOver : st::dialogsReceivedIcon));
+			return &Dialogs::ThreeStateIcon(
+				st::dialogsReceivedIcon,
+				row.active,
+				row.selected);
 		}
 		return nullptr;
 	})();
 	if (sendStateIcon) {
 		rectForName.setWidth(rectForName.width() - st::dialogsSendStateSkip);
-		(*sendStateIcon)[_palette].paint(*_p, rectForName.topLeft() + QPoint(rectForName.width(), 0), fullWidth);
+		sendStateIcon->withPalette(_palette).paint(
+			*_p,
+			rectForName.topLeft() + QPoint(rectForName.width(), 0),
+			fullWidth);
 	}
 	_p->setPen(row.active ? st::dialogsNameFgActive[_palette] : (row.selected ? st::dialogsNameFgOver[_palette] : st::dialogsNameFg[_palette]));
 	row.name.drawElided(*_p, rectForName.left(), rectForName.top(), rectForName.width());
@@ -706,7 +841,12 @@ void Generator::paintRow(const Row &row) {
 void Generator::paintBubble(const Bubble &bubble) {
 	auto height = bubble.height;
 	if (!bubble.replyName.isEmpty()) {
-		height += st::msgReplyPadding.top() + st::msgReplyBarSize.height() + st::msgReplyPadding.bottom();
+		height += st::historyReplyTop
+			+ st::historyReplyPadding.top()
+			+ st::msgServiceNameFont->height
+			+ st::normalFont->height
+			+ st::historyReplyPadding.bottom()
+			+ st::historyReplyBottom;
 	}
 	auto isPhoto = !bubble.photo.isNull();
 
@@ -715,8 +855,8 @@ void Generator::paintBubble(const Bubble &bubble) {
 	auto bubbleTop = y;
 	auto bubbleHeight = height;
 	if (isPhoto) {
-		bubbleTop -= st::historyMessageRadius + 1;
-		bubbleHeight += st::historyMessageRadius + 1;
+		bubbleTop -= Ui::BubbleRadiusLarge() + 1;
+		bubbleHeight += Ui::BubbleRadiusLarge() + 1;
 	}
 
 	auto left = bubble.outbg ? st::msgMargin.right() : st::msgMargin.left();
@@ -725,33 +865,39 @@ void Generator::paintBubble(const Bubble &bubble) {
 	}
 	x += left;
 
-	_p->setPen(Qt::NoPen);
-	auto tailclip = st::historyMessageRadius + 1;
-	if (bubble.tail) {
-		if (bubble.outbg) {
-			_p->setClipRegion(QRegion(_history) - QRect(x + bubble.width - tailclip, bubbleTop + bubbleHeight - tailclip, tailclip + st::historyMessageRadius, tailclip + st::historyMessageRadius));
-		} else {
-			_p->setClipRegion(QRegion(_history) - QRect(x - st::historyMessageRadius, bubbleTop + bubbleHeight - tailclip, tailclip + st::historyMessageRadius, tailclip + st::historyMessageRadius));
+	using Corner = Ui::BubbleCornerRounding;
+	auto rounding = Ui::BubbleRounding{
+		Corner::Large,
+		Corner::Large,
+		Corner::Large,
+		Corner::Large,
+	};
+	if (bubble.outbg) {
+		if (bubble.attachToTop) {
+			rounding.topRight = Corner::Small;
+		}
+		if (bubble.attachToBottom) {
+			rounding.bottomRight = Corner::Small;
+		} else if (bubble.tail) {
+			rounding.bottomRight = Corner::Tail;
+		}
+	} else {
+		if (bubble.attachToTop) {
+			rounding.topLeft = Corner::Small;
+		}
+		if (bubble.attachToBottom) {
+			rounding.bottomLeft = Corner::Small;
+		} else if (bubble.tail) {
+			rounding.bottomLeft = Corner::Tail;
 		}
 	}
-	auto sh = bubble.outbg ? st::msgOutShadow[_palette] : st::msgInShadow[_palette];
-	_p->setBrush(sh);
-	_p->drawRoundedRect(x, bubbleTop + st::msgShadow, bubble.width, bubbleHeight, st::historyMessageRadius, st::historyMessageRadius);
-	auto bg = bubble.outbg ? st::msgOutBg[_palette] : st::msgInBg[_palette];
-	_p->setBrush(bg);
-	_p->drawRoundedRect(x, bubbleTop, bubble.width, bubbleHeight, st::historyMessageRadius, st::historyMessageRadius);
-	if (bubble.tail) {
-		_p->setClipRect(_history);
-		if (bubble.outbg) {
-			_p->fillRect(QRect(x + bubble.width - tailclip, bubbleTop + bubbleHeight - tailclip, tailclip, tailclip), bg);
-			_p->fillRect(QRect(x + bubble.width - tailclip, bubbleTop + bubbleHeight, tailclip + st::historyBubbleTailOutRight.width(), st::msgShadow), sh);
-			st::historyBubbleTailOutRight[_palette].paint(*_p, x + bubble.width, bubbleTop + bubbleHeight - st::historyBubbleTailOutRight.height(), _rect.width());
-		} else {
-			_p->fillRect(QRect(x, bubbleTop + bubbleHeight - tailclip, tailclip, tailclip), bg);
-			_p->fillRect(QRect(x - st::historyBubbleTailInLeft.width(), bubbleTop + bubbleHeight, tailclip + st::historyBubbleTailInLeft.width(), st::msgShadow), sh);
-			st::historyBubbleTailInLeft[_palette].paint(*_p, x - st::historyBubbleTailInLeft.width(), bubbleTop + bubbleHeight - st::historyBubbleTailOutRight.height(), _rect.width());
-		}
-	}
+	Ui::PaintBubble(*_p, Ui::SimpleBubble{
+		.st = &_st,
+		.geometry = QRect(x, bubbleTop, bubble.width, bubbleHeight),
+		.outerWidth = _rect.width(),
+		.outbg = bubble.outbg,
+		.rounding = rounding,
+	});
 
 	auto trect = QRect(x, y, bubble.width, bubble.height);
 	if (isPhoto) {
@@ -760,19 +906,45 @@ void Generator::paintBubble(const Bubble &bubble) {
 		trect = trect.marginsRemoved(st::msgPadding);
 	}
 	if (!bubble.replyName.isEmpty()) {
-		auto h = st::msgReplyPadding.top() + st::msgReplyBarSize.height() + st::msgReplyPadding.bottom();
-
+		trect.setY(trect.y() + st::historyReplyTop);
 		auto bar = (bubble.outbg ? st::msgOutReplyBarColor[_palette] : st::msgInReplyBarColor[_palette]);
-		auto rbar = style::rtlrect(trect.x() + st::msgReplyBarPos.x(), trect.y() + st::msgReplyPadding.top() + st::msgReplyBarPos.y(), st::msgReplyBarSize.width(), st::msgReplyBarSize.height(), _rect.width());
-		_p->fillRect(rbar, bar);
+		auto rbar = style::rtlrect(
+			trect.x(),
+			trect.y(),
+			trect.width(),
+			(st::historyReplyPadding.top()
+				+ st::msgServiceNameFont->height
+				+ st::normalFont->height
+				+ st::historyReplyPadding.bottom()),
+			_rect.width());
+		{
+			auto hq = PainterHighQualityEnabler(*_p);
+			_p->setPen(Qt::NoPen);
+			_p->setBrush(bar);
+
+			const auto outline = st::messageTextStyle.blockquote.outline;
+			const auto radius = st::messageTextStyle.blockquote.radius;
+			_p->setOpacity(Ui::kDefaultOutline1Opacity);
+			_p->setClipRect(rbar.x(), rbar.y(), outline, rbar.height());
+			_p->drawRoundedRect(rbar, radius, radius);
+			_p->setOpacity(Ui::kDefaultBgOpacity);
+			_p->setClipRect(
+				rbar.x() + outline,
+				rbar.y(),
+				rbar.width() - outline,
+				rbar.height());
+			_p->drawRoundedRect(rbar, radius, radius);
+		}
+		_p->setOpacity(1.);
+		_p->setClipping(false);
 
 		_p->setPen(bubble.outbg ? st::msgOutServiceFg[_palette] : st::msgInServiceFg[_palette]);
-		bubble.replyName.drawLeftElided(*_p, trect.x() + st::msgReplyBarSkip, trect.y() + st::msgReplyPadding.top(), bubble.width - st::msgReplyBarSkip, _rect.width());
+		bubble.replyName.drawLeftElided(*_p, trect.x() + st::historyReplyPadding.left(), trect.y() + st::historyReplyPadding.top(), bubble.width - st::historyReplyPadding.left() - st::historyReplyPadding.right(), _rect.width());
 
 		_p->setPen(bubble.outbg ? st::historyTextOutFg[_palette] : st::historyTextInFg[_palette]);
-		bubble.replyText.drawLeftElided(*_p, trect.x() + st::msgReplyBarSkip, trect.y() + st::msgReplyPadding.top() + st::msgServiceNameFont->height, bubble.width - st::msgReplyBarSkip, _rect.width());
+		bubble.replyText.drawLeftElided(*_p, trect.x() + st::historyReplyPadding.left(), trect.y() + st::historyReplyPadding.top() + st::msgServiceNameFont->height, bubble.width - st::historyReplyPadding.left() - st::historyReplyPadding.right(), _rect.width());
 
-		trect.setY(trect.y() + h);
+		trect.setY(trect.y() + rbar.height() + st::historyReplyBottom);
 	}
 
 	if (!bubble.text.isEmpty()) {
@@ -782,8 +954,8 @@ void Generator::paintBubble(const Bubble &bubble) {
 		bubble.text.draw(*_p, trect.x(), trect.y(), trect.width());
 	} else if (!bubble.waveform.isEmpty()) {
 		const auto &st = st::msgFileLayout;
-		auto nameleft = x + st.padding.left() + st.thumbSize + st.padding.right();
-		auto nameright = st.padding.left();
+		auto nameleft = x + st.padding.left() + st.thumbSize + st.thumbSkip;
+		auto nameright = st.padding.right();
 		auto statustop = y + st.statusTop;
 
 		auto inner = style::rtlrect(x + st.padding.left(), y + st.padding.top(), st.thumbSize, st.thumbSize, _rect.width());
@@ -792,19 +964,21 @@ void Generator::paintBubble(const Bubble &bubble) {
 
 		_p->drawEllipse(inner);
 
-		auto icon = ([&bubble] {
-			return &(bubble.outbg ? st::historyFileOutPlay : st::historyFileInPlay);
-		})();
-		(*icon)[_palette].paintInCenter(*_p, inner);
+		const auto &play = bubble.outbg
+			? st::historyFileOutPlay
+			: st::historyFileInPlay;
+		play.withPalette(_palette).paintInCenter(*_p, inner);
 
 		auto namewidth = x + bubble.width - nameleft - nameright;
 
 		// rescale waveform by going in waveform.size * bar_count 1D grid
 		auto active = bubble.outbg ? st::msgWaveformOutActive[_palette] : st::msgWaveformInActive[_palette];
 		auto inactive = bubble.outbg ? st::msgWaveformOutInactive[_palette] : st::msgWaveformInInactive[_palette];
-		auto wf_size = bubble.waveform.size();
+		auto wf_size = int(bubble.waveform.size());
 		auto availw = namewidth + st::msgWaveformSkip;
-		auto bar_count = qMin(availw / (st::msgWaveformBar + st::msgWaveformSkip), wf_size);
+		auto bar_count = std::min(
+			availw / (st::msgWaveformBar + st::msgWaveformSkip),
+			wf_size);
 		auto max_value = 0;
 		auto max_delta = st::msgWaveformMax - st::msgWaveformMin;
 		auto wave_bottom = y + st::msgFileLayout.padding.top() + st::msgWaveformMax;
@@ -862,14 +1036,21 @@ void Generator::paintBubble(const Bubble &bubble) {
 		return nullptr;
 	})();
 	if (icon) {
-		(*icon)[_palette].paint(*_p, QPoint(infoRight, infoBottom) + st::historySendStatePosition, _rect.width());
+		icon->withPalette(_palette).paint(
+			*_p,
+			QPoint(infoRight, infoBottom) + st::historySendStatePosition,
+			_rect.width());
 	}
 
-	_historyBottom = y - (bubble.attached ? st::msgMarginTopAttached : st::msgMargin.top());
+	_historyBottom = y - (bubble.attachToTop ? st::msgMarginTopAttached : st::msgMargin.top());
 
 	if (isPhoto) {
-		auto image = bubble.photo.scaled(bubble.photoWidth * cIntRetinaFactor(), bubble.photoHeight * cIntRetinaFactor(), Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
-		image.setDevicePixelRatio(cRetinaFactor());
+		auto image = bubble.photo.scaled(
+			QSize(bubble.photoWidth, bubble.photoHeight)
+				* style::DevicePixelRatio(),
+			Qt::IgnoreAspectRatio,
+			Qt::SmoothTransformation);
+		image.setDevicePixelRatio(style::DevicePixelRatio());
 		_p->drawImage(x, y - bubble.photoHeight, image);
 		_historyBottom -= bubble.photoHeight;
 	}
@@ -892,34 +1073,37 @@ void Generator::paintService(QString text) {
 }
 
 void Generator::paintUserpic(int x, int y, Row::Type type, int index, QString letters) {
-	style::color colors[] = {
-		st::historyPeer1UserpicBg,
-		st::historyPeer2UserpicBg,
-		st::historyPeer3UserpicBg,
-		st::historyPeer4UserpicBg,
-		st::historyPeer5UserpicBg,
-		st::historyPeer6UserpicBg,
-		st::historyPeer7UserpicBg,
-		st::historyPeer8UserpicBg,
-	};
-	auto color = colors[index % base::array_size(colors)];
-
-	auto image = QImage(st::dialogsPhotoSize * cIntRetinaFactor(), st::dialogsPhotoSize * cIntRetinaFactor(), QImage::Format_ARGB32_Premultiplied);
-	image.setDevicePixelRatio(cRetinaFactor());
-	image.fill(color[_palette]->c);
+	const auto colors = Ui::EmptyUserpic::UserpicColor(
+		Ui::DecideColorIndex(index));
+	const auto size = st::defaultDialogRow.photoSize;
+	auto image = QImage(
+		QSize(size, size) * style::DevicePixelRatio(),
+		QImage::Format_ARGB32_Premultiplied);
+	image.setDevicePixelRatio(style::DevicePixelRatio());
+	image.fill(Qt::transparent);
 	{
-		Painter p(&image);
-		auto fontsize = (st::dialogsPhotoSize * 13) / 33;
-		auto font = st::historyPeerUserpicFont->f;
-		font.setPixelSize(fontsize);
+		auto p = QPainter(&image);
+		auto hq = PainterHighQualityEnabler(p);
+		auto gradient = QLinearGradient(0, 0, 0, size);
+		gradient.setStops({
+			{ 0., colors.color1[_palette]->c },
+			{ 1., colors.color2[_palette]->c },
+		});
+		p.setPen(Qt::NoPen);
+		p.setBrush(gradient);
+		p.drawEllipse(0, 0, size, size);
 
+		auto font = st::historyPeerUserpicFont->f;
+		font.setPixelSize((size * 13) / 33);
 		p.setFont(font);
 		p.setBrush(Qt::NoBrush);
 		p.setPen(st::historyPeerUserpicFg[_palette]);
-		p.drawText(QRect(0, 0, st::dialogsPhotoSize, st::dialogsPhotoSize), letters, QTextOption(style::al_center));
+		p.drawText(
+			QRect(0, 0, size, size),
+			FillLetters(letters),
+			QTextOption(style::al_center));
 	}
-	Images::prepareCircle(image);
-	_p->drawImage(rtl() ? (_rect.width() - x - st::dialogsPhotoSize) : x, y, image);
+	_p->drawImage(rtl() ? (_rect.width() - x - size) : x, y, image);
 }
 
 void Generator::paintHistoryShadows() {
@@ -931,16 +1115,19 @@ void Generator::paintHistoryShadows() {
 void Generator::setTextPalette(const style::TextPalette &st) {
 	_textPalette.linkFg = st.linkFg[_palette].clone();
 	_textPalette.monoFg = st.monoFg[_palette].clone();
+	_textPalette.markBg = st.markBg[_palette].clone();
+	_textPalette.spoilerFg = st.spoilerFg[_palette].clone();
 	_textPalette.selectBg = st.selectBg[_palette].clone();
 	_textPalette.selectFg = st.selectFg[_palette].clone();
 	_textPalette.selectLinkFg = st.selectLinkFg[_palette].clone();
 	_textPalette.selectMonoFg = st.selectMonoFg[_palette].clone();
+	_textPalette.selectSpoilerFg = st.selectSpoilerFg[_palette].clone();
 	_textPalette.selectOverlay = st.selectOverlay[_palette].clone();
 	_p->setTextPalette(_textPalette);
 }
 
 void Generator::restoreTextPalette() {
-	_p->restoreTextPalette();
+	setTextPalette(st::defaultTextPalette);
 }
 
 } // namespace
@@ -1016,21 +1203,24 @@ void DefaultPreviewWindowTitle(Painter &p, const style::palette &palette, QRect 
 	p.fillRect(titleRect, QColor(0, 0, 0));
 	p.fillRect(titleRect, st::titleBgActive[palette]);
 	auto right = st::defaultWindowTitle.close.width;
-	st::defaultWindowTitle.close.icon[palette].paint(p, titleRect.x() + titleRect.width() - right + st::defaultWindowTitle.close.iconPosition.x(), titleRect.y() + st::windowTitleButtonClose.iconPosition.y(), outerWidth);
+	st::defaultWindowTitle.close.icon.withPalette(palette).paint(p, titleRect.x() + titleRect.width() - right + st::defaultWindowTitle.close.iconPosition.x(), titleRect.y() + st::windowTitleButtonClose.iconPosition.y(), outerWidth);
 	right += st::defaultWindowTitle.maximize.width;
-	st::defaultWindowTitle.maximize.icon[palette].paint(p, titleRect.x() + titleRect.width() - right + st::defaultWindowTitle.maximize.iconPosition.x(), titleRect.y() + st::defaultWindowTitle.maximize.iconPosition.y(), outerWidth);
+	st::defaultWindowTitle.maximize.icon.withPalette(palette).paint(p, titleRect.x() + titleRect.width() - right + st::defaultWindowTitle.maximize.iconPosition.x(), titleRect.y() + st::defaultWindowTitle.maximize.iconPosition.y(), outerWidth);
 	right += st::defaultWindowTitle.minimize.width;
-	st::defaultWindowTitle.minimize.icon[palette].paint(p, titleRect.x() + titleRect.width() - right + st::defaultWindowTitle.minimize.iconPosition.x(), titleRect.y() + st::defaultWindowTitle.minimize.iconPosition.y(), outerWidth);
+	st::defaultWindowTitle.minimize.icon.withPalette(palette).paint(p, titleRect.x() + titleRect.width() - right + st::defaultWindowTitle.minimize.iconPosition.x(), titleRect.y() + st::defaultWindowTitle.minimize.iconPosition.y(), outerWidth);
 	p.fillRect(titleRect.x(), titleRect.y() + titleRect.height() - st::lineWidth, titleRect.width(), st::lineWidth, st::titleShadow[palette]);
 }
 
 void DefaultPreviewWindowFramePaint(QImage &preview, const style::palette &palette, QRect body, int outerWidth) {
-	auto mask = QImage(st::windowShadow.size() * cIntRetinaFactor(), QImage::Format_ARGB32_Premultiplied);
-	mask.setDevicePixelRatio(cRetinaFactor());
+	const auto shadow = st::windowShadow.withPalette(palette);
+	auto mask = QImage(
+		shadow.size() * style::DevicePixelRatio(),
+		QImage::Format_ARGB32_Premultiplied);
+	mask.setDevicePixelRatio(style::DevicePixelRatio());
 	{
 		Painter p(&mask);
 		p.setCompositionMode(QPainter::CompositionMode_Source);
-		st::windowShadow.paint(p, 0, 0, st::windowShadow.width(), QColor(0, 0, 0));
+		shadow.paint(p, 0, 0, shadow.width(), QColor(0, 0, 0));
 	}
 	auto maxSize = 0;
 	auto currentInt = static_cast<uint32>(0);
@@ -1042,25 +1232,26 @@ void DefaultPreviewWindowFramePaint(QImage &preview, const style::palette &palet
 		currentInt = *lastLineInts;
 		++maxSize;
 	}
-	if (maxSize % cIntRetinaFactor()) {
-		maxSize -= (maxSize % cIntRetinaFactor());
+	if (maxSize % style::DevicePixelRatio()) {
+		maxSize -= (maxSize % style::DevicePixelRatio());
 	}
-	auto size = maxSize / cIntRetinaFactor();
+	auto size = maxSize / style::DevicePixelRatio();
 	auto bottom = size;
 	auto left = size - st::windowShadowShift;
 	auto right = left;
 	auto top = size - 2 * st::windowShadowShift;
 
-	auto sprite = st::windowShadow[palette];
-	auto topLeft = QImage(sprite.size() * cIntRetinaFactor(), QImage::Format_ARGB32_Premultiplied);
-	topLeft.setDevicePixelRatio(cRetinaFactor());
+	auto topLeft = QImage(
+		shadow.size() * style::DevicePixelRatio(),
+		QImage::Format_ARGB32_Premultiplied);
+	topLeft.setDevicePixelRatio(style::DevicePixelRatio());
 	{
 		Painter p(&topLeft);
 		p.setCompositionMode(QPainter::CompositionMode_Source);
-		sprite.paint(p, 0, 0, sprite.width());
+		shadow.paint(p, 0, 0, shadow.width());
 	}
-	auto width = sprite.width();
-	auto height = sprite.height();
+	auto width = shadow.width();
+	auto height = shadow.height();
 	auto topRight = topLeft.mirrored(true, false);
 	auto bottomRight = topLeft.mirrored(true, true);
 	auto bottomLeft = topLeft.mirrored(false, true);
@@ -1068,16 +1259,74 @@ void DefaultPreviewWindowFramePaint(QImage &preview, const style::palette &palet
 	Painter p(&preview);
 	DefaultPreviewWindowTitle(p, palette, body, outerWidth);
 
-	auto inner = QRect(body.x(), body.y() - st::defaultWindowTitle.height, body.width(), body.height() + st::defaultWindowTitle.height);
-	p.setClipRegion(QRegion(inner.marginsAdded(QMargins(size, size, size, size))) - inner);
+	auto inner = QRect(
+		body.x(),
+		body.y() - st::defaultWindowTitle.height,
+		body.width(),
+		body.height() + st::defaultWindowTitle.height);
+	p.setClipRegion(QRegion(inner + Margins(size)) - inner);
 	p.drawImage(inner.x() - left, inner.y() - top, topLeft);
-	p.drawImage(inner.x() + inner.width() + right - width, inner.y() - top, topRight);
-	p.drawImage(inner.x() + inner.width() + right - width, inner.y() + inner.height() + bottom - height, bottomRight);
-	p.drawImage(inner.x() - left, inner.y() + inner.height() + bottom - height, bottomLeft);
-	p.drawImage(QRect(inner.x() - left, inner.y() - top + height, left, top + inner.height() + bottom - 2 * height), topLeft, QRect(0, topLeft.height() - cIntRetinaFactor(), left * cIntRetinaFactor(), cIntRetinaFactor()));
-	p.drawImage(QRect(inner.x() - left + width, inner.y() - top, left + inner.width() + right - 2 * width, top), topLeft, QRect(topLeft.width() - cIntRetinaFactor(), 0, cIntRetinaFactor(), top * cIntRetinaFactor()));
-	p.drawImage(QRect(inner.x() + inner.width(), inner.y() - top + height, right, top + inner.height() + bottom - 2 * height), topRight, QRect(topRight.width() - right * cIntRetinaFactor(), topRight.height() - cIntRetinaFactor(), right * cIntRetinaFactor(), cIntRetinaFactor()));
-	p.drawImage(QRect(inner.x() - left + width, inner.y() + inner.height(), left + inner.width() + right - 2 * width, bottom), bottomRight, QRect(0, bottomRight.height() - bottom * cIntRetinaFactor(), cIntRetinaFactor(), bottom * cIntRetinaFactor()));
+	p.drawImage(
+		inner.x() + inner.width() + right - width,
+		inner.y() - top,
+		topRight);
+	p.drawImage(
+		inner.x() + inner.width() + right - width,
+		inner.y() + inner.height() + bottom - height,
+		bottomRight);
+	p.drawImage(
+		inner.x() - left,
+		inner.y() + inner.height() + bottom - height,
+		bottomLeft);
+	p.drawImage(
+		QRect(
+			inner.x() - left,
+			inner.y() - top + height,
+			left,
+			top + inner.height() + bottom - 2 * height),
+		topLeft,
+		QRect(
+			0,
+			topLeft.height() - style::DevicePixelRatio(),
+			left * style::DevicePixelRatio(),
+			style::DevicePixelRatio()));
+	p.drawImage(
+		QRect(
+			inner.x() - left + width,
+			inner.y() - top,
+			left + inner.width() + right - 2 * width,
+			top),
+		topLeft,
+		QRect(
+			topLeft.width() - style::DevicePixelRatio(),
+			0,
+			style::DevicePixelRatio(),
+			top * style::DevicePixelRatio()));
+	p.drawImage(
+		QRect(
+			inner.x() + inner.width(),
+			inner.y() - top + height,
+			right,
+			top + inner.height() + bottom - 2 * height),
+		topRight,
+		QRect(
+			topRight.width() - right * style::DevicePixelRatio(),
+			topRight.height() - style::DevicePixelRatio(),
+			right * style::DevicePixelRatio(),
+			style::DevicePixelRatio()));
+	p.drawImage(
+		QRect(
+			inner.x() - left + width,
+			inner.y() + inner.height(),
+			left + inner.width() + right - 2 * width,
+			bottom),
+		bottomRight,
+		QRect(
+			0,
+			bottomRight.height() - bottom * style::DevicePixelRatio(),
+			style::DevicePixelRatio(),
+			bottom * style::DevicePixelRatio()));
+
 }
 
 } // namespace Theme

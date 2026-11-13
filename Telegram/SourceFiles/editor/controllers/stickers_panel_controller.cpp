@@ -9,21 +9,46 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 #include "chat_helpers/tabbed_panel.h"
 #include "chat_helpers/tabbed_selector.h"
+#include "window/window_session_controller.h" // Window::GifPauseReason
+
 #include "styles/style_chat_helpers.h"
+#include "styles/style_media_view.h"
 
 namespace Editor {
+namespace {
+
+// Works around MSVC 14.44 ICE on bitfields set in a member-init list.
+[[nodiscard]] ChatHelpers::ComposeFeatures PrepareFeatures(bool withAudio) {
+	return {
+		.megagroupSet = false,
+		.stickersSettings = false,
+		.openStickerSets = false,
+		.photoButton = true,
+		.audioButton = withAudio,
+		.linkButton = false,
+	};
+}
+
+} // namespace
 
 StickersPanelController::StickersPanelController(
 	not_null<Ui::RpWidget*> panelContainer,
-	not_null<Window::SessionController*> controller)
+	std::shared_ptr<ChatHelpers::Show> show,
+	bool withAudio)
 : _stickersPanel(
 	base::make_unique_q<ChatHelpers::TabbedPanel>(
 		panelContainer,
-		controller,
-		object_ptr<ChatHelpers::TabbedSelector>(
-			nullptr,
-			controller,
-			ChatHelpers::TabbedSelector::Mode::MediaEditor))) {
+		ChatHelpers::TabbedPanelDescriptor{
+			.ownedSelector = object_ptr<ChatHelpers::TabbedSelector>(
+				nullptr,
+				ChatHelpers::TabbedSelectorDescriptor{
+					.show = show,
+					.st = st::mediaviewEmojiPan,
+					.level = Window::GifPauseReason::Layer,
+					.mode = ChatHelpers::TabbedSelector::Mode::MediaEditor,
+					.features = PrepareFeatures(withAudio),
+				}),
+		})) {
 	_stickersPanel->setDesiredHeightValues(
 		1.,
 		st::emojiPanMinHeight / 2,
@@ -34,9 +59,21 @@ StickersPanelController::StickersPanelController(
 auto StickersPanelController::stickerChosen() const
 -> rpl::producer<not_null<DocumentData*>> {
 	return _stickersPanel->selector()->fileChosen(
-	) | rpl::map([](const ChatHelpers::TabbedSelector::FileChosen &data) {
+	) | rpl::map([](const ChatHelpers::FileChosen &data) {
 		return data.document;
 	});
+}
+
+rpl::producer<> StickersPanelController::photoRequests() const {
+	return _stickersPanel->selector()->photoRequests();
+}
+
+rpl::producer<> StickersPanelController::audioRequests() const {
+	return _stickersPanel->selector()->audioRequests();
+}
+
+rpl::producer<> StickersPanelController::linkRequests() const {
+	return _stickersPanel->selector()->linkRequests();
 }
 
 rpl::producer<bool> StickersPanelController::panelShown() const {
@@ -47,7 +84,7 @@ void StickersPanelController::setShowRequestChanges(
 		rpl::producer<ShowRequest> &&showRequest) {
 	std::move(
 		showRequest
-	) | rpl::start_with_next([=](ShowRequest show) {
+	) | rpl::on_next([=](ShowRequest show) {
 		if (show == ShowRequest::ToggleAnimated) {
 			_stickersPanel->toggleAnimated();
 			_stickersPanel->raise();
@@ -66,7 +103,7 @@ void StickersPanelController::setMoveRequestChanges(
 		rpl::producer<QPoint> &&moveRequest) {
 	std::move(
 		moveRequest
-	) | rpl::start_with_next([=](const QPoint &point) {
+	) | rpl::on_next([=](const QPoint &point) {
 		_stickersPanel->moveBottomRight(
 			point.y(),
 			point.x() + _stickersPanel->width() / 2);

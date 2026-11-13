@@ -12,6 +12,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "storage/cache/storage_cache_types.h"
 #include "storage/serialize_common.h"
 #include "data/data_file_origin.h"
+#include "data/data_location.h"
 #include "base/overload.h"
 #include "main/main_session.h"
 
@@ -34,6 +35,7 @@ enum class NonStorageLocationType : quint8 {
 	Geo,
 	Url,
 	Memory,
+	AudioAlbumThumb,
 };
 
 MTPInputPeer GenerateInputPeer(
@@ -171,6 +173,8 @@ StorageFileLocation::StorageFileLocation(
 		data.vcall().match([&](const MTPDinputGroupCall &data) {
 			_id = data.vid().v;
 			_accessHash = data.vaccess_hash().v;
+		}, [](const auto &data) {
+			Unexpected("slug/msg in inputGroupCallStream.");
 		});
 		_volumeId = data.vtime_ms().v;
 		_localId = data.vscale().v;
@@ -460,10 +464,14 @@ Storage::Cache::Key StorageFileLocation::cacheKey() const {
 	switch (_type) {
 	case Type::Legacy:
 	case Type::PeerPhoto:
-	case Type::StickerSetThumb:
 		return Key{
 			shifted | sliced | (uint64(uint32(_localId)) << 16),
 			_volumeId };
+
+	case Type::StickerSetThumb:
+		return Key{
+			shifted | sliced | (uint64(uint32(_localId)) << 16),
+			_id };
 
 	case Type::Encrypted:
 	case Type::Secure:
@@ -502,7 +510,7 @@ Storage::Cache::Key StorageFileLocation::bigFileBaseCacheKey() const {
 			| (_id >> 48);
 		const auto low = (_id << 16);
 
-		Ensures((low & 0xFFULL) == 0);
+		Ensures((low & 0x1FFULL) == 0);
 		return Storage::Cache::Key{ high, low };
 	}
 
@@ -510,8 +518,8 @@ Storage::Cache::Key StorageFileLocation::bigFileBaseCacheKey() const {
 		const auto high = (uint64(uint32(_localId)) << 24)
 			| ((uint64(_type) + 1) << 16)
 			| ((uint64(_dcId) & 0xFFULL) << 8)
-			| (_volumeId >> 56);
-		const auto low = (_volumeId << 8);
+			| (_id >> 56);
+		const auto low = (_id << 8);
 
 		Ensures((low & 0xFFULL) == 0);
 		return Storage::Cache::Key{ high, low };
@@ -694,8 +702,9 @@ InMemoryKey inMemoryKey(const WebFileLocation &location) {
 
 InMemoryKey inMemoryKey(const GeoPointLocation &location) {
 	return InMemoryKey(
-		(uint64(std::round(std::abs(location.lat + 360.) * 1000000)) << 32)
-		| uint64(std::round(std::abs(location.lon + 360.) * 1000000)),
+		(uint64(base::SafeRound(
+			std::abs(location.lat + 360.) * 1000000)) << 32)
+		| uint64(base::SafeRound(std::abs(location.lon + 360.) * 1000000)),
 		(uint64(location.width) << 32) | uint64(location.height));
 }
 
@@ -707,6 +716,11 @@ InMemoryKey inMemoryKey(const PlainUrlLocation &location) {
 		bytes::object_as_span(&result),
 		bytes::make_span(sha).subspan(0, sizeof(result)));
 	return result;
+}
+
+InMemoryKey inMemoryKey(const AudioAlbumThumbLocation &location) {
+	const auto key = Data::AudioAlbumThumbCacheKey(location);
+	return { key.high, key.low };
 }
 
 InMemoryKey inMemoryKey(const InMemoryLocation &location) {
@@ -780,7 +794,9 @@ std::optional<StorageImageLocation> StorageImageLocation::FromSerialized(
 }
 
 QByteArray DownloadLocation::serialize() const {
-	if (!valid() || v::is<StorageFileLocation>(data)) {
+	if (!valid()) {
+		return QByteArray();
+	} else if (v::is<StorageFileLocation>(data)) {
 		return v::get<StorageFileLocation>(data).serialize();
 	}
 	auto result = QByteArray();
@@ -807,6 +823,10 @@ QByteArray DownloadLocation::serialize() const {
 			<< qint32(data.height)
 			<< qint32(data.zoom)
 			<< qint32(data.scale);
+	}, [&](const AudioAlbumThumbLocation &data) {
+		stream
+			<< quint8(NonStorageLocationType::AudioAlbumThumb)
+			<< quint64(data.documentId);
 	}, [&](const PlainUrlLocation &data) {
 		stream << quint8(NonStorageLocationType::Url) << data.url.toUtf8();
 	}, [&](const InMemoryLocation &data) {
@@ -817,7 +837,9 @@ QByteArray DownloadLocation::serialize() const {
 }
 
 int DownloadLocation::serializeSize() const {
-	if (!valid() || v::is<StorageFileLocation>(data)) {
+	if (!valid()) {
+		return 0;
+	} else if (v::is<StorageFileLocation>(data)) {
 		return v::get<StorageFileLocation>(data).serializeSize();
 	}
 	auto result = sizeof(quint16) + sizeof(quint8) + sizeof(quint8);
@@ -829,6 +851,8 @@ int DownloadLocation::serializeSize() const {
 		result += 2 * sizeof(qreal) + sizeof(quint64) + 4 * sizeof(qint32);
 	}, [&](const PlainUrlLocation &data) {
 		result += Serialize::bytearraySize(data.url.toUtf8());
+	}, [&](const AudioAlbumThumbLocation &data) {
+		result += sizeof(quint64);
 	}, [&](const InMemoryLocation &data) {
 		result += Serialize::bytearraySize(data.bytes);
 	});
@@ -870,6 +894,9 @@ std::optional<DownloadLocation> DownloadLocation::FromSerialized(
 		qint32 zoom = 0;
 		qint32 scale = 0;
 		stream >> lat >> lon >> access >> width >> height >> zoom >> scale;
+		if (!Data::ValidGeoCoordinates(lat, lon)) {
+			return std::nullopt;
+		}
 		return (stream.status() == QDataStream::Ok)
 			? std::make_optional(
 				DownloadLocation{ GeoPointLocation{
@@ -880,6 +907,15 @@ std::optional<DownloadLocation> DownloadLocation::FromSerialized(
 					.height = height,
 					.zoom = zoom,
 					.scale = scale } })
+			: std::nullopt;
+	} break;
+
+	case NonStorageLocationType::AudioAlbumThumb: {
+		quint64 id = 0;
+		stream >> id;
+		return (stream.status() == QDataStream::Ok)
+			? std::make_optional(DownloadLocation{
+				AudioAlbumThumbLocation{ id } })
 			: std::nullopt;
 	} break;
 
@@ -919,7 +955,9 @@ DownloadLocation DownloadLocation::convertToModernPeerPhoto(
 
 Storage::Cache::Key DownloadLocation::cacheKey() const {
 	return v::match(data, [](const GeoPointLocation &data) {
-		return Data::GeoPointCacheKey(data);
+		return Data::ValidGeoCoordinates(data.lat, data.lon)
+			? Data::GeoPointCacheKey(data)
+			: Storage::Cache::Key();
 	}, [](const StorageFileLocation &data) {
 		return data.valid()
 			? data.cacheKey()
@@ -932,6 +970,8 @@ Storage::Cache::Key DownloadLocation::cacheKey() const {
 		return data.url.isEmpty()
 			? Storage::Cache::Key()
 			: Data::UrlCacheKey(data.url);
+	}, [](const AudioAlbumThumbLocation &data) {
+		return Data::AudioAlbumThumbCacheKey(data);
 	}, [](const InMemoryLocation &data) {
 		return Storage::Cache::Key();
 	});
@@ -945,13 +985,15 @@ Storage::Cache::Key DownloadLocation::bigFileBaseCacheKey() const {
 
 bool DownloadLocation::valid() const {
 	return v::match(data, [](const GeoPointLocation &data) {
-		return true;
+		return Data::ValidGeoCoordinates(data.lat, data.lon);
 	}, [](const StorageFileLocation &data) {
 		return data.valid();
 	}, [](const WebFileLocation &data) {
 		return !data.isNull();
 	}, [](const PlainUrlLocation &data) {
 		return !data.url.isEmpty();
+	}, [](const AudioAlbumThumbLocation &data) {
+		return data.documentId != 0;
 	}, [](const InMemoryLocation &data) {
 		return !data.bytes.isEmpty();
 	});

@@ -7,8 +7,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #pragma once
 
-#include "boxes/abstract_box.h"
-#include "styles/style_widgets.h"
+#include "ui/layers/box_content.h"
 
 namespace Countries {
 struct Info;
@@ -21,6 +20,7 @@ class RippleAnimation;
 
 class CountrySelectBox : public BoxContent {
 public:
+	class Inner;
 	enum class Type {
 		Phones,
 		Countries,
@@ -51,7 +51,6 @@ private:
 
 	object_ptr<MultiSelect> _select;
 
-	class Inner;
 	object_ptr<Inner> _ownedInner;
 	QPointer<Inner> _inner;
 

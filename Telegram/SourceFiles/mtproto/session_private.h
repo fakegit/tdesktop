@@ -13,7 +13,6 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "mtproto/mtproto_dc_options.h"
 #include "mtproto/connection_abstract.h"
 #include "mtproto/facade.h"
-#include "base/openssl_help.h"
 #include "base/timer.h"
 
 namespace MTP {
@@ -39,7 +38,6 @@ public:
 		ShiftedDcId shiftedDcId);
 	~SessionPrivate();
 
-	[[nodiscard]] int32 getShiftedDcId() const;
 	void dcOptionsChanged();
 	void cdnConfigChanged();
 
@@ -130,11 +128,16 @@ private:
 		const mtpPrime *from,
 		const mtpPrime *end,
 		uint64 msgId,
-		OuterInfo info);
+		OuterInfo info,
+		int &unpackedBudget,
+		int gzipDepth);
 	[[nodiscard]] HandleResult handleBindResponse(
 		mtpMsgId requestMsgId,
 		const mtpBuffer &response);
-	mtpBuffer ungzip(const mtpPrime *from, const mtpPrime *end) const;
+	mtpBuffer ungzip(
+		const mtpPrime *from,
+		const mtpPrime *end,
+		int sizeLimit) const;
 	void handleMsgsStates(const QVector<MTPlong> &ids, const QByteArray &states);
 
 	// _sessionDataMutex must be locked for read.
@@ -240,6 +243,8 @@ private:
 	crl::time _bindMessageSent = 0;
 
 };
+
+extern const char kOptionPreferIPv6[];
 
 } // namespace details
 } // namespace MTP

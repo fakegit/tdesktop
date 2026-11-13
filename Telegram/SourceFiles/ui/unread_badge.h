@@ -7,7 +7,12 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #pragma once
 
+#include "ui/text/text_custom_emoji.h"
 #include "ui/rp_widget.h"
+
+namespace style {
+struct VerifiedBadge;
+} // namespace style
 
 namespace Ui {
 
@@ -27,20 +32,90 @@ private:
 
 };
 
-struct PeerBadgeStyle {
-	const style::icon *verified = nullptr;
-	const style::color *scam = nullptr;
+struct BotVerifyDetails {
+	UserId botId = 0;
+	DocumentId iconId = 0;
+	TextWithEntities description;
+
+	explicit operator bool() const {
+		return iconId != 0;
+	}
+	friend inline bool operator==(
+		const BotVerifyDetails &,
+		const BotVerifyDetails &) = default;
 };
-int DrawPeerBadgeGetWidth(
-	not_null<PeerData*> peer,
-	Painter &p,
-	QRect rectForName,
-	int nameWidth,
-	int outerWidth,
-	const PeerBadgeStyle &st);
-QSize ScamBadgeSize(bool fake);
-void DrawScamBadge(
-	bool fake,
+
+[[nodiscard]] std::unique_ptr<Text::CustomEmoji> CreateBotVerifiedEmoji(
+	DocumentId iconId,
+	Text::CustomEmojiFactory factory,
+	Fn<void()> repaint);
+
+class PeerBadge {
+public:
+	PeerBadge();
+	~PeerBadge();
+
+	struct Descriptor {
+		not_null<PeerData*> peer;
+		QRect rectForName;
+		int nameWidth = 0;
+		int outerWidth = 0;
+		const style::icon *verified = nullptr;
+		const style::icon *premium = nullptr;
+		const style::color *scam = nullptr;
+		const style::color *direct = nullptr;
+		const style::color *premiumFg = nullptr;
+		Fn<void()> customEmojiRepaint;
+		crl::time now = 0;
+		bool prioritizeVerification = false;
+		bool bothVerifyAndStatus = false;
+		bool paused = false;
+	};
+	int drawGetWidth(Painter &p, Descriptor &&descriptor);
+	[[nodiscard]] QRect emojiStatusRect() const;
+	void paintEmojiStatusFrame(QPainter &p, crl::time now, bool paused);
+	void paintEmojiStatusFrame(
+		QPainter &p,
+		crl::time now,
+		bool paused,
+		QPoint position);
+	void unload();
+
+	[[nodiscard]] bool ready(const BotVerifyDetails *details) const;
+	void set(
+		not_null<const BotVerifyDetails*> details,
+		Text::CustomEmojiFactory factory,
+		Fn<void()> repaint);
+
+	// How much horizontal space the badge took.
+	int drawVerified(
+		QPainter &p,
+		QPoint position,
+		const style::VerifiedBadge &st);
+
+private:
+	struct EmojiStatus;
+	struct BotVerifiedData;
+
+	int drawTextBadge(Painter &p, const Descriptor &descriptor);
+	int drawVerifyCheck(Painter &p, const Descriptor &descriptor);
+	int drawPremiumEmojiStatus(Painter &p, const Descriptor &descriptor);
+	int drawPremiumStar(Painter &p, const Descriptor &descriptor);
+
+	std::unique_ptr<EmojiStatus> _emojiStatus;
+	mutable std::unique_ptr<BotVerifiedData> _botVerifiedData;
+
+};
+
+enum class TextBadgeType : uchar {
+	Scam,
+	Fake,
+	Direct,
+};
+
+QSize TextBadgeSize(TextBadgeType type);
+void DrawTextBadge(
+	TextBadgeType,
 	Painter &p,
 	QRect rect,
 	int outerWidth,

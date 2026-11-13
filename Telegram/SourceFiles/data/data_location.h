@@ -7,14 +7,24 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #pragma once
 
+#include <optional>
+
 namespace Data {
 
 struct FileOrigin;
 
+[[nodiscard]] bool ValidGeoCoordinates(float64 lat, float64 lon);
+
 class LocationPoint {
 public:
 	LocationPoint() = default;
-	explicit LocationPoint(const MTPDgeoPoint &point);
+
+	[[nodiscard]] static std::optional<LocationPoint> FromMTP(
+		const MTPGeoPoint &point);
+	[[nodiscard]] static std::optional<LocationPoint> FromCoordinates(
+		float64 lat,
+		float64 lon,
+		uint64 accessHash = 0);
 
 	[[nodiscard]] QString latAsString() const;
 	[[nodiscard]] QString lonAsString() const;
@@ -26,7 +36,6 @@ public:
 
 	[[nodiscard]] size_t hash() const;
 
-private:
 	friend inline bool operator==(
 			const LocationPoint &a,
 			const LocationPoint &b) {
@@ -38,6 +47,9 @@ private:
 			const LocationPoint &b) {
 		return (a._lat < b._lat) || ((a._lat == b._lat) && (a._lon < b._lon));
 	}
+
+private:
+	LocationPoint(float64 lat, float64 lon, uint64 accessHash);
 
 	float64 _lat = 0;
 	float64 _lon = 0;

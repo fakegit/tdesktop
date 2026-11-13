@@ -5,10 +5,10 @@ the official desktop application for the Telegram messaging service.
 For license and copyright information please follow this link:
 https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
+#define _GLIBCXX_USE_CXX11_ABI 0
 #include <cstdio>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <sys/sendfile.h>
 #include <cstdlib>
 #include <unistd.h>
 #include <dirent.h>
@@ -22,6 +22,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include <cstdarg>
 #include <ctime>
 #include <iostream>
+#include <memory>
 
 using std::string;
 using std::deque;
@@ -42,11 +43,13 @@ bool do_mkdir(const char *path) { // from http://stackoverflow.com/questions/675
 }
 
 bool _debug = false;
+bool writeprotected = false;
 string updaterDir;
 string updaterName;
 string workDir;
 string exeName;
 string exePath;
+string argv0;
 
 FILE *_logFile = 0;
 void openLog() {
@@ -88,68 +91,68 @@ void writeLog(const char *format, ...) {
 	va_end(args);
 }
 
-bool copyFile(const char *from, const char *to, bool writeprotected) {
-	FILE *ffrom = fopen(from, "rb"), *fto = fopen(to, "wb");
+bool copyFile(const char *from, const char *to) {
+	auto ffrom = std::unique_ptr<FILE, int(*)(FILE*)>(
+		fopen(from, "rb"),
+		fclose);
 	if (!ffrom) {
-		if (fto) fclose(fto);
+		writeLog("Failed to open source file '%s'", from);
 		return false;
 	}
+	auto fto = std::unique_ptr<FILE, int(*)(FILE*)>(
+		fopen(to, "wb"),
+		fclose);
 	if (!fto) {
-		fclose(ffrom);
+		writeLog("Failed to open destination file '%s'", to);
+		return false;
+	}
+	static const int BufSize = 65536;
+	char buf[BufSize];
+	while (const auto size = fread(buf, 1, BufSize, ffrom.get())) {
+		if (fwrite(buf, 1, size, fto.get()) != size) {
+			writeLog("Failed to write destination file '%s'", to);
+			return false;
+		}
+	}
+	if (ferror(ffrom.get())) {
+		writeLog("Failed to read source file '%s'", from);
+		return false;
+	}
+	if (ferror(fto.get())) {
+		writeLog("Write error in destination file '%s'", to);
+		return false;
+	}
+	if (fflush(fto.get()) != 0) {
+		writeLog("Failed to flush destination file '%s'", to);
 		return false;
 	}
 
 	struct stat fst; // from http://stackoverflow.com/questions/5486774/keeping-fileowner-and-permissions-after-copying-file-in-c
-	//let's say this wont fail since you already worked OK on that fp
-	if (fstat(fileno(ffrom), &fst) != 0) {
-		fclose(ffrom);
-		fclose(fto);
+	if (fstat(fileno(ffrom.get()), &fst) != 0) {
+		writeLog("Failed to stat source file '%s'", from);
 		return false;
 	}
-
-	ssize_t copied = sendfile(
-		fileno(fto),
-		fileno(ffrom),
-		nullptr,
-		fst.st_size);
-
-	if (copied == -1) {
-		writeLog(
-			"Copy by sendfile '%s' to '%s' failed, error: %d, fallback now.",
-			from,
-			to,
-			int(errno));
-		static const int BufSize = 65536;
-		char buf[BufSize];
-		while (size_t size = fread(buf, 1, BufSize, ffrom)) {
-			fwrite(buf, 1, size, fto);
-		}
-	} else {
-		writeLog(
-			"Copy by sendfile '%s' to '%s' done, size: %d, result: %d.",
-			from,
-			to,
-			int(fst.st_size),
-			int(copied));
-	}
-
 	//update to the same uid/gid
-	if (!writeprotected && fchown(fileno(fto), fst.st_uid, fst.st_gid) != 0) {
-		fclose(ffrom);
-		fclose(fto);
+	if (!writeprotected
+		&& fchown(fileno(fto.get()), fst.st_uid, fst.st_gid) != 0) {
+		writeLog("Failed to set owner of destination file '%s'", to);
 		return false;
 	}
 	//update the permissions
-	if (fchmod(fileno(fto), fst.st_mode) != 0) {
-		fclose(ffrom);
-		fclose(fto);
+	if (fchmod(fileno(fto.get()), fst.st_mode) != 0) {
+		writeLog("Failed to set permissions of destination file '%s'", to);
 		return false;
 	}
 
-	fclose(ffrom);
-	fclose(fto);
-
-	return true;
+	const auto fromClosed = (fclose(ffrom.release()) == 0);
+	const auto toClosed = (fclose(fto.release()) == 0);
+	if (!fromClosed) {
+		writeLog("Failed to close source file '%s'", from);
+	}
+	if (!toClosed) {
+		writeLog("Failed to close destination file '%s'", to);
+	}
+	return fromClosed && toClosed;
 }
 
 bool remove_directory(const string &path) { // from http://stackoverflow.com/questions/2256945/removing-a-non-empty-directory-programmatically-in-c-or-c
@@ -233,7 +236,7 @@ void delFolder() {
 	rmdir(delFolder.c_str());
 }
 
-bool update(bool writeprotected) {
+bool update() {
 	writeLog("Update started..");
 
 	string updDir = workDir + "tupdates/temp", readyFilePath = workDir + "tupdates/temp/ready", tdataDir = workDir + "tupdates/temp/tdata";
@@ -346,7 +349,7 @@ bool update(bool writeprotected) {
 		writeLog("Copying file '%s' to '%s'..", fname.c_str(), tofname.c_str());
 		int copyTries = 0, triesLimit = 30;
 		do {
-			if (!copyFile(fname.c_str(), tofname.c_str(), writeprotected)) {
+			if (!copyFile(fname.c_str(), tofname.c_str())) {
 				++copyTries;
 				usleep(100000);
 			} else {
@@ -354,7 +357,7 @@ bool update(bool writeprotected) {
 			}
 		} while (copyTries < triesLimit);
 		if (copyTries == triesLimit) {
-			writeLog("Error: failed to copy, asking to retry..");
+			writeLog("Error: failed to copy after %d attempts.", triesLimit);
 			delFolder();
 			return false;
 		}
@@ -381,10 +384,10 @@ int main(int argc, char *argv[]) {
 	bool needupdate = true;
 	bool autostart = false;
 	bool debug = false;
-	bool writeprotected = false;
 	bool tosettings = false;
 	bool startintray = false;
 	bool customWorkingDir = false;
+	bool justUpdate = false;
 
 	char *key = 0;
 	char *workdir = 0;
@@ -403,6 +406,9 @@ int main(int argc, char *argv[]) {
 			customWorkingDir = true;
 		} else if (equal(argv[i], "-writeprotected")) {
 			writeprotected = true;
+			justUpdate = true;
+		} else if (equal(argv[i], "-justupdate")) {
+			justUpdate = true;
 		} else if (equal(argv[i], "-key") && ++i < argc) {
 			key = argv[i];
 		} else if (equal(argv[i], "-workpath") && ++i < argc) {
@@ -411,6 +417,8 @@ int main(int argc, char *argv[]) {
 			exeName = argv[i];
 		} else if (equal(argv[i], "-exepath") && ++i < argc) {
 			exePath = argv[i];
+		} else if (equal(argv[i], "-argv0") && ++i < argc) {
+			argv0 = argv[i];
 		}
 	}
 	if (exeName.empty() || exeName.find('/') != string::npos) {
@@ -475,7 +483,12 @@ int main(int argc, char *argv[]) {
 				} else {
 					writeLog("Passed workpath is '%s'", workDir.c_str());
 				}
-				update(writeprotected);
+				if (!update()) {
+					writeLog("Update installation failed.");
+					fprintf(stderr, "Update installation failed.\n");
+					closeLog();
+					return 1;
+				}
 			}
 		} else {
 			writeLog("Error: bad exe name!");
@@ -484,49 +497,51 @@ int main(int argc, char *argv[]) {
 		writeLog("Error: short exe name!");
 	}
 
-	auto fullBinaryPath = exePath + exeName;
-	const auto path = fullBinaryPath.c_str();
-
-	auto values = vector<string>();
-	const auto push = [&](string arg) {
-		// Force null-terminated .data() call result.
-		values.push_back(arg + char(0));
-	};
-	push(path);
-	push("-noupdate");
-	if (autostart) push("-autostart");
-	if (debug) push("-debug");
-	if (startintray) push("-startintray");
-	if (tosettings) push("-tosettings");
-	if (key) {
-		push("-key");
-		push(key);
-	}
-	if (customWorkingDir && workdir) {
-		push("-workdir");
-		push(workdir);
-	}
-
-	auto args = vector<char*>();
-	for (auto &arg : values) {
-		args.push_back(arg.data());
-	}
-	args.push_back(nullptr);
-
 	// let the parent launch instead
-	if (!writeprotected) {
+	if (justUpdate) {
+		writeLog("Closing log and quitting..");
+	} else {
+		const auto fullBinaryPath = exePath + exeName;
+
+		auto values = vector<string>();
+		const auto push = [&](string arg) {
+			// Force null-terminated .data() call result.
+			values.push_back(arg + char(0));
+		};
+		push(!argv0.empty() ? argv0 : fullBinaryPath);
+		push("-noupdate");
+		if (autostart) push("-autostart");
+		if (debug) push("-debug");
+		if (startintray) push("-startintray");
+		if (tosettings) push("-tosettings");
+		if (key) {
+			push("-key");
+			push(key);
+		}
+		if (customWorkingDir && workdir) {
+			push("-workdir");
+			push(workdir);
+		}
+
+		auto args = vector<char*>();
+		for (auto &arg : values) {
+			args.push_back(arg.data());
+		}
+		args.push_back(nullptr);
+
 		pid_t pid = fork();
 		switch (pid) {
 		case -1:
 			writeLog("fork() failed!");
 			return 1;
 		case 0:
-			execv(args[0], args.data());
+			execv(fullBinaryPath.c_str(), args.data());
 			return 1;
 		}
+
+		writeLog("Executed Telegram, closing log and quitting..");
 	}
 
-	writeLog("Executed Telegram, closing log and quitting..");
 	closeLog();
 
 	return 0;

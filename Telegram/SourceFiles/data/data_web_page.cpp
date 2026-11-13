@@ -14,28 +14,16 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "data/data_photo.h"
 #include "data/data_channel.h"
 #include "data/data_document.h"
-#include "base/qt_adapters.h"
+#include "data/data_star_gift.h"
+#include "core/local_url_handlers.h"
+#include "lang/lang_keys.h"
+#include "iv/iv_data.h"
 #include "ui/image/image.h"
 #include "ui/text/text_entity.h"
 
 namespace {
 
-QString SiteNameFromUrl(const QString &url) {
-	QUrl u(url);
-	QString pretty = u.isValid() ? u.toDisplayString() : url;
-	QRegularExpressionMatch m = QRegularExpression(qsl("^[a-zA-Z0-9]+://")).match(pretty);
-	if (m.hasMatch()) pretty = pretty.mid(m.capturedLength());
-	int32 slash = pretty.indexOf('/');
-	if (slash > 0) pretty = pretty.mid(0, slash);
-	QStringList components = pretty.split('.', base::QStringSkipEmptyParts);
-	if (components.size() >= 2) {
-		components = components.mid(components.size() - 2);
-		return components.at(0).at(0).toUpper() + components.at(0).mid(1) + '.' + components.at(1);
-	}
-	return QString();
-}
-
-WebPageCollage ExtractCollage(
+[[nodiscard]] WebPageCollage ExtractCollage(
 		not_null<Data::Session*> owner,
 		const QVector<MTPPageBlock> &items,
 		const QVector<MTPPhoto> &photos,
@@ -71,7 +59,8 @@ WebPageCollage ExtractCollage(
 			return true;
 		}, [&](const MTPDpageBlockVideo &data) {
 			const auto document = owner->document(data.vvideo_id().v);
-			if (!document->isVideoFile()) {
+			if (document->isVideoMessage()
+				|| (!document->isVideoFile() && !document->isAnimation())) {
 				return false;
 			}
 			result.items.emplace_back(document);
@@ -134,23 +123,128 @@ WebPageCollage ExtractCollage(
 
 } // namespace
 
-WebPageType ParseWebPageType(const MTPDwebPage &page) {
-	const auto type = qs(page.vtype().value_or_empty());
-	if (type == qstr("video") || page.vembed_url()) {
+WebPageType ParseWebPageType(
+		const QString &type,
+		const QString &embedUrl,
+		bool hasIV) {
+	if (type == u"video"_q || type == u"gif"_q || !embedUrl.isEmpty()) {
 		return WebPageType::Video;
-	} else if (type == qstr("photo")) {
+	} else if (type == u"photo"_q) {
 		return WebPageType::Photo;
-	} else if (type == qstr("profile")) {
+	} else if (type == u"document"_q) {
+		return WebPageType::Document;
+	} else if (type == u"profile"_q) {
 		return WebPageType::Profile;
-	} else if (type == qstr("telegram_background")) {
+	} else if (type == u"telegram_background"_q) {
 		return WebPageType::WallPaper;
-	} else if (type == qstr("telegram_theme")) {
+	} else if (type == u"telegram_theme"_q) {
 		return WebPageType::Theme;
-	} else if (page.vcached_page()) {
+	} else if (type == u"telegram_story"_q) {
+		return WebPageType::Story;
+	} else if (type == u"telegram_channel"_q) {
+		return WebPageType::Channel;
+	} else if (type == u"telegram_channel_request"_q) {
+		return WebPageType::ChannelWithRequest;
+	} else if (type == u"telegram_megagroup"_q
+		|| type == u"telegram_chat"_q) {
+		return WebPageType::Group;
+	} else if (type == u"telegram_megagroup_request"_q
+		|| type == u"telegram_chat_request"_q) {
+		return WebPageType::GroupWithRequest;
+	} else if (type == u"telegram_album"_q) {
+		return WebPageType::Album;
+	} else if (type == u"telegram_message"_q) {
+		return WebPageType::Message;
+	} else if (type == u"telegram_bot"_q) {
+		return WebPageType::Bot;
+	} else if (type == u"telegram_voicechat"_q) {
+		return WebPageType::VoiceChat;
+	} else if (type == u"telegram_livestream"_q) {
+		return WebPageType::Livestream;
+	} else if (type == u"telegram_call"_q) {
+		return WebPageType::ConferenceCall;
+	} else if (type == u"telegram_user"_q) {
+		return WebPageType::User;
+	} else if (type == u"telegram_botapp"_q) {
+		return WebPageType::BotApp;
+	} else if (type == u"telegram_channel_boost"_q) {
+		return WebPageType::ChannelBoost;
+	} else if (type == u"telegram_group_boost"_q) {
+		return WebPageType::GroupBoost;
+	} else if (type == u"telegram_giftcode"_q) {
+		return WebPageType::Giftcode;
+	} else if (type == u"telegram_stickerset"_q) {
+		return WebPageType::StickerSet;
+	} else if (type == u"telegram_story_album"_q) {
+		return WebPageType::StoryAlbum;
+	} else if (type == u"telegram_collection"_q) {
+		return WebPageType::GiftCollection;
+	} else if (type == u"telegram_auction"_q) {
+		return WebPageType::Auction;
+	} else if (type == u"telegram_newbot"_q) {
+		return WebPageType::NewBot;
+	} else if (type == u"telegram_aicomposetone"_q) {
+		return WebPageType::ComposeAiTone;
+	} else if (hasIV) {
 		return WebPageType::ArticleWithIV;
 	} else {
 		return WebPageType::Article;
 	}
+}
+
+bool IgnoreIv(WebPageType type) {
+	return (type == WebPageType::Message)
+		|| (type == WebPageType::Album);
+}
+
+WebPageType ParseWebPageType(const MTPDwebPage &page) {
+	return ParseWebPageType(
+		qs(page.vtype().value_or_empty()),
+		page.vembed_url().value_or_empty(),
+		!!page.vcached_page());
+}
+
+namespace {
+
+[[nodiscard]] QString SimplifyUrl(const QString &url) {
+	auto result = url.split('#')[0].toLower();
+	if (result.endsWith('/')) {
+		result.chop(1);
+	}
+	const auto prefixes = { u"http://"_q, u"https://"_q };
+	for (const auto &prefix : prefixes) {
+		if (result.startsWith(prefix)) {
+			result = result.mid(prefix.size());
+			break;
+		}
+	}
+	return result;
+}
+
+} // namespace
+
+QString ExtractHash(
+		not_null<WebPageData*> webpage,
+		const TextWithEntities &text) {
+	const auto simplified = SimplifyUrl(webpage->url);
+	for (const auto &entity : text.entities) {
+		const auto link = (entity.type() == EntityType::Url)
+			? text.text.mid(entity.offset(), entity.length())
+			: (entity.type() == EntityType::CustomUrl)
+			? entity.data()
+			: QString();
+		if (SimplifyUrl(link) == simplified) {
+			const auto i = link.indexOf('#');
+			return (i > 0) ? link.mid(i + 1) : QString();
+		}
+	}
+	return QString();
+}
+
+bool UrlMatchesWebPage(
+		not_null<WebPageData*> webpage,
+		const QString &url) {
+	return SimplifyUrl(url) == SimplifyUrl(webpage->url);
 }
 
 WebPageCollage::WebPageCollage(
@@ -163,6 +257,8 @@ WebPageData::WebPageData(not_null<Data::Session*> owner, const WebPageId &id)
 : id(id)
 , _owner(owner) {
 }
+
+WebPageData::~WebPageData() = default;
 
 Data::Session &WebPageData::owner() const {
 	return *_owner;
@@ -179,28 +275,33 @@ bool WebPageData::applyChanges(
 		const QString &newSiteName,
 		const QString &newTitle,
 		const TextWithEntities &newDescription,
+		FullStoryId newStoryId,
 		PhotoData *newPhoto,
 		DocumentData *newDocument,
 		WebPageCollage &&newCollage,
+		std::unique_ptr<Iv::Data> newIv,
+		std::unique_ptr<WebPageStickerSet> newStickerSet,
+		std::shared_ptr<Data::UniqueGift> newUniqueGift,
+		std::unique_ptr<WebPageAuction> newAuction,
+		DocumentId newComposeToneEmojiId,
 		int newDuration,
 		const QString &newAuthor,
+		bool newHasLargeMedia,
+		bool newPhotoIsVideoCover,
 		int newPendingTill) {
 	if (newPendingTill != 0
-		&& (!url.isEmpty() || pendingTill < 0)
+		&& (!url.isEmpty() || failed)
 		&& (!pendingTill
 			|| pendingTill == newPendingTill
 			|| newPendingTill < -1)) {
 		return false;
 	}
 
-	const auto resultUrl = TextUtilities::Clean(newUrl);
-	const auto resultDisplayUrl = TextUtilities::Clean(
-		newDisplayUrl);
-	const auto possibleSiteName = TextUtilities::Clean(
-		newSiteName);
-	const auto resultTitle = TextUtilities::SingleLine(
-		newTitle);
-	const auto resultAuthor = TextUtilities::Clean(newAuthor);
+	const auto resultUrl = newUrl;
+	const auto resultDisplayUrl = newDisplayUrl;
+	const auto possibleSiteName = newSiteName;
+	const auto resultTitle = TextUtilities::SingleLine(newTitle);
+	const auto resultAuthor = newAuthor;
 
 	const auto viewTitleText = resultTitle.isEmpty()
 		? TextUtilities::SingleLine(resultAuthor)
@@ -211,10 +312,25 @@ bool WebPageData::applyChanges(
 		} else if (!newDescription.text.isEmpty()
 			&& viewTitleText.isEmpty()
 			&& !resultUrl.isEmpty()) {
-			return SiteNameFromUrl(resultUrl);
+			return Iv::SiteNameFromUrl(resultUrl);
 		}
 		return QString();
 	}();
+	const auto hasSiteName = !resultSiteName.isEmpty() ? 1 : 0;
+	const auto hasTitle = !resultTitle.isEmpty() ? 1 : 0;
+	const auto hasDescription = !newDescription.text.isEmpty() ? 1 : 0;
+	const auto allowLargeMediaDocument = newDocument
+		&& newDocument->isVideoFile()
+		&& newPhoto;
+	if ((!allowLargeMediaDocument && newDocument)
+		|| !newCollage.items.empty()
+		|| !newPhoto
+		|| (hasSiteName + hasTitle + hasDescription < 2)) {
+		newHasLargeMedia = false;
+	}
+	if (!newDocument || !newDocument->isVideoFile() || !newPhoto) {
+		newPhotoIsVideoCover = false;
+	}
 
 	if (type == newType
 		&& url == resultUrl
@@ -222,11 +338,21 @@ bool WebPageData::applyChanges(
 		&& siteName == resultSiteName
 		&& title == resultTitle
 		&& description.text == newDescription.text
+		&& storyId == newStoryId
 		&& photo == newPhoto
 		&& document == newDocument
 		&& collage.items == newCollage.items
+		&& (!iv == !newIv)
+		&& (!iv || (iv->partial() == newIv->partial()
+			&& iv->hash() == newIv->hash()))
+		&& (!stickerSet == !newStickerSet)
+		&& (!uniqueGift == !newUniqueGift)
+		&& (!auction == !newAuction)
+		&& composeToneEmojiId == newComposeToneEmojiId
 		&& duration == newDuration
 		&& author == resultAuthor
+		&& hasLargeMedia == (newHasLargeMedia ? 1 : 0)
+		&& photoIsVideoCover == (newPhotoIsVideoCover ? 1 : 0)
 		&& pendingTill == newPendingTill) {
 		return false;
 	}
@@ -234,14 +360,22 @@ bool WebPageData::applyChanges(
 		_owner->session().api().clearWebPageRequest(this);
 	}
 	type = newType;
+	hasLargeMedia = newHasLargeMedia ? 1 : 0;
+	photoIsVideoCover = newPhotoIsVideoCover ? 1 : 0;
 	url = resultUrl;
 	displayUrl = resultDisplayUrl;
 	siteName = resultSiteName;
 	title = resultTitle;
 	description = newDescription;
+	storyId = newStoryId;
 	photo = newPhoto;
 	document = newDocument;
 	collage = std::move(newCollage);
+	iv = std::move(newIv);
+	stickerSet = std::move(newStickerSet);
+	uniqueGift = std::move(newUniqueGift);
+	auction = std::move(newAuction);
+	composeToneEmojiId = newComposeToneEmojiId;
 	duration = newDuration;
 	author = resultAuthor;
 	pendingTill = newPendingTill;
@@ -266,16 +400,6 @@ void WebPageData::ApplyChanges(
 		not_null<Main::Session*> session,
 		ChannelData *channel,
 		const MTPmessages_Messages &result) {
-	result.match([&](
-			const MTPDmessages_channelMessages &data) {
-		if (channel) {
-			channel->ptsReceived(data.vpts().v);
-		} else {
-			LOG(("API Error: received messages.channelMessages "
-				"when no channel was passed! (WebPageData::ApplyChanges)"));
-		}
-	}, [&](const auto &) {
-	});
 	const auto list = result.match([](
 			const MTPDmessages_messagesNotModified &) {
 		LOG(("API Error: received messages.messagesNotModified! "
@@ -285,6 +409,24 @@ void WebPageData::ApplyChanges(
 		session->data().processUsers(data.vusers());
 		session->data().processChats(data.vchats());
 		return &data.vmessages().v;
+	});
+	result.match([&](
+			const MTPDmessages_channelMessages &data) {
+		if (channel) {
+			channel->ptsReceived(data.vpts().v);
+			channel->processTopics(data.vtopics());
+		} else {
+			LOG(("API Error: received messages.channelMessages "
+				"when no channel was passed! (WebPageData::ApplyChanges)"));
+		}
+	}, [&](const auto &) {
+	});
+	result.match([](
+			const MTPDmessages_messagesNotModified &) {
+	}, [&](const auto &data) {
+		if (channel) {
+			channel->processTopics(data.vtopics());
+		}
 	});
 	if (!list) {
 		return;
@@ -301,5 +443,60 @@ void WebPageData::ApplyChanges(
 		}, [&](const auto &) {
 		});
 	}
-	session->data().sendWebPageGamePollNotifications();
+	session->data().sendWebPageGamePollTodoListNotifications();
+}
+
+QString WebPageData::displayedSiteName() const {
+	return (document && document->isWallPaper())
+		? tr::lng_media_chat_background(tr::now)
+		: (document && document->isTheme())
+		? tr::lng_media_color_theme(tr::now)
+		: siteName;
+}
+
+TimeId WebPageData::extractVideoTimestamp() const {
+	const auto take = [&](const QStringList &list, int index) {
+		return (index >= 0 && index < list.size()) ? list[index] : QString();
+	};
+	const auto hashed = take(url.split('#'), 0);
+	const auto params = take(hashed.split('?'), 1);
+	const auto parts = params.split('&');
+	for (const auto &part : parts) {
+		if (part.startsWith(u"t="_q)) {
+			return Core::ParseVideoTimestamp(part.mid(2));
+		}
+	}
+	return 0;
+}
+
+bool WebPageData::computeDefaultSmallMedia() const {
+	if (!collage.items.empty()) {
+		return false;
+	} else if (siteName.isEmpty()
+		&& title.isEmpty()
+		&& description.empty()
+		&& author.isEmpty()) {
+		return false;
+	} else if (!uniqueGift
+		&& !document
+		&& photo
+		&& type != WebPageType::Photo
+		&& type != WebPageType::Document
+		&& type != WebPageType::Story
+		&& type != WebPageType::Video) {
+		if (type == WebPageType::Profile) {
+			return true;
+		} else if (siteName == u"Twitter"_q
+			|| siteName == u"Facebook"_q
+			|| type == WebPageType::ArticleWithIV) {
+			return false;
+		} else {
+			return true;
+		}
+	}
+	return false;
+}
+
+bool WebPageData::suggestEnlargePhoto() const {
+	return !siteName.isEmpty() || !title.isEmpty() || !description.empty();
 }

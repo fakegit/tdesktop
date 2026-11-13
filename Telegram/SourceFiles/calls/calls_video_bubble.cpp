@@ -10,8 +10,6 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "webrtc/webrtc_video_track.h"
 #include "ui/image/image_prepare.h"
 #include "ui/widgets/shadow.h"
-#include "styles/style_calls.h"
-#include "styles/style_widgets.h"
 #include "styles/style_layers.h"
 
 namespace Calls {
@@ -30,17 +28,17 @@ void VideoBubble::setup() {
 	applyDragMode(_dragMode);
 
 	_content.paintRequest(
-	) | rpl::start_with_next([=] {
+	) | rpl::on_next([=] {
 		paint();
 	}, lifetime());
 
 	_track->stateValue(
-	) | rpl::start_with_next([=](Webrtc::VideoState state) {
+	) | rpl::on_next([=](Webrtc::VideoState state) {
 		setState(state);
 	}, lifetime());
 
 	_track->renderNextFrame(
-	) | rpl::start_with_next([=] {
+	) | rpl::on_next([=] {
 		if (_track->frameSize().isEmpty()) {
 			_track->markFrameShown();
 		} else {
@@ -119,20 +117,21 @@ void VideoBubble::applySizeConstraints(QSize min, QSize max) {
 }
 
 void VideoBubble::paint() {
-	Painter p(&_content);
+	auto p = QPainter(&_content);
 
 	prepareFrame();
 	if (!_frame.isNull()) {
 		const auto padding = st::boxRoundShadow.extend;
 		const auto inner = _content.rect().marginsRemoved(padding);
 		Ui::Shadow::paint(p, inner, _content.width(), st::boxRoundShadow);
-		const auto factor = cIntRetinaFactor();
+		const auto factor = style::DevicePixelRatio();
+		const auto left = _mirrored
+			? (_frame.width() - (inner.width() * factor))
+			: 0;
 		p.drawImage(
 			inner,
 			_frame,
-			QRect(
-				QPoint(_frame.width() - (inner.width() * factor), 0),
-				inner.size() * factor));
+			QRect(QPoint(left, 0), inner.size() * factor));
 	}
 	_track->markFrameShown();
 }
@@ -144,8 +143,8 @@ void VideoBubble::prepareFrame() {
 		return;
 	}
 	const auto padding = st::boxRoundShadow.extend;
-	const auto size = _content.rect().marginsRemoved(padding).size()
-		* cIntRetinaFactor();
+	const auto size = (_content.rect() - padding).size()
+		* style::DevicePixelRatio();
 
 	// Should we check 'original' and 'size' aspect ratios?..
 	const auto request = Webrtc::FrameRequest{
@@ -154,27 +153,26 @@ void VideoBubble::prepareFrame() {
 	};
 	const auto frame = _track->frame(request);
 	if (_frame.width() < size.width() || _frame.height() < size.height()) {
-		_frame = QImage(
-			size * cIntRetinaFactor(),
-			QImage::Format_ARGB32_Premultiplied);
+		_frame = QImage(size, QImage::Format_ARGB32_Premultiplied);
+		_frame.fill(Qt::transparent);
 	}
 	Assert(_frame.width() >= frame.width()
 		&& _frame.height() >= frame.height());
-	const auto toPerLine = _frame.bytesPerLine();
-	const auto fromPerLine = frame.bytesPerLine();
+	const auto dstPerLine = _frame.bytesPerLine();
+	const auto srcPerLine = frame.bytesPerLine();
 	const auto lineSize = frame.width() * 4;
-	auto to = _frame.bits();
-	auto from = frame.bits();
-	const auto till = from + frame.height() * fromPerLine;
-	for (; from != till; from += fromPerLine, to += toPerLine) {
-		memcpy(to, from, lineSize);
+	auto dst = _frame.bits();
+	auto src = frame.bits();
+	const auto till = src + frame.height() * srcPerLine;
+	for (; src != till; src += srcPerLine, dst += dstPerLine) {
+		memcpy(dst, src, lineSize);
 	}
-	Images::prepareRound(
-		_frame,
+	_frame = Images::Round(
+		std::move(_frame),
 		ImageRoundRadius::Large,
 		RectPart::AllCorners,
-		QRect(QPoint(), size));
-	_frame = std::move(_frame).mirrored(true, false);
+		QRect(QPoint(), size)
+	).mirrored(_mirrored, false);
 }
 
 void VideoBubble::setState(Webrtc::VideoState state) {
@@ -209,7 +207,7 @@ void VideoBubble::updateSizeToFrame(QSize frame) {
 		size = frame.scaled((_min + _max) / 2, Qt::KeepAspectRatio);
 	} else {
 		const auto area = size.width() * size.height();
-		const auto w = int(std::round(std::max(
+		const auto w = int(base::SafeRound(std::max(
 			std::sqrt((frame.width() * float64(area)) / (frame.height() * 1.)),
 			1.)));
 		const auto h = area / w;

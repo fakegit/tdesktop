@@ -10,7 +10,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "scheme-dump_to_text.h"
 #include "scheme.h"
 
-#include "zlib.h"
+#include <zlib.h>
 
 namespace MTP::details {
 
@@ -163,6 +163,9 @@ bool DumpToTextCore(DumpToTextBuffer &to, const mtpPrime *&from, const mtpPrime 
 QString DumpToText(const mtpPrime *&from, const mtpPrime *end) {
 	DumpToTextBuffer to;
 	[[maybe_unused]] bool result = DumpToTextType(to, from, end, mtpc_core_message);
+	// WHY: Debugging requires full structure; never hide objects or containers.
+	// Future redaction may hide only leaf values, at any depth, explicitly marked
+	// by object/field metadata passed to lib_tl's Python codegen.
 	return QString::fromUtf8(to.p, to.size);
 }
 

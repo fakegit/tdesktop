@@ -8,11 +8,12 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "passport/passport_encryption.h"
 
 #include "base/openssl_help.h"
+#include "base/random.h"
 #include "mtproto/details/mtproto_rsa_public_key.h"
 
 #include <QtCore/QJsonDocument>
-#include <QtCore/QJsonArray>
 #include <QtCore/QJsonObject>
+#include <QtCore/QtEndian>
 
 namespace Passport {
 namespace {
@@ -108,7 +109,7 @@ bool CheckSecretBytes(bytes::const_span secret) {
 
 bytes::vector GenerateSecretBytes() {
 	auto result = bytes::vector(kSecretSize);
-	memset_rand(result.data(), result.size());
+	bytes::set_random(result);
 	const auto full = ranges::accumulate(
 		result,
 		0ULL,
@@ -252,78 +253,6 @@ std::map<QString, QString> DeserializeData(bytes::const_span bytes) {
 	return result;
 }
 
-std::vector<DataError> DeserializeErrors(bytes::const_span json) {
-	const auto serialized = QByteArray::fromRawData(
-		reinterpret_cast<const char*>(json.data()),
-		json.size());
-	auto error = QJsonParseError();
-	auto document = QJsonDocument::fromJson(serialized, &error);
-	if (error.error != QJsonParseError::NoError) {
-		LOG(("API Error: Could not deserialize errors JSON, error %1"
-			).arg(error.errorString()));
-		return {};
-	} else if (!document.isArray()) {
-		LOG(("API Error: Errors JSON root is not an array."));
-		return {};
-	}
-	auto array = document.array();
-	auto result = std::vector<DataError>();
-	for (const auto error : array) {
-		if (!error.isObject()) {
-			LOG(("API Error: Not an object inside errors JSON."));
-			continue;
-		}
-		auto fields = error.toObject();
-		const auto typeIt = fields.constFind("type");
-		if (typeIt == fields.constEnd()) {
-			LOG(("API Error: type was not found in an error."));
-			continue;
-		} else if (!(*typeIt).isString()) {
-			LOG(("API Error: type was not a string in an error."));
-			continue;
-		}
-		const auto descriptionIt = fields.constFind("description");
-		if (descriptionIt == fields.constEnd()) {
-			LOG(("API Error: description was not found in an error."));
-			continue;
-		} else if (!(*typeIt).isString()) {
-			LOG(("API Error: description was not a string in an error."));
-			continue;
-		}
-		const auto targetIt = fields.constFind("target");
-		if (targetIt == fields.constEnd()) {
-			LOG(("API Error: target aws not found in an error."));
-			continue;
-		} else if (!(*targetIt).isString()) {
-			LOG(("API Error: target was not as string in an error."));
-			continue;
-		}
-		auto next = DataError();
-		next.type = (*typeIt).toString();
-		next.text = (*descriptionIt).toString();
-		const auto fieldIt = fields.constFind("field");
-		const auto fileHashIt = fields.constFind("file_hash");
-		if (fieldIt != fields.constEnd()) {
-			if (!(*fieldIt).isString()) {
-				LOG(("API Error: field was not a string in an error."));
-				continue;
-			}
-			next.key = (*fieldIt).toString();
-		} else if (fileHashIt != fields.constEnd()) {
-			if (!(*fileHashIt).isString()) {
-				LOG(("API Error: file_hash was not a string in an error."));
-				continue;
-			}
-			next.key = QByteArray::fromBase64(
-				(*fileHashIt).toString().toUtf8());
-		} else if ((*targetIt).toString() == "selfie") {
-			next.key = QByteArray();
-		}
-		result.push_back(std::move(next));
-	}
-	return result;
-}
-
 EncryptedData EncryptData(bytes::const_span bytes) {
 	return EncryptData(bytes, GenerateSecretBytes());
 }
@@ -334,7 +263,7 @@ EncryptedData EncryptData(
 	constexpr auto kFromPadding = kMinPadding + kAlignTo - 1;
 	constexpr auto kPaddingDelta = kMaxPadding - kFromPadding;
 	const auto randomPadding = kFromPadding
-		+ (openssl::RandomValue<uint32>() % kPaddingDelta);
+		+ (base::RandomValue<uint32>() % kPaddingDelta);
 	const auto padding = randomPadding
 		- ((bytes.size() + randomPadding) % kAlignTo);
 	Assert(padding >= kMinPadding && padding <= kMaxPadding);
@@ -343,7 +272,7 @@ EncryptedData EncryptData(
 	Assert(unencrypted.size() % kAlignTo == 0);
 
 	unencrypted[0] = static_cast<gsl::byte>(padding);
-	memset_rand(unencrypted.data() + 1, padding - 1);
+	base::RandomFill(unencrypted.data() + 1, padding - 1);
 	bytes::copy(
 		gsl::make_span(unencrypted).subspan(padding),
 		bytes);
@@ -373,6 +302,9 @@ bytes::vector DecryptData(
 	} else if (dataSecret.size() != kSecretSize) {
 		LOG(("API Error: Bad data secret size %1").arg(dataSecret.size()));
 		return {};
+	} else if ((encrypted.size() % kAlignTo) != 0) {
+		LOG(("API Error: Bad encrypted size %1").arg(encrypted.size()));
+		return {};
 	}
 
 	const auto bytesForEncryptionKey = bytes::concatenate(
@@ -393,12 +325,6 @@ bytes::vector DecryptData(
 	}
 	const auto bytes = gsl::make_span(decrypted).subspan(padding);
 	return { bytes.begin(), bytes.end() };
-}
-
-bytes::vector PrepareValueHash(
-		bytes::const_span dataHash,
-		bytes::const_span valueSecret) {
-	return openssl::Sha256(dataHash, valueSecret);
 }
 
 bytes::vector EncryptValueSecret(
@@ -423,7 +349,7 @@ bytes::vector DecryptValueSecret(
 
 uint64 CountSecureSecretId(bytes::const_span secret) {
 	const auto full = openssl::Sha256(secret);
-	return *reinterpret_cast<const uint64*>(full.data());
+	return qFromUnaligned<uint64>(full.data());
 }
 
 bytes::vector EncryptCredentialsSecret(

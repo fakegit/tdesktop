@@ -9,12 +9,38 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 namespace Storage {
 
+void UserPhotos::List::setBack(PhotoId photoId) {
+	if (_backPhotoId != photoId) {
+		detachBack();
+		_backPhotoId = photoId;
+		attachBack();
+		sendUpdate();
+	}
+}
+
+void UserPhotos::List::detachBack() {
+	if (_backPhotoId) {
+		removeOne(_backPhotoId);
+	}
+}
+
+void UserPhotos::List::attachBack() {
+	if (_backPhotoId) {
+		_photoIds.push_front(_backPhotoId);
+		if (_count) {
+			++*_count;
+		}
+	}
+}
+
 void UserPhotos::List::addNew(PhotoId photoId) {
 	if (!base::contains(_photoIds, photoId)) {
+		detachBack();
 		_photoIds.push_back(photoId);
 		if (_count) {
 			++*_count;
 		}
+		attachBack();
 		sendUpdate();
 	}
 }
@@ -22,6 +48,7 @@ void UserPhotos::List::addNew(PhotoId photoId) {
 void UserPhotos::List::addSlice(
 		std::vector<PhotoId> &&photoIds,
 		int count) {
+	detachBack();
 	for (auto photoId : photoIds) {
 		if (!base::contains(_photoIds, photoId)) {
 			_photoIds.push_front(photoId);
@@ -32,6 +59,7 @@ void UserPhotos::List::addSlice(
 	if ((_count && *_count < _photoIds.size()) || photoIds.empty()) {
 		_count = _photoIds.size();
 	}
+	attachBack();
 	sendUpdate();
 }
 
@@ -62,6 +90,17 @@ void UserPhotos::List::removeAfter(PhotoId photoId) {
 	sendUpdate();
 }
 
+void UserPhotos::List::replace(PhotoId oldPhotoId, PhotoId newPhotoId) {
+	auto position = ranges::find(_photoIds, oldPhotoId);
+	if (position != _photoIds.end()) {
+		*position = newPhotoId;
+	}
+	if (_backPhotoId == oldPhotoId) {
+		_backPhotoId = newPhotoId;
+	}
+	sendUpdate();
+}
+
 void UserPhotos::List::sendUpdate() {
 	auto update = SliceUpdate();
 	update.photoIds = &_photoIds;
@@ -72,15 +111,17 @@ void UserPhotos::List::sendUpdate() {
 rpl::producer<UserPhotosResult> UserPhotos::List::query(
 		UserPhotosQuery &&query) const {
 	return [this, query = std::move(query)](auto consumer) {
-		auto result = UserPhotosResult {};
+		auto result = UserPhotosResult();
 		result.count = _count;
 
 		auto position = ranges::find(_photoIds, query.key.photoId);
 		if (position != _photoIds.end()) {
 			auto haveBefore = int(position - _photoIds.begin());
 			auto haveEqualOrAfter = int(_photoIds.end() - position);
-			auto before = qMin(haveBefore, query.limitBefore);
-			auto equalOrAfter = qMin(haveEqualOrAfter, query.limitAfter + 1);
+			auto before = std::min(haveBefore, query.limitBefore);
+			auto equalOrAfter = std::min(
+				haveEqualOrAfter,
+				query.limitAfter + 1);
 			result.photoIds = std::deque<PhotoId>(
 				position - before,
 				position + equalOrAfter);
@@ -90,6 +131,10 @@ rpl::producer<UserPhotosResult> UserPhotos::List::query(
 				| func::add(-int(_photoIds.size()) + skippedInIds);
 			result.skippedBefore = haveBefore - before;
 			result.skippedAfter = (haveEqualOrAfter - equalOrAfter);
+			consumer.put_next(std::move(result));
+		} else if (query.key.back && _backPhotoId) {
+			result.photoIds.push_front(_backPhotoId);
+			result.count = 1;
 			consumer.put_next(std::move(result));
 		} else if (_count) {
 			consumer.put_next(std::move(result));
@@ -107,14 +152,15 @@ rpl::producer<UserPhotosSliceUpdate> UserPhotos::sliceUpdated() const {
 	return _sliceUpdated.events();
 }
 
-std::map<UserId, UserPhotos::List>::iterator UserPhotos::enforceLists(UserId user) {
+std::map<UserId, UserPhotos::List>::iterator UserPhotos::enforceLists(
+		UserId user) {
 	auto result = _lists.find(user);
 	if (result != _lists.end()) {
 		return result;
 	}
 	result = _lists.emplace(user, List {}).first;
 	result->second.sliceUpdated(
-	) | rpl::start_with_next([this, user](
+	) | rpl::on_next([this, user](
 			const SliceUpdate &update) {
 		_sliceUpdated.fire(UserPhotosSliceUpdate(
 			user,
@@ -122,6 +168,11 @@ std::map<UserId, UserPhotos::List>::iterator UserPhotos::enforceLists(UserId use
 			update.count));
 	}, _lifetime);
 	return result;
+}
+
+void UserPhotos::add(UserPhotosSetBack &&query) {
+	auto userIt = enforceLists(query.userId);
+	userIt->second.setBack(query.photoId);
 }
 
 void UserPhotos::add(UserPhotosAddNew &&query) {
@@ -150,7 +201,15 @@ void UserPhotos::remove(UserPhotosRemoveAfter &&query) {
 	}
 }
 
-rpl::producer<UserPhotosResult> UserPhotos::query(UserPhotosQuery &&query) const {
+void UserPhotos::replace(UserPhotosReplace &&query) {
+	auto userIt = _lists.find(query.userId);
+	if (userIt != _lists.end()) {
+		userIt->second.replace(query.oldPhotoId, query.newPhotoId);
+	}
+}
+
+rpl::producer<UserPhotosResult> UserPhotos::query(
+		UserPhotosQuery &&query) const {
 	auto userIt = _lists.find(query.key.userId);
 	if (userIt != _lists.end()) {
 		return userIt->second.query(std::move(query));

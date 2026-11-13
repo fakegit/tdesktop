@@ -51,10 +51,15 @@ bool UnpackBlob(
 	if (zip.goToFirstFile() != UNZ_OK) {
 		return false;
 	}
+	const auto cleanFolder = QDir::cleanPath(folder);
 	do {
 		const auto name = zip.getCurrentFileName();
 		const auto path = folder + '/' + name;
-		if (checkNameCallback(name) && !ExtractZipFile(zip, path)) {
+		const auto cleanPath = QDir::cleanPath(path);
+		const auto inside = (cleanPath == cleanFolder)
+			|| cleanPath.startsWith(cleanFolder + '/');
+		if (checkNameCallback(name)
+			&& (!inside || !ExtractZipFile(zip, path))) {
 			return false;
 		}
 
@@ -85,7 +90,7 @@ QString StateDescription(const BlobState &state, tr::phrase<> activeText) {
 		return tr::lng_emoji_set_loading(
 			tr::now,
 			lt_percent,
-			QString::number(int(std::round(percent))) + '%',
+			QString::number(int(base::SafeRound(percent))) + '%',
 			lt_progress,
 			Ui::FormatDownloadText(data.already, data.size));
 	}, [](const Failed &data) {
@@ -99,7 +104,7 @@ BlobLoader::BlobLoader(
 	int id,
 	MTP::DedicatedLoader::Location location,
 	const QString &folder,
-	int size)
+	int64 size)
 : QObject(parent)
 , _folder(folder)
 , _id(id)
@@ -131,16 +136,23 @@ void BlobLoader::setImplementation(
 		return BlobState(state);
 	});
 	_implementation->failed(
-	) | rpl::start_with_next([=] {
+	) | rpl::on_next([=] {
 		fail();
 	}, _implementation->lifetime());
 
 	_implementation->ready(
-	) | rpl::start_with_next([=](const QString &filepath) {
+	) | rpl::on_next([=](const QString &filepath) {
 		unpack(filepath);
 	}, _implementation->lifetime());
 
-	QDir(_folder).removeRecursively();
+	auto folderDir = QDir(_folder);
+	const auto folderName = folderDir.dirName();
+	if (!folderName.isEmpty()
+		&& folderName != u"."_q
+		&& folderName != u".."_q
+		&& !folderName.contains(':')) {
+		folderDir.removeRecursively();
+	}
 	_implementation->start();
 }
 

@@ -89,6 +89,20 @@ Content ContentFromState(
 	case Step::Contacts:
 		pushMain(tr::lng_export_option_contacts(tr::now));
 		break;
+	case Step::Stories:
+		pushMain(tr::lng_export_option_stories(tr::now));
+		pushBytes(
+			"story" + QString::number(state.entityIndex),
+			state.bytesName,
+			state.bytesRandomId);
+		break;
+	case Step::ProfileMusic:
+		pushMain(tr::lng_export_option_profile_music(tr::now));
+		pushBytes(
+			"music" + QString::number(state.entityIndex),
+			state.bytesName,
+			state.bytesRandomId);
+		break;
 	case Step::Sessions:
 		pushMain(tr::lng_export_option_sessions(tr::now));
 		break;
@@ -121,6 +135,26 @@ Content ContentFromState(
 				+ QString::number(state.entityIndex)
 				+ '_'
 				+ QString::number(state.itemIndex)),
+			state.bytesName,
+			state.bytesRandomId);
+		break;
+	case Step::Topic:
+		pushMain(tr::lng_export_state_chats(tr::now));
+		push(
+			"topic",
+			state.entityName.isEmpty()
+				? tr::lng_deleted(tr::now)
+				: state.entityName,
+			(state.itemCount > 0
+				? (QString::number(state.itemIndex)
+					+ " / "
+					+ QString::number(state.itemCount))
+				: QString()),
+			(state.itemCount > 0
+				? (state.itemIndex / float64(state.itemCount))
+				: 0.));
+		pushBytes(
+			"file_topic_" + QString::number(state.itemIndex),
 			state.bytesName,
 			state.bytesRandomId);
 		break;

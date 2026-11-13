@@ -9,11 +9,19 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 #include "ui/chat/attach/attach_album_thumbnail.h"
 #include "ui/chat/attach/attach_prepare.h"
+#include "ui/effects/spoiler_mess.h"
+#include "ui/painter.h"
 #include "styles/style_chat.h"
 #include "styles/style_boxes.h"
 #include "styles/style_layers.h"
 
 #include <QtWidgets/QApplication>
+
+namespace Media::Streaming {
+
+[[nodiscard]] QImage PrepareBlurredBackground(QSize outer, QImage frame);
+
+} // namespace Media::Streaming
 
 namespace Ui {
 namespace {
@@ -24,9 +32,13 @@ constexpr auto kDragDuration = crl::time(200);
 
 AlbumPreview::AlbumPreview(
 	QWidget *parent,
+	const style::ComposeControls &st,
 	gsl::span<Ui::PreparedFile> items,
+	const Text::MarkedContext &captionContext,
 	SendFilesWay way)
 : RpWidget(parent)
+, _st(st)
+, _captionContext(captionContext)
 , _sendWay(way)
 , _dragTimer([=] { switchToDrag(); }) {
 	setMouseTracking(true);
@@ -47,12 +59,82 @@ void AlbumPreview::setSendWay(SendFilesWay way) {
 	update();
 }
 
+void AlbumPreview::setCaption(int index, const TextWithTags &caption) {
+	if (index < 0 || index >= _thumbs.size()) {
+		return;
+	}
+	const auto realIndex = _order[index];
+	const auto oldHeight = _thumbs[realIndex]->fileHeight();
+	_thumbs[realIndex]->setCaption(caption);
+	const auto newHeight = _thumbs[realIndex]->fileHeight();
+	if (oldHeight == newHeight) {
+		return;
+	}
+	const auto firstFileHeight = _thumbs.front()->fileHeight();
+	_hasMixedFileHeights = ranges::any_of(
+		_thumbs,
+		[=](const auto &thumb) {
+			return thumb->fileHeight() != firstFileHeight;
+		});
+	_filesHeight = ranges::accumulate(ranges::views::all(
+		_thumbs
+	) | ranges::views::transform([](const auto &thumb) {
+		return thumb->fileHeight();
+	}), 0) + (int(_thumbs.size()) - 1) * st::sendMediaRowSkip;
+	updateSize();
+	updateFileRows();
+}
+
+int AlbumPreview::indexFromPoint(QPoint position) const {
+	const auto thumb = findThumb(position);
+	return thumb ? orderIndex(thumb) : -1;
+}
+
 void AlbumPreview::updateFileRows() {
 	Expects(_order.size() == _thumbs.size());
 
 	const auto isFile = !_sendWay.sendImagesAsPhotos();
+	auto top = 0;
 	for (auto i = 0; i < _order.size(); i++) {
-		_thumbs[i]->updateFileRow(isFile ? _order[i] : -1);
+		const auto &thumb = _thumbs[_order[i]];
+		thumb->setButtonVisible(isFile && !thumb->isCompressedSticker());
+		// Video edits only apply when the file is sent as a video.
+		thumb->setModifyAllowed(!isFile && thumb->canEditVideo());
+		thumb->moveButtons(top);
+		top += thumb->fileHeight() + st::sendMediaRowSkip;
+	}
+}
+
+base::flat_set<int> AlbumPreview::collectSpoileredIndices() {
+	auto result = base::flat_set<int>();
+	result.reserve(_thumbs.size());
+	auto i = 0;
+	for (const auto &thumb : _thumbs) {
+		if (thumb->hasSpoiler()) {
+			result.emplace(i);
+		}
+		++i;
+	}
+	return result;
+}
+
+bool AlbumPreview::canHaveSpoiler(int index) const {
+	return _sendWay.sendImagesAsPhotos();
+}
+
+void AlbumPreview::toggleSpoilers(bool enabled) {
+	for (auto &thumb : _thumbs) {
+		thumb->setSpoiler(enabled);
+	}
+}
+
+void AlbumPreview::setSelectionMode(bool enabled) {
+	_selectionMode = enabled;
+}
+
+void AlbumPreview::setSelected(int index, bool selected) {
+	if (index >= 0 && index < _order.size()) {
+		_thumbs[_order[index]]->setSelected(selected);
 	}
 }
 
@@ -103,12 +185,21 @@ void AlbumPreview::prepareThumbs(gsl::span<Ui::PreparedFile> items) {
 	const auto layout = generateOrderedLayout();
 	_thumbs.reserve(count);
 	for (auto i = 0; i != count; ++i) {
+		const auto self = std::make_shared<AlbumThumbnail*>(nullptr);
 		_thumbs.push_back(std::make_unique<AlbumThumbnail>(
+			_st,
 			items[i],
+			_captionContext,
 			layout[i],
 			this,
-			[=] { changeThumbByIndex(thumbIndex(thumbUnderCursor())); },
-			[=] { deleteThumbByIndex(thumbIndex(thumbUnderCursor())); }));
+			[=] { update(); },
+			[=](QRect rect) { update(rect); },
+			[=] { changeThumbByIndex(orderIndex(*self)); },
+			[=] { deleteThumbByIndex(orderIndex(*self)); }));
+		*self = _thumbs.back().get();
+		if (_thumbs.back()->isCompressedSticker()) {
+			_hasMixedFileHeights = true;
+		}
 	}
 	_thumbsHeight = countLayoutHeight(layout);
 	_photosHeight = ranges::accumulate(ranges::views::all(
@@ -117,9 +208,17 @@ void AlbumPreview::prepareThumbs(gsl::span<Ui::PreparedFile> items) {
 		return thumb->photoHeight();
 	}), 0) + (count - 1) * st::sendMediaRowSkip;
 
-	const auto &st = st::attachPreviewThumbLayout;
-	_filesHeight = count * st.thumbSize
-		+ (count - 1) * st::sendMediaRowSkip;
+	const auto firstFileHeight = _thumbs.front()->fileHeight();
+	_hasMixedFileHeights = _hasMixedFileHeights || ranges::any_of(
+		_thumbs,
+		[=](const auto &thumb) {
+			return thumb->fileHeight() != firstFileHeight;
+		});
+	_filesHeight = ranges::accumulate(ranges::views::all(
+		_thumbs
+	) | ranges::views::transform([](const auto &thumb) {
+		return thumb->fileHeight();
+	}), 0) + (count - 1) * st::sendMediaRowSkip;
 }
 
 int AlbumPreview::contentLeft() const {
@@ -142,7 +241,7 @@ AlbumThumbnail *AlbumPreview::findThumb(QPoint position) const {
 		} else {
 			const auto bottom = top + (isPhotosWay
 				? thumb->photoHeight()
-				: st::attachPreviewThumbLayout.thumbSize);
+				: thumb->fileHeight());
 			const auto isUnderTop = (position.y() > top);
 			top = bottom + skip;
 			return isUnderTop && (position.y() < bottom);
@@ -173,8 +272,7 @@ not_null<AlbumThumbnail*> AlbumPreview::findClosestThumb(
 	return result;
 }
 
-int AlbumPreview::orderIndex(
-	not_null<AlbumThumbnail*> thumb) const {
+int AlbumPreview::orderIndex(not_null<AlbumThumbnail*> thumb) const {
 	const auto i = ranges::find_if(_order, [&](int index) {
 		return (_thumbs[index].get() == thumb);
 	});
@@ -226,6 +324,7 @@ void AlbumPreview::finishDrag() {
 		_finishDragAnimation.start([=] { update(); }, 0., 1., kDragDuration);
 
 		updateSizeAnimated(layout);
+		_orderUpdated.fire({});
 	} else {
 		for (const auto &thumb : _thumbs) {
 			thumb->resetLayoutAnimation();
@@ -244,7 +343,7 @@ int AlbumPreview::countLayoutHeight(
 }
 
 void AlbumPreview::updateSizeAnimated(
-	const std::vector<GroupMediaLayout> &layout) {
+		const std::vector<GroupMediaLayout> &layout) {
 	const auto newHeight = countLayoutHeight(layout);
 	if (newHeight != _thumbsHeight) {
 		_thumbsHeightAnimation.start(
@@ -263,7 +362,7 @@ void AlbumPreview::updateSize() {
 		} else if (!_sendWay.groupFiles()) {
 			return _photosHeight;
 		} else {
-			return int(std::round(_thumbsHeightAnimation.value(
+			return int(base::SafeRound(_thumbsHeightAnimation.value(
 				_thumbsHeight)));
 		}
 	}();
@@ -291,11 +390,23 @@ void AlbumPreview::paintAlbum(Painter &p) const {
 	const auto top = contentTop();
 	for (const auto &thumb : _thumbs) {
 		if (thumb.get() != _paintedAbove) {
-			thumb->paintInAlbum(p, left, top, shrink, moveProgress);
+			thumb->paintInAlbum(
+				p,
+				left,
+				top,
+				shrink,
+				moveProgress,
+				_sendWay.sendLargePhotos());
 		}
 	}
 	if (_paintedAbove) {
-		_paintedAbove->paintInAlbum(p, left, top, shrink, moveProgress);
+		_paintedAbove->paintInAlbum(
+			p,
+			left,
+			top,
+			shrink,
+			moveProgress,
+			_sendWay.sendLargePhotos());
 	}
 }
 
@@ -313,54 +424,57 @@ void AlbumPreview::paintPhotos(Painter &p, QRect clip) const {
 		} else if (bottom <= clip.y()) {
 			continue;
 		}
-		thumb->paintPhoto(p, left, top, outerWidth);
+		thumb->paintPhoto(
+			p,
+			left,
+			top,
+			outerWidth,
+			_sendWay.sendLargePhotos());
 	}
 }
 
 void AlbumPreview::paintFiles(Painter &p, QRect clip) const {
-	const auto fileHeight = st::attachPreviewThumbLayout.thumbSize
-		+ st::sendMediaRowSkip;
-	const auto bottom = clip.y() + clip.height();
-	const auto from = std::clamp(clip.y() / fileHeight, 0, int(_thumbs.size()));
-	const auto till = std::clamp((bottom + fileHeight - 1) / fileHeight, 0, int(_thumbs.size()));
 	const auto left = (st::boxWideWidth - st::sendMediaPreviewSize) / 2;
 	const auto outerWidth = width();
+	if (!_hasMixedFileHeights) {
+		const auto fileHeight = _thumbs.front()->fileHeight()
+			+ st::sendMediaRowSkip;
+		const auto bottom = clip.y() + clip.height();
+		const auto from = std::clamp(
+			clip.y() / fileHeight,
+			0,
+			int(_thumbs.size()));
+		const auto till = std::clamp(
+			(bottom + fileHeight - 1) / fileHeight,
+			0,
+			int(_thumbs.size()));
 
-	auto top = from * fileHeight;
-	for (auto i = from; i != till; ++i) {
-		_thumbs[i]->paintFile(p, left, top, outerWidth);
-		top += fileHeight;
+		auto top = from * fileHeight;
+		for (auto i = from; i != till; ++i) {
+			_thumbs[i]->paintFile(p, left, top, outerWidth);
+			top += fileHeight;
+		}
+	} else {
+		auto top = 0;
+		for (const auto &thumb : _thumbs) {
+			const auto bottom = top + thumb->fileHeight();
+			const auto guard = gsl::finally([&] {
+				top = bottom + st::sendMediaRowSkip;
+			});
+			if (top >= clip.y() + clip.height()) {
+				break;
+			} else if (bottom <= clip.y()) {
+				continue;
+			}
+			thumb->paintFile(p, left, top, outerWidth);
+		}
 	}
-}
-
-int AlbumPreview::thumbIndex(AlbumThumbnail *thumb) {
-	if (!thumb) {
-		return -1;
-	}
-	const auto thumbIt = ranges::find_if(_thumbs, [&](auto &t) {
-		return t.get() == thumb;
-	});
-	Expects(thumbIt != _thumbs.end());
-	return std::distance(_thumbs.begin(), thumbIt);
-}
-
-AlbumThumbnail *AlbumPreview::thumbUnderCursor() {
-	return findThumb(mapFromGlobal(QCursor::pos()));
 }
 
 void AlbumPreview::deleteThumbByIndex(int index) {
 	if (index < 0) {
 		return;
 	}
-	const auto orderIt = ranges::find(_order, index);
-	Expects(orderIt != _order.end());
-
-	_order.erase(orderIt);
-	ranges::for_each(_order, [=](auto &i) {
-		if (i > index) {
-			i--;
-		}
-	});
 	_thumbDeleted.fire(std::move(index));
 }
 
@@ -381,7 +495,7 @@ void AlbumPreview::modifyThumbByIndex(int index) {
 void AlbumPreview::thumbButtonsCallback(
 		not_null<AlbumThumbnail*> thumb,
 		AttachButtonType type) {
-	const auto index = thumbIndex(thumb);
+	const auto index = orderIndex(thumb);
 
 	switch (type) {
 	case AttachButtonType::None: return;
@@ -401,13 +515,18 @@ void AlbumPreview::mousePressEvent(QMouseEvent *e) {
 	const auto position = e->pos();
 	cancelDrag();
 	if (const auto thumb = findThumb(position)) {
+		if (selectingByClick(e, thumb)) {
+			_selectPressedThumb = thumb;
+			return;
+		}
 		_draggedStartPosition = position;
 		_pressedThumb = thumb;
 		_pressedButtonType = thumb->buttonTypeFromPoint(position);
 
 		const auto isAlbum = _sendWay.sendImagesAsPhotos()
 			&& _sendWay.groupFiles();
-		if (!isAlbum) {
+		if (!isAlbum || e->button() != Qt::LeftButton) {
+			_dragTimer.cancel();
 			return;
 		}
 
@@ -420,7 +539,7 @@ void AlbumPreview::mousePressEvent(QMouseEvent *e) {
 }
 
 void AlbumPreview::mouseMoveEvent(QMouseEvent *e) {
-	if (!_sendWay.sendImagesAsPhotos()) {
+	if (!_sendWay.sendImagesAsPhotos() && !_hasMixedFileHeights) {
 		applyCursor(style::cur_default);
 		return;
 	}
@@ -500,6 +619,12 @@ void AlbumPreview::updateSuggestedDrag(QPoint position) {
 }
 
 void AlbumPreview::mouseReleaseEvent(QMouseEvent *e) {
+	if (const auto thumb = base::take(_selectPressedThumb)) {
+		if (e->button() == Qt::LeftButton && findThumb(e->pos()) == thumb) {
+			_thumbSelected.fire(orderIndex(thumb));
+		}
+		return;
+	}
 	if (_draggedThumb) {
 		finishDrag();
 		_shrinkAnimation.start(
@@ -513,11 +638,21 @@ void AlbumPreview::mouseReleaseEvent(QMouseEvent *e) {
 	} else if (const auto thumb = base::take(_pressedThumb)) {
 		const auto was = _pressedButtonType;
 		const auto now = thumb->buttonTypeFromPoint(e->pos());
-		if (was == now) {
+		if (e->button() == Qt::LeftButton && was == now) {
 			thumbButtonsCallback(thumb, now);
 		}
 	}
 	_pressedButtonType = AttachButtonType::None;
+}
+
+bool AlbumPreview::selectingByClick(
+		QMouseEvent *e,
+		not_null<AlbumThumbnail*> thumb) const {
+	return !_sendWay.sendImagesAsPhotos()
+		&& thumb->selectable()
+		&& (e->button() == Qt::LeftButton)
+		&& (_selectionMode
+			|| e->modifiers().testFlag(Qt::ControlModifier));
 }
 
 void AlbumPreview::switchToDrag() {
@@ -534,8 +669,47 @@ void AlbumPreview::switchToDrag() {
 	update();
 }
 
-rpl::producer<int> AlbumPreview::thumbModified() const {
-	return _thumbModified.events();
+QImage AlbumPreview::generatePriceTagBackground() const {
+	auto wmax = 0;
+	auto hmax = 0;
+	for (auto &thumb : _thumbs) {
+		const auto geometry = thumb->geometry();
+		accumulate_max(wmax, geometry.x() + geometry.width());
+		accumulate_max(hmax, geometry.y() + geometry.height());
+	}
+	const auto size = QSize(wmax, hmax);
+	if (size.isEmpty()) {
+		return {};
+	}
+	const auto ratio = style::DevicePixelRatio();
+	const auto full = size * ratio;
+	const auto skip = st::historyGroupSkip;
+	auto result = QImage(full, QImage::Format_ARGB32_Premultiplied);
+	result.setDevicePixelRatio(ratio);
+	result.fill(Qt::black);
+	auto p = QPainter(&result);
+	auto hq = PainterHighQualityEnabler(p);
+	for (auto &thumb : _thumbs) {
+		const auto geometry = thumb->geometry();
+		if (geometry.isEmpty()) {
+			continue;
+		}
+		const auto w = geometry.width();
+		const auto h = geometry.height();
+		const auto wscale = (w + skip) / float64(w);
+		const auto hscale = (h + skip) / float64(h);
+		p.save();
+		p.translate(geometry.center());
+		p.scale(wscale, hscale);
+		p.translate(-geometry.center());
+		thumb->paintInAlbum(p, 0, 0, 1., 1., _sendWay.sendLargePhotos());
+		p.restore();
+	}
+	p.end();
+
+	return ::Media::Streaming::PrepareBlurredBackground(
+		full,
+		std::move(result));
 }
 
 } // namespace Ui

@@ -19,31 +19,103 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "main/main_session_settings.h"
 #include "main/main_app_config.h"
 #include "media/view/media_view_open_common.h"
+#include "lang/lang_hardcoded.h"
+#include "lang/lang_keys.h"
 #include "intro/intro_widget.h"
 #include "mtproto/mtproto_config.h"
-#include "ui/layers/box_content.h"
-#include "ui/layers/layer_widget.h"
+#include "storage/storage_account.h"
 #include "ui/toast/toast.h"
 #include "ui/emoji_config.h"
 #include "chat_helpers/emoji_sets_manager.h"
+#include "window/window_columns.h"
 #include "window/window_session_controller.h"
-#include "window/themes/window_theme.h"
 #include "window/themes/window_theme_editor.h"
-#include "boxes/confirm_box.h"
-#include "mainwindow.h"
+#include "ui/boxes/confirm_box.h"
+#include "data/components/promo_suggestions.h"
+#include "data/data_thread.h"
+#include "settings/settings_common.h"
+#include "wallet/wallet_panel.h"
+#include "wallet/wallet_session.h"
 #include "apiwrap.h" // ApiWrap::acceptTerms.
-#include "facades.h"
 #include "styles/style_layers.h"
 
 #include <QtGui/QWindow>
 #include <QtGui/QScreen>
 
 namespace Window {
+namespace {
 
-Controller::Controller()
-: _widget(this)
+class Show final : public Ui::Show {
+public:
+	explicit Show(not_null<Controller*> window);
+
+	void showOrHideBoxOrLayer(
+		std::variant<
+			v::null_t,
+			object_ptr<Ui::BoxContent>,
+			std::unique_ptr<Ui::LayerWidget>> &&layer,
+		Ui::LayerOptions options,
+		anim::type animated) const override;
+	[[nodiscard]] not_null<QWidget*> toastParent() const override;
+	[[nodiscard]] bool valid() const override;
+	operator bool() const override;
+
+private:
+	const base::weak_ptr<Controller> _window;
+
+};
+
+Show::Show(not_null<Controller*> window)
+: _window(base::make_weak(window)) {
+}
+
+void Show::showOrHideBoxOrLayer(
+		std::variant<
+			v::null_t,
+			object_ptr<Ui::BoxContent>,
+			std::unique_ptr<Ui::LayerWidget>> &&layer,
+		Ui::LayerOptions options,
+		anim::type animated) const {
+	if (const auto window = _window.get()) {
+		window->widget()->showOrHideBoxOrLayer(
+			std::move(layer),
+			options,
+			animated);
+	}
+}
+
+not_null<QWidget*> Show::toastParent() const {
+	const auto window = _window.get();
+	Assert(window != nullptr);
+	return window->widget()->bodyWidget();
+}
+
+bool Show::valid() const {
+	return !_window.empty();
+}
+
+Show::operator bool() const {
+	return valid();
+}
+
+} // namespace
+
+Controller::Controller() : Controller(CreateArgs{ nullptr }) {
+}
+
+Controller::Controller(SeparateId id, MsgId showAtMsgId)
+: Controller(CreateArgs{ id }) {
+	if (id) {
+		showAccount(id.account, showAtMsgId);
+	}
+}
+
+Controller::Controller(CreateArgs &&args)
+: _id(args.id)
+, _isActiveTimer([=] { updateIsActive(); })
+, _widget(this)
 , _adaptive(std::make_unique<Adaptive>())
-, _isActiveTimer([=] { updateIsActive(); }) {
+, _columns(std::make_unique<Columns>(this)) {
 	_widget.init();
 }
 
@@ -51,69 +123,144 @@ Controller::~Controller() {
 	// We want to delete all widgets before the _sessionController.
 	_widget.ui_hideSettingsAndLayer(anim::type::instant);
 	_widget.clearWidgets();
+	_accountLifetime.destroy();
+	_sessionControllerValue = nullptr;
+	_sessionController = nullptr;
+}
+
+SeparateId Controller::id() const {
+	return _id;
+}
+
+bool Controller::isPrimary() const {
+	return _id.primary();
+}
+
+Main::Account &Controller::account() const {
+	Expects(_id.account != nullptr);
+
+	return *_id.account;
 }
 
 void Controller::showAccount(not_null<Main::Account*> account) {
-	const auto prevSessionUniqueId = (_account && _account->sessionExists())
-		? _account->session().uniqueId()
+	showAccount(account, ShowAtUnreadMsgId);
+}
+
+void Controller::showAccount(
+		not_null<Main::Account*> account,
+		MsgId singlePeerShowAtMsgId) {
+	Expects(isPrimary() || _id.account == account);
+
+	const auto prevAccount = _id.account;
+	const auto prevSession = maybeSession();
+	const auto prevSessionUniqueId = prevSession
+		? prevSession->uniqueId()
 		: 0;
+	// Weak: the account can be destroyed by removeRedundantAccounts()
+	// before this subscription fires again.
+	const auto accountBeforeIntro = (prevAccount
+		&& prevAccount != account
+		&& prevAccount->sessionExists())
+		? base::make_weak(prevAccount)
+		: base::weak_ptr<Main::Account>();
 	_accountLifetime.destroy();
-	_account = account;
+	_id.account = account;
+	Core::App().checkWindowId(this);
 
-	const auto updateOnlineOfPrevSesssion = crl::guard(_account, [=] {
-		if (!prevSessionUniqueId) {
-			return;
-		}
-		for (auto &[index, account] : _account->domain().accounts()) {
-			if (const auto anotherSession = account->maybeSession()) {
-				if (anotherSession->uniqueId() == prevSessionUniqueId) {
-					anotherSession->updates().updateOnline(crl::now());
-					return;
-				}
-			}
-		}
-	});
+	if (!prevAccount && Core::App().isWindowInSettings(this)) {
+		_columns->seedFirstWindow();
+	}
 
-	_account->sessionValue(
-	) | rpl::start_with_next([=](Main::Session *session) {
+	if (!isPrimary()) {
+		_id.account->sessionChanges(
+		) | rpl::on_next([=](Main::Session *session) {
+			Core::App().closeWindow(this);
+		}, _accountLifetime);
+	}
+
+	_id.account->sessionValue(
+	) | rpl::on_next([=](Main::Session *session) {
 		const auto was = base::take(_sessionController);
 		_sessionController = session
 			? std::make_unique<SessionController>(session, this)
 			: nullptr;
-		if (_sessionController) {
-			_sessionController->filtersMenuChanged(
-			) | rpl::start_with_next([=] {
-				sideBarChanged();
-			}, _sessionController->lifetime());
-		}
-		if (session && session->settings().dialogsFiltersEnabled()) {
-			_sessionController->toggleFiltersMenu(true);
-		} else {
-			sideBarChanged();
-		}
+		_sessionControllerValue = _sessionController.get();
+
+		auto oldContentCache = _widget.grabForSlideAnimation();
 		_widget.updateWindowIcon();
 		if (session) {
-			setupMain();
+			setupSideBar();
+			setupMain(singlePeerShowAtMsgId, std::move(oldContentCache));
 
 			session->updates().isIdleValue(
 			) | rpl::filter([=](bool idle) {
 				return !idle;
-			}) | rpl::start_with_next([=] {
-				widget()->checkHistoryActivation();
+			}) | rpl::on_next([=] {
+				widget()->checkActivation();
 			}, _sessionController->lifetime());
 
 			session->termsLockValue(
-			) | rpl::start_with_next([=] {
+			) | rpl::on_next([=] {
 				checkLockByTerms();
 				_widget.updateGlobalMenu();
 			}, _sessionController->lifetime());
+
+			widget()->setInnerFocus();
+
+			_sessionController->activeChatChanges(
+			) | rpl::on_next([=] {
+				_widget.updateTitle();
+			}, _sessionController->lifetime());
+			_widget.updateTitle();
+
+			if (session->promoSuggestions().setupEmailState()
+				!= Data::SetupEmailState::None) {
+				_widget.setupSetupEmailLock();
+			}
+
+			session->updates().updateOnline(crl::now());
 		} else {
-			setupIntro();
+			sideBarChanged();
+			setupIntro(
+				accountBeforeIntro.get(),
+				std::move(oldContentCache));
 			_widget.updateGlobalMenu();
 		}
 
-		crl::on_main(updateOnlineOfPrevSesssion);
+		crl::on_main(this, [=] {
+			if (!prevSessionUniqueId) {
+				return;
+			}
+			for (auto &[index, account] : _id.account->domain().accounts()) {
+				if (const auto anotherSession = account->maybeSession()) {
+					if (anotherSession->uniqueId() == prevSessionUniqueId) {
+						anotherSession->updates().updateOnline(crl::now());
+						return;
+					}
+				}
+			}
+		});
 	}, _accountLifetime);
+}
+
+void Controller::setupSideBar() {
+	Expects(_sessionController != nullptr);
+
+	if (!isPrimary()) {
+		return;
+	}
+	_sessionController->filtersMenuChanged(
+	) | rpl::on_next([=] {
+		sideBarChanged();
+	}, _sessionController->lifetime());
+
+	if (_sessionController->session().settings().dialogsFiltersEnabled()
+		&& _sessionController->enoughSpaceForFilters()
+		&& !Core::App().settings().chatFiltersHorizontal()) {
+		_sessionController->toggleFiltersMenu(true);
+	} else {
+		sideBarChanged();
+	}
 }
 
 void Controller::checkLockByTerms() {
@@ -126,7 +273,8 @@ void Controller::checkLockByTerms() {
 		}
 		return;
 	}
-	Ui::hideSettingsAndLayer(anim::type::instant);
+	hideSettingsAndLayer(anim::type::instant);
+	Wallet::CloseWallet(&account().session());
 	const auto box = show(Box<TermsBox>(
 		*data,
 		tr::lng_terms_agree(),
@@ -137,7 +285,7 @@ void Controller::checkLockByTerms() {
 
 	const auto id = data->id;
 	box->agreeClicks(
-	) | rpl::start_with_next([=] {
+	) | rpl::on_next([=] {
 		const auto mention = box ? box->lastClickedMention() : QString();
 		box->closeBox();
 		if (const auto session = account().maybeSession()) {
@@ -150,11 +298,11 @@ void Controller::checkLockByTerms() {
 	}, box->lifetime());
 
 	box->cancelClicks(
-	) | rpl::start_with_next([=] {
+	) | rpl::on_next([=] {
 		showTermsDecline();
 	}, box->lifetime());
 
-	QObject::connect(box, &QObject::destroyed, [=] {
+	QObject::connect(box.get(), &QObject::destroyed, [=] {
 		crl::on_main(widget(), [=] { checkLockByTerms(); });
 	});
 
@@ -162,16 +310,14 @@ void Controller::checkLockByTerms() {
 }
 
 void Controller::showTermsDecline() {
-	const auto box = show(
-		Box<Window::TermsBox>(
-			TextWithEntities{ tr::lng_terms_update_sorry(tr::now) },
-			tr::lng_terms_decline_and_delete(),
-			tr::lng_terms_back(),
-			true),
-		Ui::LayerOption::KeepOther);
+	const auto box = show(Box<Window::TermsBox>(
+		TextWithEntities{ tr::lng_terms_update_sorry(tr::now) },
+		tr::lng_terms_decline_and_delete(),
+		tr::lng_terms_back(),
+		true));
 
 	box->agreeClicks(
-	) | rpl::start_with_next([=] {
+	) | rpl::on_next([=] {
 		if (box) {
 			box->closeBox();
 		}
@@ -179,7 +325,7 @@ void Controller::showTermsDecline() {
 	}, box->lifetime());
 
 	box->cancelClicks(
-	) | rpl::start_with_next([=] {
+	) | rpl::on_next([=] {
 		if (box) {
 			box->closeBox();
 		}
@@ -191,16 +337,19 @@ void Controller::showTermsDelete() {
 		if (const auto session = account().maybeSession()) {
 			session->termsDeleteNow();
 		} else {
-			Ui::hideLayer();
+			hideLayer();
 		}
 	};
-	show(
-		Box<ConfirmBox>(
-			tr::lng_terms_delete_warning(tr::now),
-			tr::lng_terms_delete_now(tr::now),
-			st::attentionBoxButton,
-			deleteByTerms),
-		Ui::LayerOption::KeepOther);
+	show(Ui::MakeConfirmBox({
+		.text = tr::lng_terms_delete_warning(),
+		.confirmed = deleteByTerms,
+		.confirmText = tr::lng_terms_delete_now(),
+		.confirmStyle = &st::attentionBoxButton,
+	}));
+}
+
+void Controller::firstShow() {
+	_widget.firstShow();
 }
 
 void Controller::finishFirstShow() {
@@ -208,8 +357,17 @@ void Controller::finishFirstShow() {
 	checkThemeEditor();
 }
 
+Main::Session *Controller::maybeSession() const {
+	return _id.account ? _id.account->maybeSession() : nullptr;
+}
+
+auto Controller::sessionControllerValue() const
+-> rpl::producer<SessionController*> {
+	return _sessionControllerValue.value();
+}
+
 bool Controller::locked() const {
-	if (Core::App().passcodeLocked()) {
+	if (Core::App().passcodeLocked()/* || Core::App().setupEmailLocked()*/) {
 		return true;
 	} else if (const auto controller = sessionController()) {
 		return controller->session().termsLocked().has_value();
@@ -230,23 +388,41 @@ void Controller::setupPasscodeLock() {
 }
 
 void Controller::clearPasscodeLock() {
-	if (!_account) {
+	if (!_id) {
 		showAccount(&Core::App().activeAccount());
 	} else {
 		_widget.clearPasscodeLock();
 	}
 }
 
-void Controller::setupIntro() {
-	_widget.setupIntro(Core::App().domain().maybeLastOrSomeAuthedAccount()
-		? Intro::EnterPoint::Qr
-		: Intro::EnterPoint::Start);
+void Controller::setupSetupEmailLock() {
+	if (const auto &session = _sessionController) {
+		if (session->session().promoSuggestions().setupEmailState()
+			!= Data::SetupEmailState::None) {
+			_widget.setupSetupEmailLock();
+		}
+	}
 }
 
-void Controller::setupMain() {
+void Controller::clearSetupEmailLock() {
+	_widget.clearSetupEmailLock();
+}
+
+void Controller::setupIntro(
+		Main::Account *accountBeforeIntro,
+		QPixmap oldContentCache) {
+	const auto point = Core::App().domain().maybeLastOrSomeAuthedAccount()
+		? Intro::EnterPoint::Qr
+		: Intro::EnterPoint::Start;
+	_widget.setupIntro(point, accountBeforeIntro, std::move(oldContentCache));
+}
+
+void Controller::setupMain(
+		MsgId singlePeerShowAtMsgId,
+		QPixmap oldContentCache) {
 	Expects(_sessionController != nullptr);
 
-	_widget.setupMain();
+	_widget.setupMain(singlePeerShowAtMsgId, std::move(oldContentCache));
 
 	if (const auto id = Ui::Emoji::NeedToSwitchBackToId()) {
 		Ui::Emoji::LoadAndSwitchTo(&_sessionController->session(), id);
@@ -265,26 +441,58 @@ int Controller::verticalShadowTop() const {
 		: 0;
 }
 
-void Controller::showToast(const QString &text) {
-	Ui::Toast::Show(_widget.bodyWidget(), text);
+void Controller::showToast(Ui::Toast::Config &&config) {
+	Show(this).showToast(std::move(config));
+}
+
+void Controller::showToast(TextWithEntities &&text, crl::time duration) {
+	Show(this).showToast(std::move(text), duration);
+}
+
+void Controller::showToast(const QString &text, crl::time duration) {
+	Show(this).showToast(text, duration);
 }
 
 void Controller::showLayer(
 		std::unique_ptr<Ui::LayerWidget> &&layer,
 		Ui::LayerOptions options,
 		anim::type animated) {
-	_widget.showLayer(std::move(layer), options, animated);
+	_widget.showOrHideBoxOrLayer(std::move(layer), options, animated);
 }
 
 void Controller::showBox(
 		object_ptr<Ui::BoxContent> content,
 		Ui::LayerOptions options,
 		anim::type animated) {
-	_widget.ui_showBox(std::move(content), options, animated);
+	_widget.showOrHideBoxOrLayer(std::move(content), options, animated);
 }
 
-void Controller::showRightColumn(object_ptr<TWidget> widget) {
+void Controller::showRightColumn(object_ptr<Ui::RpWidget> widget) {
 	_widget.showRightColumn(std::move(widget));
+}
+
+void Controller::hideLayer(anim::type animated) {
+	_widget.showOrHideBoxOrLayer(v::null, Ui::LayerOption::CloseOther, animated);
+}
+
+void Controller::hideSettingsAndLayer(anim::type animated) {
+	_widget.ui_hideSettingsAndLayer(animated);
+}
+
+bool Controller::closeLayerByBackButton() {
+	return _widget.closeLayerByBackButton();
+}
+
+bool Controller::isLayerShown() const {
+	return _widget.ui_isLayerShown();
+}
+
+rpl::producer<bool> Controller::layerShownValue() const {
+	return _widget.ui_layerShownValue();
+}
+
+rpl::producer<bool> Controller::boxShownValue() const {
+	return _widget.ui_boxShownValue();
 }
 
 void Controller::sideBarChanged() {
@@ -293,10 +501,7 @@ void Controller::sideBarChanged() {
 
 void Controller::activate() {
 	_widget.activate();
-}
-
-void Controller::reActivate() {
-	_widget.reActivateWindow();
+	Core::App().registerWindowActivation(&_widget);
 }
 
 void Controller::updateIsActiveFocus() {
@@ -334,19 +539,65 @@ void Controller::preventOrInvoke(Fn<void()> &&callback) {
 
 void Controller::invokeForSessionController(
 		not_null<Main::Account*> account,
+		PeerData *singlePeer,
 		Fn<void(not_null<SessionController*>)> &&callback) {
-	_account->domain().activate(std::move(account));
+	const auto separateWindow = singlePeer
+		? Core::App().separateWindowFor(not_null(singlePeer))
+		: nullptr;
+	const auto separateSession = separateWindow
+		? separateWindow->sessionController()
+		: nullptr;
+	if (separateSession) {
+		return callback(separateSession);
+	}
+	const auto accountWindow = account
+		? Core::App().separateWindowFor(not_null(account))
+		: nullptr;
+	const auto accountSession = accountWindow
+		? accountWindow->sessionController()
+		: nullptr;
+	if (accountSession) {
+		return callback(accountSession);
+	}
+	_id.account->domain().activate(std::move(account));
 	if (_sessionController) {
 		callback(_sessionController.get());
 	}
 }
 
 QPoint Controller::getPointForCallPanelCenter() const {
-	Expects(_widget.windowHandle() != nullptr);
+	if (_widget.isActive()) {
+		return _widget.geometry().center();
+	}
+	// When the last monitor is removed QGuiApplication has no screens at
+	// all, so screen() is nullptr.
+	const auto screen = _widget.screen();
+	return screen
+		? screen->geometry().center()
+		: _widget.geometry().center();
+}
 
-	return _widget.isActive()
-		? _widget.geometry().center()
-		: _widget.windowHandle()->screen()->geometry().center();
+QString LogoutConfirmationText(Main::Account *account) {
+	auto result = tr::lng_sure_logout(tr::now);
+	const auto append = [&](const QString &line) {
+		if (!line.isEmpty()) {
+			result += u"\n\n"_q + line;
+		}
+	};
+	const auto &domain = Core::App().domain();
+	if (account) {
+		append(Wallet::WalletLossWarning(
+			Wallet::WalletLossOnLogout(account)));
+	} else if (!domain.started()) {
+		append(tr::lng_sure_logout_wallet_unknown(tr::now));
+	} else {
+		auto loss = Wallet::WalletLoss();
+		for (const auto &[index, one] : domain.accounts()) {
+			loss.add(Wallet::WalletLossOnLogout(one.get()));
+		}
+		append(Wallet::WalletLossWarning(loss));
+	}
+	return result;
 }
 
 void Controller::showLogoutConfirmation() {
@@ -356,30 +607,45 @@ void Controller::showLogoutConfirmation() {
 		? &sessionController()->session().account()
 		: nullptr;
 	const auto weak = base::make_weak(account);
-	const auto callback = [=] {
-		if (account && !weak) {
-			return;
+	const auto callback = [=](Fn<void()> close) {
+		if (!account || weak) {
+			Core::App().logoutWithChecks(account);
 		}
-		if (account
-			&& account->sessionExists()
-			&& Core::App().exportManager().inProgress(&account->session())) {
-			Ui::hideLayer();
-			Core::App().exportManager().stopWithConfirmation([=] {
-				Core::App().logout(account);
-			});
-		} else {
-			Core::App().logout(account);
+		if (close) {
+			close();
 		}
 	};
-	show(Box<ConfirmBox>(
-		tr::lng_sure_logout(tr::now),
-		tr::lng_settings_logout(tr::now),
-		st::attentionBoxButton,
-		callback));
+	show(Ui::MakeConfirmBox({
+		.text = LogoutConfirmationText(account),
+		.confirmed = callback,
+		.confirmText = tr::lng_settings_logout(),
+		.confirmStyle = &st::attentionBoxButton,
+	}));
+}
+
+void Controller::showPasscodeClearFailed(Fn<bool()> retry) {
+	if (_passcodeClearFailedBox) {
+		return;
+	}
+	_passcodeClearFailedBox = show(Ui::MakeConfirmBox({
+		.text = Lang::Hard::SecureSaveError(),
+		.confirmed = [=](Fn<void()> close) {
+			if (retry && retry()) {
+				close();
+			}
+		},
+		.confirmText = tr::lng_bot_download_retry(),
+		.cancelText = tr::lng_close(),
+		.title = tr::lng_passcode_remove(),
+	}));
 }
 
 Window::Adaptive &Controller::adaptive() const {
 	return *_adaptive;
+}
+
+Window::Columns &Controller::columns() const {
+	return *_columns;
 }
 
 void Controller::openInMediaView(Media::View::OpenRequest &&request) {
@@ -389,6 +655,73 @@ void Controller::openInMediaView(Media::View::OpenRequest &&request) {
 auto Controller::openInMediaViewRequests() const
 -> rpl::producer<Media::View::OpenRequest> {
 	return _openInMediaViewRequests.events();
+}
+
+void Controller::setDefaultFloatPlayerDelegate(
+		not_null<Media::Player::FloatDelegate*> delegate) {
+	_defaultFloatPlayerDelegate = delegate;
+	_replacementFloatPlayerDelegate = nullptr;
+	_floatPlayerDelegate = delegate;
+}
+
+void Controller::replaceFloatPlayerDelegate(
+		not_null<Media::Player::FloatDelegate*> replacement) {
+	Expects(_defaultFloatPlayerDelegate != nullptr);
+
+	_replacementFloatPlayerDelegate = replacement;
+	_floatPlayerDelegate = replacement;
+}
+
+void Controller::restoreFloatPlayerDelegate(
+		not_null<Media::Player::FloatDelegate*> replacement) {
+	Expects(_defaultFloatPlayerDelegate != nullptr);
+
+	if (_replacementFloatPlayerDelegate == replacement) {
+		_replacementFloatPlayerDelegate = nullptr;
+		_floatPlayerDelegate = _defaultFloatPlayerDelegate;
+	}
+}
+
+auto Controller::floatPlayerDelegate() const -> FloatDelegate* {
+	return _floatPlayerDelegate.current();
+}
+
+auto Controller::floatPlayerDelegateValue() const
+-> rpl::producer<FloatDelegate*> {
+	return _floatPlayerDelegate.value();
+}
+
+std::shared_ptr<Ui::Show> Controller::uiShow() {
+	return std::make_shared<Show>(this);
+}
+
+void Controller::setHighlightControlId(const QString &id) {
+	_highlightControlId = id;
+}
+
+QString Controller::highlightControlId() const {
+	return _highlightControlId;
+}
+
+bool Controller::takeHighlightControlId(const QString &id) {
+	if (_highlightControlId == id) {
+		_highlightControlId = QString();
+		return true;
+	}
+	return false;
+}
+
+void Controller::checkHighlightControl(
+		const QString &id,
+		QWidget *widget,
+		Settings::HighlightArgs &&args) {
+	if (widget && takeHighlightControlId(id)) {
+		Settings::HighlightWidget(widget, std::move(args));
+	}
+}
+
+void Controller::checkHighlightControl(const QString &id, QWidget *widget) {
+	checkHighlightControl(id, widget, {});
 }
 
 rpl::lifetime &Controller::lifetime() {

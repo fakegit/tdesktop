@@ -53,8 +53,14 @@ QString FormatSongName::string() const {
 	const auto &[title, performer] = _composedName;
 	const auto dash = (title.isEmpty() || performer.isEmpty())
 		? QString()
+		: _noDash
+		? QString(' ')
 		: QString::fromUtf8(" \xe2\x80\x93 ");
 	return performer + dash + title;
+}
+
+void FormatSongName::setNoDash(bool noDash) {
+	_noDash = noDash;
 }
 
 TextWithEntities FormatSongName::textWithEntities(
@@ -66,8 +72,8 @@ TextWithEntities FormatSongName::textWithEntities(
 			EntityType::Semibold,
 			0,
 			_composedName.performer.isEmpty()
-				? result.text.size()
-				: _composedName.performer.size(),
+				? int(result.text.size())
+				: int(_composedName.performer.size()),
 		});
 	}
 	return result;

@@ -34,14 +34,20 @@ public:
 	void start(
 		not_null<Main::Session*> session,
 		const MTPInputPeer &singlePeer = MTP_inputPeerEmpty());
+	void startTopic(
+		not_null<PeerData*> peer,
+		MsgId topicRootId,
+		const QString &topicTitle);
 
 	[[nodiscard]] rpl::producer<View::PanelController*> currentView() const;
 	[[nodiscard]] bool inProgress() const;
 	[[nodiscard]] bool inProgress(not_null<Main::Session*> session) const;
-	void stopWithConfirmation(FnMut<void()> callback);
+	void stopWithConfirmation(Fn<void()> callback);
 	void stop();
 
 private:
+	void setupPanel(not_null<Main::Session*> session);
+
 	std::unique_ptr<Controller> _controller;
 	std::unique_ptr<View::PanelController> _panel;
 	rpl::event_stream<View::PanelController*> _viewChanges;

@@ -7,23 +7,124 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #pragma once
 
+#include "core/credits_amount.h"
+#include "data/components/credits.h"
+#include "data/data_birthday.h"
 #include "data/data_peer.h"
+#include "data/data_chat_participant_status.h"
+#include "data/data_lastseen_status.h"
+#include "data/data_user_names.h"
 #include "dialogs/dialogs_key.h"
+#include "base/flags.h"
+#include "base/weak_ptr.h"
 
-struct BotInfo {
-	bool inited = false;
-	bool readsAllHistory = false;
-	bool cantJoinGroups = false;
-	int version = 0;
-	QString description, inlinePlaceholder;
-	std::vector<BotCommand> commands;
-	Ui::Text::String text = { int(st::msgMinWidth) }; // description
+namespace Data {
+class Forum;
+class Thread;
+struct BotCommand;
+struct BusinessDetails;
+struct WalletCard;
+} // namespace Data
 
-	QString startToken, startGroupToken, shareGameShortName;
-	Dialogs::EntryState inlineReturnTo;
+namespace Api {
+enum class DisallowedGiftType : uchar;
+using DisallowedGiftTypes = base::flags<DisallowedGiftType>;
+} // namespace Api
+
+struct StarRefProgram {
+	CreditsAmount revenuePerUser;
+	TimeId endDate = 0;
+	ushort commission = 0;
+	uint8 durationMonths = 0;
+
+	friend inline constexpr bool operator==(
+		StarRefProgram,
+		StarRefProgram) = default;
 };
 
-enum class UserDataFlag {
+struct BotVerifierSettings {
+	DocumentId iconId = 0;
+	QString company;
+	TextWithEntities customDescription;
+	bool canModifyDescription = false;
+
+	explicit operator bool() const {
+		return iconId != 0;
+	}
+
+	friend inline bool operator==(
+		const BotVerifierSettings &a,
+		const BotVerifierSettings &b) = default;
+};
+
+struct BotInfo {
+	enum class SetBotPhotoOpenState : uchar {
+		Unknown,
+		OpenedWithHistory,
+		OpenedEmpty,
+	};
+
+	BotInfo();
+	~BotInfo();
+
+	void ensureForum(not_null<UserData*> that);
+	[[nodiscard]] Data::Forum *forum() const;
+	[[nodiscard]] std::unique_ptr<Data::Forum> takeForumData();
+
+	void setInlineReturnTo(Dialogs::EntryState state);
+	[[nodiscard]] Dialogs::EntryState inlineReturnTo() const;
+
+	QString description;
+	QString inlinePlaceholder;
+	std::vector<Data::BotCommand> commands;
+
+	PhotoData *photo = nullptr;
+	DocumentData *document = nullptr;
+
+	QString botMenuButtonText;
+	QString botMenuButtonUrl;
+	QString privacyPolicyUrl;
+
+	QColor botAppColorTitleDay = QColor(0, 0, 0, 0);
+	QColor botAppColorTitleNight = QColor(0, 0, 0, 0);
+	QColor botAppColorBodyDay = QColor(0, 0, 0, 0);
+	QColor botAppColorBodyNight = QColor(0, 0, 0, 0);
+
+	QString startToken;
+
+	ChatAdminRights groupAdminRights;
+	ChatAdminRights channelAdminRights;
+
+	StarRefProgram starRefProgram;
+	std::unique_ptr<BotVerifierSettings> verifierSettings;
+
+	int version = 0;
+	int descriptionVersion = 0;
+	int activeUsers = 0;
+	SetBotPhotoOpenState setBotPhotoOpenState = SetBotPhotoOpenState::Unknown;
+	bool inited : 1 = false;
+	bool readsAllHistory : 1 = false;
+	bool cantJoinGroups : 1 = false;
+	bool supportsAttachMenu : 1 = false;
+	bool canEditInformation : 1 = false;
+	bool canManageEmojiStatus : 1 = false;
+	bool supportsBusiness : 1 = false;
+	bool hasMainApp : 1 = false;
+	bool userCreatesTopics : 1 = false;
+	bool setBotPhotoHidden : 1 = false;
+	bool canManageBots : 1 = false;
+	bool supportsGuestChat : 1 = false;
+	bool supportsGuard : 1 = false;
+
+private:
+	std::unique_ptr<Data::Forum> _forum;
+	Dialogs::EntryState _inlineReturnTo;
+	// A topic or sublist can be freed without a destroyed() event.
+	base::weak_ptr<Data::Thread> _inlineReturnThread;
+
+};
+
+enum class UserDataFlag : uint32 {
 	Contact = (1 << 0),
 	MutualContact = (1 << 1),
 	Deleted = (1 << 2),
@@ -37,16 +138,40 @@ enum class UserDataFlag {
 	Support = (1 << 10),
 	CanPinMessages = (1 << 11),
 	DiscardMinPhoto = (1 << 12),
+	Self = (1 << 13),
+	Premium = (1 << 14),
+	UnofficialSecurityRisk = (1 << 15),
+	VoiceMessagesForbidden = (1 << 16),
+	PersonalPhoto = (1 << 17),
+	StoriesHidden = (1 << 18),
+	HasActiveStories = (1 << 19),
+	HasUnreadStories = (1 << 20),
+	RequiresPremiumToWrite = (1 << 21),
+	HasRequirePremiumToWrite = (1 << 22),
+	HasStarsPerMessage = (1 << 23),
+	MessageMoneyRestrictionsKnown = (1 << 24),
+	ReadDatesPrivate = (1 << 25),
+	StoriesCorrespondent = (1 << 26),
+	Forum = (1 << 27),
+	HasActiveVideoStream = (1 << 28),
+	NoForwardsMyEnabled = (1 << 29),
+	NoForwardsPeerEnabled = (1 << 30),
 };
 inline constexpr bool is_flag_type(UserDataFlag) { return true; };
 using UserDataFlags = base::flags<UserDataFlag>;
 
-class UserData : public PeerData {
+[[nodiscard]] Data::LastseenStatus LastseenFromMTP(
+	const MTPUserStatus &status,
+	Data::LastseenStatus currentStatus);
+
+class UserData final : public PeerData {
 public:
 	using Flag = UserDataFlag;
 	using Flags = Data::Flags<UserDataFlags>;
 
 	UserData(not_null<Data::Session*> owner, PeerId id);
+	~UserData();
+
 	void setPhoto(const MTPUserProfilePhoto &photo);
 
 	void setName(
@@ -54,7 +179,9 @@ public:
 		const QString &newLastName,
 		const QString &newPhoneName,
 		const QString &newUsername);
+	void setUsernames(const Data::Usernames &newUsernames);
 
+	void setUsername(const QString &username);
 	void setPhone(const QString &newPhone);
 	void setBotInfoVersion(int version);
 	void setBotInfo(const MTPBotInfo &info);
@@ -63,92 +190,87 @@ public:
 
 	void madeAction(TimeId when); // pseudo-online
 
-	uint64 accessHash() const {
+	[[nodiscard]] uint64 accessHash() const {
 		return _accessHash;
 	}
 	void setAccessHash(uint64 accessHash);
 
-	void setFlags(UserDataFlags which) {
-		_flags.set(which);
-	}
-	void addFlags(UserDataFlags which) {
-		_flags.add(which);
-	}
-	void removeFlags(UserDataFlags which) {
-		_flags.remove(which);
-	}
 	auto flags() const {
 		return _flags.current();
 	}
 	auto flagsValue() const {
 		return _flags.value();
 	}
+	void setFlags(UserDataFlags which);
+	void addFlags(UserDataFlags which);
+	void removeFlags(UserDataFlags which);
 
-	[[nodiscard]] bool isVerified() const {
-		return flags() & UserDataFlag::Verified;
+	[[nodiscard]] bool isVerified() const;
+	[[nodiscard]] bool isScam() const;
+	[[nodiscard]] bool isFake() const;
+	[[nodiscard]] bool isPremium() const;
+	[[nodiscard]] bool isBot() const;
+	[[nodiscard]] bool isSupport() const;
+	[[nodiscard]] bool isInaccessible() const;
+	[[nodiscard]] bool applyMinPhoto() const;
+	[[nodiscard]] bool hasPersonalPhoto() const;
+	[[nodiscard]] bool hasStoriesHidden() const;
+	[[nodiscard]] bool hasRequirePremiumToWrite() const;
+	[[nodiscard]] bool hasStarsPerMessage() const;
+	[[nodiscard]] bool requiresPremiumToWrite() const;
+	[[nodiscard]] bool messageMoneyRestrictionsKnown() const;
+	[[nodiscard]] bool canSendIgnoreMoneyRestrictions() const;
+	[[nodiscard]] bool readDatesPrivate() const;
+	[[nodiscard]] bool allowsForwarding() const;
+	void setNoForwardsFlags(bool myEnabled, bool peerEnabled);
+	[[nodiscard]] bool isForum() const {
+		return flags() & Flag::Forum;
 	}
-	[[nodiscard]] bool isScam() const {
-		return flags() & UserDataFlag::Scam;
+	[[nodiscard]] Data::Forum *forum() const {
+		return botInfo ? botInfo->forum() : nullptr;
 	}
-	[[nodiscard]] bool isFake() const {
-		return flags() & UserDataFlag::Fake;
-	}
-	[[nodiscard]] bool isBotInlineGeo() const {
-		return flags() & UserDataFlag::BotInlineGeo;
-	}
-	[[nodiscard]] bool isBot() const {
-		return botInfo != nullptr;
-	}
-	[[nodiscard]] bool isSupport() const {
-		return flags() & UserDataFlag::Support;
-	}
-	[[nodiscard]] bool isInaccessible() const {
-		return flags() & UserDataFlag::Deleted;
-	}
-	[[nodiscard]] bool canWrite() const {
-		// Duplicated in Data::CanWriteValue().
-		return !isInaccessible() && !isRepliesChat();
-	}
-	[[nodiscard]] bool applyMinPhoto() const {
-		return !(flags() & UserDataFlag::DiscardMinPhoto);
-	}
+
+	void setStoriesCorrespondent(bool is);
+	[[nodiscard]] bool storiesCorrespondent() const;
+
+	void setStarsPerMessage(int stars);
+	[[nodiscard]] int starsPerMessage() const;
+
+	void setStarsRating(Data::StarsRating value);
+	[[nodiscard]] Data::StarsRating starsRating() const;
 
 	[[nodiscard]] bool canShareThisContact() const;
-	[[nodiscard]] bool canAddContact() const {
-		return canShareThisContact() && !isContact();
-	}
 
 	// In Data::Session::processUsers() we check only that.
 	// When actually trying to share contact we perform
 	// a full check by canShareThisContact() call.
-	[[nodiscard]] bool canShareThisContactFast() const {
-		return !_phone.isEmpty();
-	}
+	[[nodiscard]] bool canShareThisContactFast() const;
 
-	MTPInputUser inputUser = MTP_inputUserEmpty();
+	[[nodiscard]] const QString &phone() const;
+	[[nodiscard]] QString username() const;
+	[[nodiscard]] QString editableUsername() const;
+	[[nodiscard]] const std::vector<QString> &usernames() const;
+	[[nodiscard]] bool isUsernameEditable(QString username) const;
 
-	QString firstName;
-	QString lastName;
-	QString username;
-	[[nodiscard]] const QString &phone() const {
-		return _phone;
+	[[nodiscard]] bool isOldWalletBot() const;
+
+	void setBotVerifyDetails(Ui::BotVerifyDetails details);
+	void setBotVerifyDetailsIcon(DocumentId iconId);
+	[[nodiscard]] Ui::BotVerifyDetails *botVerifyDetails() const {
+		return _botVerifyDetails.get();
 	}
-	QString nameOrPhone;
-	Ui::Text::String phoneText;
-	TimeId onlineTill = 0;
 
 	enum class ContactStatus : char {
 		Unknown,
 		Contact,
 		NotContact,
 	};
-	[[nodiscard]] ContactStatus contactStatus() const {
-		return _contactStatus;
-	}
-	[[nodiscard]] bool isContact() const {
-		return (contactStatus() == ContactStatus::Contact);
-	}
+	[[nodiscard]] ContactStatus contactStatus() const;
+	[[nodiscard]] bool isContact() const;
 	void setIsContact(bool is);
+
+	[[nodiscard]] Data::LastseenStatus lastseen() const;
+	bool updateLastseen(Data::LastseenStatus value);
 
 	enum class CallsStatus : char {
 		Unknown,
@@ -156,42 +278,120 @@ public:
 		Disabled,
 		Private,
 	};
-	CallsStatus callsStatus() const {
-		return _callsStatus;
-	}
+	CallsStatus callsStatus() const;
 	bool hasCalls() const;
 	void setCallsStatus(CallsStatus callsStatus);
 
+	[[nodiscard]] Data::Birthday birthday() const;
+	void setBirthday(Data::Birthday value);
+	void setBirthday(const tl::conditional<MTPBirthday> &value);
+
+	[[nodiscard]] int commonChatsCount() const;
+	void setCommonChatsCount(int count);
+
+	[[nodiscard]] int peerGiftsCount() const;
+	void setPeerGiftsCount(int count);
+
+	// Disengaged means no source has answered about this user yet; engaged
+	// and empty means a source answered and this user has no wallet; engaged
+	// and non-empty is the canonical raw address. Every write is an answer,
+	// never a nullopt: answers come from wallet.getUserAddresses.
+	[[nodiscard]] const std::optional<QString> &gramAddress() const;
+	void setGramAddress(QString address);
+
+	[[nodiscard]] const Data::WalletCard *walletCard() const;
+	void setWalletCard(std::optional<Data::WalletCard> card);
+
+	[[nodiscard]] bool hasActiveStories() const;
+	[[nodiscard]] bool hasUnreadStories() const;
+	[[nodiscard]] bool hasActiveVideoStream() const;
+	void setStoriesState(StoriesState state);
+
+	[[nodiscard]] const Data::BusinessDetails &businessDetails() const;
+	void setBusinessDetails(Data::BusinessDetails details);
+
+	void setStarRefProgram(StarRefProgram program);
+
+	[[nodiscard]] ChannelId personalChannelId() const;
+	[[nodiscard]] MsgId personalChannelMessageId() const;
+	void setPersonalChannel(ChannelId channelId, MsgId messageId);
+
+	[[nodiscard]] ChannelId linkedCommunityId() const;
+	void setLinkedCommunityId(ChannelId id);
+
+	[[nodiscard]] UserId botManagerId() const;
+	void setBotManagerId(UserId managerId);
+
+	[[nodiscard]] bool unofficialSecurityRisk() const {
+		return flags() & Flag::UnofficialSecurityRisk;
+	}
+
+	[[nodiscard]] MTPInputUser inputUser() const;
+
+	QString firstName;
+	QString lastName;
+	QString nameOrPhone;
+
 	std::unique_ptr<BotInfo> botInfo;
 
-	void setUnavailableReasons(
-		std::vector<Data::UnavailableReason> &&reasons);
-
-	int commonChatsCount() const {
-		return _commonChatsCount;
+	[[nodiscard]] Api::DisallowedGiftTypes disallowedGiftTypes() const {
+		return _disallowedGiftTypes;
 	}
-	void setCommonChatsCount(int count);
+	void setDisallowedGiftTypes(Api::DisallowedGiftTypes types);
+
+	[[nodiscard]] const TextWithEntities &note() const;
+	void setNote(const TextWithEntities &note);
 
 private:
 	auto unavailableReasons() const
 		-> const std::vector<Data::UnavailableReason> & override;
 
-	Flags _flags;
+	void setUnavailableReasonsList(
+		std::vector<Data::UnavailableReason> &&reasons) override;
 
-	std::vector<Data::UnavailableReason> _unavailableReasons;
-	QString _phone;
+	Flags _flags;
+	Data::LastseenStatus _lastseen;
+	Data::Birthday _birthday;
+	int _commonChatsCount = 0;
+	int _peerGiftsCount = 0;
+	int _starsPerMessage = 0;
 	ContactStatus _contactStatus = ContactStatus::Unknown;
 	CallsStatus _callsStatus = CallsStatus::Unknown;
-	int _commonChatsCount = 0;
+
+	Data::UsernamesInfo _username;
+
+	std::unique_ptr<Data::BusinessDetails> _businessDetails;
+	std::vector<Data::UnavailableReason> _unavailableReasons;
+	QString _phone;
+	std::optional<QString> _gramAddress;
+	std::unique_ptr<Ui::BotVerifyDetails> _botVerifyDetails;
+	std::unique_ptr<Data::WalletCard> _walletCard;
+	Data::StarsRating _starsRating;
+
+	ChannelId _personalChannelId = 0;
+	MsgId _personalChannelMessageId = 0;
+	ChannelId _linkedCommunityId = 0;
+	UserId _botManagerId = 0;
 
 	uint64 _accessHash = 0;
 	static constexpr auto kInaccessibleAccessHashOld
 		= 0xFFFFFFFFFFFFFFFFULL;
 
+	Api::DisallowedGiftTypes _disallowedGiftTypes;
+	TextWithEntities _note;
+
 };
 
 namespace Data {
 
-void ApplyUserUpdate(not_null<UserData*> user, const MTPDuserFull &update);
+void ApplyUserUpdate(
+	not_null<UserData*> user,
+	const MTPDuserFull &update);
+
+[[nodiscard]] StarRefProgram ParseStarRefProgram(
+	const MTPStarRefProgram *program);
+
+[[nodiscard]] Ui::BotVerifyDetails ParseBotVerifyDetails(
+	const MTPBotVerification *info);
 
 } // namespace Data

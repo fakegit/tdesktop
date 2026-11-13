@@ -7,25 +7,37 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #pragma once
 
+#include "api/api_common.h"
+#include "ui/text/text_entity.h"
+
 namespace Api {
 enum class SendProgressType;
-struct SendOptions;
+struct SendAction;
 } // namespace Api
+
+namespace Data {
+class GroupCall;
+} // namespace Data
 
 class History;
 
 namespace HistoryView::Controls {
 
+extern const char kOptionMacCmdReplyImmediately[];
+
 struct MessageToEdit {
 	FullMsgId fullId;
 	Api::SendOptions options;
 	TextWithTags textWithTags;
+	bool spoilered = false;
+	Api::VideoCoverEdit videoCover;
 };
 struct VoiceToSend {
 	QByteArray bytes;
 	VoiceWaveform waveform;
-	int duration = 0;
+	crl::time duration = 0;
 	Api::SendOptions options;
+	bool video = false;
 };
 struct SendActionUpdate {
 	Api::SendProgressType type = Api::SendProgressType();
@@ -33,12 +45,49 @@ struct SendActionUpdate {
 	bool cancel = false;
 };
 
+enum class WriteRestrictionType {
+	None,
+	Rights,
+	PremiumRequired,
+	Frozen,
+	Hidden,
+};
+
+struct WriteRestriction {
+	using Type = WriteRestrictionType;
+
+	QString text;
+	QString button;
+	Type type = Type::None;
+	int boostsToLift = false;
+
+	[[nodiscard]] bool empty() const {
+		return (type == Type::None);
+	}
+	explicit operator bool() const {
+		return !empty();
+	}
+
+	friend inline bool operator==(
+		const WriteRestriction &a,
+		const WriteRestriction &b) = default;
+};
+
 struct SetHistoryArgs {
 	required<History*> history;
+	std::shared_ptr<Data::GroupCall> videoStream;
+	MsgId topicRootId = 0;
+	PeerId monoforumPeerId = 0;
 	Fn<bool()> showSlowmodeError;
+	Fn<bool()> showScheduleSendError;
+	Fn<Api::SendAction()> sendActionFactory;
+	Fn<void(TextWithEntities, Api::SendOptions, Fn<void()>)> sendWithText;
 	rpl::producer<int> slowmodeSecondsLeft;
 	rpl::producer<bool> sendDisabledBySlowmode;
-	rpl::producer<std::optional<QString>> writeRestriction;
+	rpl::producer<bool> liked;
+	rpl::producer<int> minStarsCount;
+	rpl::producer<WriteRestriction> writeRestriction;
+	rpl::producer<bool> canSendTexts;
 };
 
 struct ReplyNextRequest {
@@ -48,6 +97,18 @@ struct ReplyNextRequest {
 	};
 	const FullMsgId replyId;
 	const Direction direction;
+};
+
+enum class ToggleCommentsState {
+	Empty,
+	Shown,
+	Hidden,
+	WithNew,
+};
+
+struct SendStarButtonEffect {
+	not_null<PeerData*> from;
+	int stars = 0;
 };
 
 } // namespace HistoryView::Controls

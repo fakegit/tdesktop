@@ -8,10 +8,10 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "chat_helpers/stickers_dice_pack.h"
 
 #include "main/main_session.h"
+#include "chat_helpers/stickers_lottie.h"
+#include "data/data_media_types.h"
 #include "data/data_session.h"
 #include "data/data_document.h"
-#include "ui/image/image_location_factory.h"
-#include "storage/localimageloader.h"
 #include "base/unixtime.h"
 #include "apiwrap.h"
 
@@ -25,6 +25,7 @@ const QString DicePacks::kDartString = QString::fromUtf8("\xF0\x9F\x8E\xAF");
 const QString DicePacks::kSlotString = QString::fromUtf8("\xF0\x9F\x8E\xB0");
 const QString DicePacks::kFballString = QString::fromUtf8("\xE2\x9A\xBD");
 const QString DicePacks::kBballString = QString::fromUtf8("\xF0\x9F\x8F\x80");
+const QString DicePacks::kPartyPopper = QString::fromUtf8("\xf0\x9f\x8e\x89");
 
 DicePack::DicePack(not_null<Main::Session*> session, const QString &emoji)
 : _session(session)
@@ -34,7 +35,7 @@ DicePack::DicePack(not_null<Main::Session*> session, const QString &emoji)
 DicePack::~DicePack() = default;
 
 DocumentData *DicePack::lookup(int value) {
-	if (!_requestId) {
+	if (!_requestId && _emoji != DicePacks::kPartyPopper) {
 		load();
 	}
 	tryGenerateLocalZero();
@@ -47,12 +48,15 @@ void DicePack::load() {
 		return;
 	}
 	_requestId = _session->api().request(MTPmessages_GetStickerSet(
-		MTP_inputStickerSetDice(MTP_string(_emoji))
+		MTP_inputStickerSetDice(MTP_string(_emoji)),
+		MTP_int(0) // hash
 	)).done([=](const MTPmessages_StickerSet &result) {
 		result.match([&](const MTPDmessages_stickerSet &data) {
 			applySet(data);
+		}, [](const MTPDmessages_stickerSetNotModified &) {
+			LOG(("API Error: Unexpected messages.stickerSetNotModified."));
 		});
-	}).fail([=](const MTP::Error &error) {
+	}).fail([=] {
 		_requestId = 0;
 	}).send();
 }
@@ -62,8 +66,7 @@ void DicePack::applySet(const MTPDmessages_stickerSet &data) {
 	auto index = 0;
 	auto documents = base::flat_map<DocumentId, not_null<DocumentData*>>();
 	for (const auto &sticker : data.vdocuments().v) {
-		const auto document = _session->data().processDocument(
-			sticker);
+		const auto document = _session->data().processDocument(sticker);
 		if (document->sticker()) {
 			if (isSlotMachine) {
 				_map.emplace(index++, document);
@@ -100,6 +103,11 @@ void DicePack::tryGenerateLocalZero() {
 		return;
 	}
 
+	const auto generateLocal = [&](int index, const QString &name) {
+		_map.emplace(
+			index,
+			ChatHelpers::GenerateLocalTgsSticker(_session, name));
+	};
 	if (_emoji == DicePacks::kDiceString) {
 		generateLocal(0, u"dice_idle"_q);
 	} else if (_emoji == DicePacks::kDartString) {
@@ -114,34 +122,13 @@ void DicePack::tryGenerateLocalZero() {
 		generateLocal(8, u"slot_0_idle"_q);
 		generateLocal(14, u"slot_1_idle"_q);
 		generateLocal(20, u"slot_2_idle"_q);
+	} else if (_emoji == DicePacks::kPartyPopper) {
+		generateLocal(0, u"winners"_q);
 	}
 }
 
-void DicePack::generateLocal(int index, const QString &name) {
-	const auto path = u":/gui/art/"_q + name + u".tgs"_q;
-	auto task = FileLoadTask(
-		_session,
-		path,
-		QByteArray(),
-		nullptr,
-		SendMediaType::File,
-		FileLoadTo(0, {}, 0, 0),
-		{});
-	task.process({ .generateGoodThumbnail = false });
-	const auto result = task.peekResult();
-	Assert(result != nullptr);
-	const auto document = _session->data().processDocument(
-		result->document,
-		Images::FromImageInMemory(result->thumb, "WEBP", result->thumbbytes));
-	document->setLocation(Core::FileLocation(path));
-
-	_map.emplace(index, document);
-
-	Ensures(document->sticker());
-	Ensures(document->sticker()->animated);
-}
-
-DicePacks::DicePacks(not_null<Main::Session*> session) : _session(session) {
+DicePacks::DicePacks(not_null<Main::Session*> session)
+: _session(session) {
 }
 
 DocumentData *DicePacks::lookup(const QString &emoji, int value) {
@@ -156,6 +143,56 @@ DocumentData *DicePacks::lookup(const QString &emoji, int value) {
 		key,
 		std::make_unique<DicePack>(_session, key)
 	).first->second->lookup(value);
+}
+
+void DicePacks::resolveGameOptions(
+		Fn<void(const Data::DiceGameOptions &)> done) {
+	_resolveGameOptionsCallback = std::move(done);
+	if (_resolveGameOptionsRequestId) {
+		return;
+	}
+
+	_resolveGameOptionsRequestId = _session->api().request(
+		MTPmessages_GetEmojiGameInfo()
+	).done([=](const MTPmessages_EmojiGameInfo &result) {
+		_resolveGameOptionsRequestId = 0;
+		if (const auto onstack = base::take(_resolveGameOptionsCallback)) {
+			onstack(result.match([&](
+					const MTPDmessages_emojiGameUnavailable &) {
+				return Data::DiceGameOptions();
+			}, [&](const MTPDmessages_emojiGameDiceInfo &data) {
+				auto jackpot = 0;
+				auto rewards = std::array<int, 6>{};
+				const auto &params = data.vparams().v;
+				const auto count = int(params.size());
+				for (auto i = 0; i != count; ++i) {
+					if (i < 6) {
+						rewards[i] = params[i].v;
+					} else if (i == 6) {
+						jackpot = params[i].v;
+					} else {
+						break;
+					}
+				}
+				return Data::DiceGameOptions{
+					.seedHash = data.vgame_hash().v,
+					.previousSteakNanoTon = int64(data.vprev_stake().v),
+					.milliRewards = rewards,
+					.jackpotMilliReward = jackpot,
+					.currentStreak = data.vcurrent_streak().v,
+					.playsLeft = data.vplays_left().value_or_empty(),
+				};
+			}));
+		}
+	}).fail([=] {
+		_resolveGameOptionsRequestId = 0;
+		if (const auto onstack = base::take(_resolveGameOptionsCallback)) {
+			onstack({});
+		}
+	}).send();
+}
+
+void DicePacks::apply(const MTPDupdateEmojiGameInfo &update) {
 }
 
 } // namespace Stickers

@@ -17,6 +17,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "ui/wrap/padding_wrap.h"
 #include "ui/text/format_values.h"
 #include "ui/toast/toast.h"
+#include "ui/power_saving.h"
 #include "lang/lang_keys.h"
 #include "core/application.h"
 #include "calls/calls_call.h"
@@ -24,16 +25,18 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "calls/calls_signal_bars.h"
 #include "calls/group/calls_group_call.h"
 #include "calls/group/calls_group_menu.h" // Group::LeaveBox.
-#include "history/view/history_view_group_call_tracker.h" // ContentByCall.
+#include "history/view/history_view_group_call_bar.h" // ContentByCall.
 #include "data/data_user.h"
 #include "data/data_group_call.h"
 #include "data/data_peer.h"
 #include "data/data_changes.h"
+#include "data/data_session.h"
 #include "main/main_session.h"
 #include "boxes/abstract_box.h"
 #include "base/timer.h"
+#include "styles/style_basic.h"
 #include "styles/style_calls.h"
-#include "styles/style_chat.h" // style::GroupCallUserpics
+#include "styles/style_chat_helpers.h" // style::GroupCallUserpics
 #include "styles/style_layers.h"
 
 namespace Calls {
@@ -48,7 +51,6 @@ enum class BarState {
 namespace {
 
 constexpr auto kUpdateDebugTimeoutMs = crl::time(500);
-constexpr auto kSwitchStateDuration = 120;
 
 constexpr auto kMinorBlobAlpha = 76. / 255.;
 
@@ -147,7 +149,7 @@ DebugInfoBox::DebugInfoBox(QWidget*, base::weak_ptr<Call> call)
 }
 
 void DebugInfoBox::prepare() {
-	setTitle(rpl::single(qsl("Call Debug")));
+	setTitle(u"Call Debug"_q);
 
 	addButton(tr::lng_close(), [this] { closeBox(); });
 	_text = setInnerWidget(
@@ -184,7 +186,7 @@ public:
 		installEventFilter(this);
 
 		style::PaletteChanged(
-		) | rpl::start_with_next([=] {
+		) | rpl::on_next([=] {
 			_crossLineMuteAnimation.invalidate();
 		}, lifetime());
 	}
@@ -204,7 +206,7 @@ public:
 protected:
 	bool eventFilter(QObject *object, QEvent *event) {
 		if (event->type() == QEvent::Paint) {
-			Painter p(this);
+			auto p = QPainter(this);
 			paintRipple(
 				p,
 				_st.rippleAreaPosition.x(),
@@ -227,23 +229,27 @@ private:
 
 TopBar::TopBar(
 	QWidget *parent,
-	const base::weak_ptr<Call> &call)
-: TopBar(parent, call, nullptr) {
+	Call *call,
+	std::shared_ptr<Ui::Show> show)
+: TopBar(parent, show, call, nullptr) {
 }
 
 TopBar::TopBar(
 	QWidget *parent,
-	const base::weak_ptr<GroupCall> &call)
-: TopBar(parent, nullptr, call) {
+	GroupCall *call,
+	std::shared_ptr<Ui::Show> show)
+: TopBar(parent, show, nullptr, call) {
 }
 
 TopBar::TopBar(
 	QWidget *parent,
-	const base::weak_ptr<Call> &call,
-	const base::weak_ptr<GroupCall> &groupCall)
+	std::shared_ptr<Ui::Show> show,
+	Call *call,
+	GroupCall *groupCall)
 : RpWidget(parent)
 , _call(call)
 , _groupCall(groupCall)
+, _show(show)
 , _userpics(call
 	? nullptr
 	: std::make_unique<Ui::GroupCallUserpics>(
@@ -262,7 +268,7 @@ TopBar::TopBar(
 	? object_ptr<Ui::LabelSimple>(
 		this,
 		st::callBarLabel,
-		tr::lng_call_bar_hangup(tr::now).toUpper())
+		tr::lng_call_bar_hangup(tr::now))
 	: object_ptr<Ui::LabelSimple>(nullptr))
 , _mute(this, st::callBarMuteToggle)
 , _info(this)
@@ -271,6 +277,14 @@ TopBar::TopBar(
 , _updateDurationTimer([=] { updateDurationText(); }) {
 	initControls();
 	resize(width(), st::callBarHeight);
+	setupInitialBrush();
+}
+
+void TopBar::setupInitialBrush() {
+	Expects(_switchStateCallback != nullptr);
+
+	_switchStateAnimation.stop();
+	_switchStateCallback(1.);
 }
 
 void TopBar::initControls() {
@@ -279,7 +293,8 @@ void TopBar::initControls() {
 			call->setMuted(!call->muted());
 		} else if (const auto group = _groupCall.get()) {
 			if (group->mutedByAdmin()) {
-				Ui::Toast::Show(tr::lng_group_call_force_muted_sub(tr::now));
+				_show->showToast(
+					tr::lng_group_call_force_muted_sub(tr::now));
 			} else {
 				group->setMuted((group->muted() == MuteState::Muted)
 					? MuteState::Active
@@ -304,25 +319,27 @@ void TopBar::initControls() {
 			_call->mutedValue() | rpl::map(mapToState),
 			rpl::single(GroupCall::InstanceState::Connected),
 			rpl::single(TimeId(0))
-		) | rpl::type_erased()
+		) | rpl::type_erased
 		: rpl::combine(
 			(_groupCall->mutedValue()
 				| MapPushToTalkToActive()
 				| rpl::distinct_until_changed()
-				| rpl::type_erased()),
-			_groupCall->instanceStateValue(),
+				| rpl::type_erased),
+			rpl::single(
+				_groupCall->instanceState()
+			) | rpl::then(_groupCall->instanceStateValue() | rpl::filter(
+				_1 != GroupCall::InstanceState::TransitionToRtc)),
 			rpl::single(
 				_groupCall->scheduleDate()
 			) | rpl::then(_groupCall->real(
 			) | rpl::map([](not_null<Data::GroupCall*> call) {
 				return call->scheduleDateValue();
-			}) | rpl::flatten_latest())
-		) | rpl::filter(_2 != GroupCall::InstanceState::TransitionToRtc);
+			}) | rpl::flatten_latest()));
 	std::move(
 		muted
 	) | rpl::map(
 		BarStateFromMuteState
-	) | rpl::start_with_next([=](BarState state) {
+	) | rpl::on_next([=](BarState state) {
 		_isGroupConnecting = (state == BarState::Connecting);
 		setMuted(state != BarState::Active);
 		update();
@@ -344,7 +361,7 @@ void TopBar::initControls() {
 		const auto crossFrom = (fromMuted != BarState::Active) ? 1. : 0.;
 		const auto crossTo = (toMuted != BarState::Active) ? 1. : 0.;
 
-		auto animationCallback = [=](float64 value) {
+		_switchStateCallback = [=](float64 value) {
 			if (_groupCall) {
 				_groupBrush = QBrush(
 					_gradients.gradient(fromMuted, toMuted, value));
@@ -353,14 +370,14 @@ void TopBar::initControls() {
 
 			const auto crossProgress = (crossFrom == crossTo)
 				? crossTo
-				: anim::interpolateF(crossFrom, crossTo, value);
+				: anim::interpolateToF(crossFrom, crossTo, value);
 			_mute->setProgress(crossProgress);
 		};
 
 		_switchStateAnimation.stop();
-		const auto duration = (to - from) * kSwitchStateDuration;
+		const auto duration = (to - from) * st::universalDuration;
 		_switchStateAnimation.start(
-			std::move(animationCallback),
+			_switchStateCallback,
 			from,
 			to,
 			duration);
@@ -370,7 +387,7 @@ void TopBar::initControls() {
 		subscribeToMembersChanges(group);
 
 		_isGroupConnecting.value(
-		) | rpl::start_with_next([=](bool isConnecting) {
+		) | rpl::on_next([=](bool isConnecting) {
 			_mute->setAttribute(
 				Qt::WA_TransparentForMouseEvents,
 				isConnecting);
@@ -384,7 +401,7 @@ void TopBar::initControls() {
 		) | rpl::filter([=](const Data::PeerUpdate &update) {
 			// _user may change for the same Panel.
 			return (_call != nullptr) && (update.peer == _call->user());
-		}) | rpl::start_with_next([=] {
+		}) | rpl::on_next([=] {
 			updateInfoLabels();
 		}, lifetime());
 	}
@@ -394,7 +411,9 @@ void TopBar::initControls() {
 		if (const auto call = _call.get()) {
 			if (Logs::DebugEnabled()
 				&& (_info->clickModifiers() & Qt::ControlModifier)) {
-				Ui::show(Box<DebugInfoBox>(_call));
+				_show->showBox(
+					Box<DebugInfoBox>(_call),
+					Ui::LayerOption::CloseOther);
 			} else {
 				Core::App().calls().showInfoPanel(call);
 			}
@@ -406,14 +425,16 @@ void TopBar::initControls() {
 		if (const auto call = _call.get()) {
 			call->hangup();
 		} else if (const auto group = _groupCall.get()) {
-			if (!group->peer()->canManageGroupCall()) {
+			if (!group->canManage()) {
 				group->hangup();
 			} else {
-				Ui::show(Box(
-					Group::LeaveBox,
-					group,
-					false,
-					Group::BoxContext::MainWindow));
+				_show->showBox(
+					Box(
+						Group::LeaveBox,
+						group,
+						false,
+						Group::BoxContext::MainWindow),
+					Ui::LayerOption::CloseOther);
 			}
 		}
 	});
@@ -470,29 +491,23 @@ void TopBar::initBlobsUnder(
 	});
 
 	group->stateValue(
-	) | rpl::start_with_next([=](Calls::GroupCall::State state) {
+	) | rpl::on_next([=](Calls::GroupCall::State state) {
 		if (state == Calls::GroupCall::State::HangingUp) {
 			_blobs->hide();
 		}
 	}, lifetime());
 
+	using namespace rpl::mappers;
 	auto hideBlobs = rpl::combine(
-		rpl::single(anim::Disabled()) | rpl::then(anim::Disables()),
+		PowerSaving::OnValue(PowerSaving::kCalls),
 		Core::App().appDeactivatedValue(),
 		group->instanceStateValue()
-	) | rpl::map([](
-			bool animDisabled,
-			bool hide,
-			GroupCall::InstanceState instanceState) {
-		return (instanceState == GroupCall::InstanceState::Disconnected)
-			|| animDisabled
-			|| hide;
-	});
+	) | rpl::map(_1 || _2 || _3 == GroupCall::InstanceState::Disconnected);
 
 	std::move(
 		hideBlobs
 	) | rpl::distinct_until_changed(
-	) | rpl::start_with_next([=](bool hide) {
+	) | rpl::on_next([=](bool hide) {
 		if (hide) {
 			state->paint.setLevel(0.);
 		}
@@ -515,7 +530,7 @@ void TopBar::initBlobsUnder(
 
 	std::move(
 		barGeometry
-	) | rpl::start_with_next([=](QRect rect) {
+	) | rpl::on_next([=](QRect rect) {
 		_blobs->resize(
 			rect.width(),
 			(int)state->paint.maxRadius());
@@ -523,19 +538,19 @@ void TopBar::initBlobsUnder(
 	}, lifetime());
 
 	shownValue(
-	) | rpl::start_with_next([=](bool shown) {
+	) | rpl::on_next([=](bool shown) {
 		_blobs->setVisible(shown);
 	}, lifetime());
 
 	_blobs->paintRequest(
-	) | rpl::start_with_next([=](QRect clip) {
+	) | rpl::on_next([=](QRect clip) {
 		const auto hidden = state->hideAnimation.value(
 			state->hideLastTime ? 1. : 0.);
 		if (hidden == 1.) {
 			return;
 		}
 
-		Painter p(_blobs);
+		auto p = QPainter(_blobs);
 		if (hidden > 0.) {
 			p.setOpacity(1. - hidden);
 		}
@@ -548,7 +563,7 @@ void TopBar::initBlobsUnder(
 	group->levelUpdates(
 	) | rpl::filter([=](const LevelUpdate &update) {
 		return !state->hideLastTime && (update.value > state->lastLevel);
-	}) | rpl::start_with_next([=](const LevelUpdate &update) {
+	}) | rpl::on_next([=](const LevelUpdate &update) {
 		if (state->lastLevel == 0.) {
 			state->levelTimer.callEach(kBlobUpdateInterval);
 		}
@@ -566,28 +581,33 @@ void TopBar::initBlobsUnder(
 
 void TopBar::subscribeToMembersChanges(not_null<GroupCall*> call) {
 	const auto peer = call->peer();
-	peer->session().changes().peerFlagsValue(
-		peer,
-		Data::PeerUpdate::Flag::GroupCall
-	) | rpl::map([=] {
-		return peer->groupCall();
-	}) | rpl::filter([=](Data::GroupCall *real) {
-		const auto call = _groupCall.get();
-		return call && real && (real->id() == call->id());
-	}) | rpl::take(
-		1
+	const auto group = _groupCall.get();
+	const auto conference = group && group->conference();
+	auto realValue = conference
+		? (rpl::single(group->sharedCall().get()) | rpl::type_erased)
+		: peer->session().changes().peerFlagsValue(
+			peer,
+			Data::PeerUpdate::Flag::GroupCall
+		) | rpl::map([=] {
+			return peer->groupCall();
+		}) | rpl::filter([=](Data::GroupCall *real) {
+			const auto call = _groupCall.get();
+			return call && real && (real->id() == call->id());
+		}) | rpl::take(1);
+	std::move(
+		realValue
 	) | rpl::before_next([=](not_null<Data::GroupCall*> real) {
-		real->titleValue() | rpl::start_with_next([=] {
+		real->titleValue() | rpl::on_next([=] {
 			updateInfoLabels();
 		}, lifetime());
 	}) | rpl::map([=](not_null<Data::GroupCall*> real) {
-
-		return HistoryView::GroupCallTracker::ContentByCall(
+		return HistoryView::GroupCallBarContentByCall(
 			real,
 			st::groupCallTopBarUserpics.size);
 	}) | rpl::flatten_latest(
 	) | rpl::filter([=](const Ui::GroupCallBarContent &content) {
-		if (_users.size() != content.users.size()) {
+		if (_users.size() != content.users.size()
+			|| (conference && _usersCount != content.count)) {
 			return true;
 		}
 		for (auto i = 0, count = int(_users.size()); i != count; ++i) {
@@ -597,16 +617,20 @@ void TopBar::subscribeToMembersChanges(not_null<GroupCall*> call) {
 			}
 		}
 		return false;
-	}) | rpl::start_with_next([=](const Ui::GroupCallBarContent &content) {
+	}) | rpl::on_next([=](const Ui::GroupCallBarContent &content) {
 		_users = content.users;
+		_usersCount = content.count;
 		for (auto &user : _users) {
 			user.speaking = false;
 		}
 		_userpics->update(_users, !isHidden());
+		if (conference) {
+			updateInfoLabels();
+		}
 	}, lifetime());
 
 	_userpics->widthValue(
-	) | rpl::start_with_next([=](int width) {
+	) | rpl::on_next([=](int width) {
 		_userpicsWidth = width;
 		updateControlsGeometry();
 	}, lifetime());
@@ -617,7 +641,7 @@ void TopBar::subscribeToMembersChanges(not_null<GroupCall*> call) {
 		// _peer may change for the same Panel.
 		const auto call = _groupCall.get();
 		return (call != nullptr) && (update.peer == call->peer());
-	}) | rpl::start_with_next([=] {
+	}) | rpl::on_next([=] {
 		updateInfoLabels();
 	}, lifetime());
 }
@@ -634,21 +658,69 @@ void TopBar::updateInfoLabels() {
 void TopBar::setInfoLabels() {
 	if (const auto call = _call.get()) {
 		const auto user = call->user();
-		const auto fullName = user->name;
+		const auto fullName = user->name();
 		const auto shortName = user->firstName;
 		_fullInfoLabel->setText(fullName);
 		_shortInfoLabel->setText(shortName);
 	} else if (const auto group = _groupCall.get()) {
 		const auto peer = group->peer();
 		const auto real = peer->groupCall();
-		const auto name = peer->name;
-		const auto text = _isGroupConnecting.current()
-			? tr::lng_group_call_connecting(tr::now)
-			: (real && real->id() == group->id() && !real->title().isEmpty())
-			? real->title()
-			: name;
-		_fullInfoLabel->setText(text);
-		_shortInfoLabel->setText(text);
+		const auto connecting = _isGroupConnecting.current();
+		if (!group->conference()) {
+			_shortInfoLabel.destroy();
+		}
+		if (!group->conference() || connecting) {
+			const auto name = peer->name();
+			const auto title = (real && real->id() == group->id())
+				? real->title()
+				: QString();
+			const auto text = _isGroupConnecting.current()
+				? tr::lng_group_call_connecting(tr::now)
+				: !title.isEmpty()
+				? title
+				: name;
+			_fullInfoLabel->setText(text);
+			if (_shortInfoLabel) {
+				_shortInfoLabel->setText(text);
+			}
+		} else if (!_usersCount
+			|| _users.empty()
+			|| (_users.size() == 1
+				&& _users.front().id == peer->session().userPeerId().value
+				&& _usersCount == 1)) {
+			_fullInfoLabel->setText(tr::lng_confcall_join_title(tr::now));
+			_shortInfoLabel->setText(tr::lng_confcall_join_title(tr::now));
+		} else {
+			const auto textWithUserpics = [&](int userpics) {
+				const auto other = std::max(_usersCount - userpics, 0);
+				auto names = QStringList();
+				for (const auto &entry : _users) {
+					const auto user = peer->owner().peer(PeerId(entry.id));
+					names.push_back(user->shortName());
+					if (names.size() >= userpics) {
+						break;
+					}
+				}
+				if (other > 0) {
+					return tr::lng_forwarding_from(
+						tr::now,
+						lt_count,
+						other,
+						lt_user,
+						names.join(u", "_q));
+				} else if (userpics > 1) {
+					return tr::lng_forwarding_from_two(
+						tr::now,
+						lt_user,
+						names.mid(0, userpics - 1).join(u", "_q),
+						lt_second_user,
+						names.back());
+				}
+				return names.back();
+			};
+			_fullInfoLabel->setText(textWithUserpics(int(_users.size())));
+			_shortInfoLabel->setText(textWithUserpics(1));
+		}
 	}
 }
 
@@ -717,14 +789,12 @@ void TopBar::updateControlsGeometry() {
 		width() - _mute->width() - _hangup->width(),
 		height());
 
-	auto fullWidth = _fullInfoLabel->naturalWidth();
-	auto showFull = (left + fullWidth + right <= width());
-	_fullInfoLabel->setVisible(showFull);
-	_shortInfoLabel->setVisible(!showFull);
-
+	auto fullWidth = _fullInfoLabel->textMaxWidth();
+	auto showFull = !_shortInfoLabel
+		|| (left + fullWidth + right <= width());
 	auto setInfoLabelGeometry = [this, left, right](auto &&infoLabel) {
-		auto minPadding = qMax(left, right);
-		auto infoWidth = infoLabel->naturalWidth();
+		auto minPadding = std::max(left, right);
+		auto infoWidth = infoLabel->textMaxWidth();
 		auto infoLeft = (width() - infoWidth) / 2;
 		if (infoLeft < minPadding) {
 			infoLeft = left;
@@ -732,16 +802,24 @@ void TopBar::updateControlsGeometry() {
 		}
 		infoLabel->setGeometryToLeft(infoLeft, st::callBarLabelTop, infoWidth, st::callBarInfoLabel.style.font->height);
 	};
+
+	_fullInfoLabel->setVisible(showFull);
 	setInfoLabelGeometry(_fullInfoLabel);
-	setInfoLabelGeometry(_shortInfoLabel);
+	if (_shortInfoLabel) {
+		_shortInfoLabel->setVisible(!showFull);
+		setInfoLabelGeometry(_shortInfoLabel);
+	}
 
 	_gradients.set_points(
 		QPointF(0, st::callBarHeight / 2),
 		QPointF(width(), st::callBarHeight / 2));
+	if (!_switchStateAnimation.animating()) {
+		_switchStateCallback(1.);
+	}
 }
 
 void TopBar::paintEvent(QPaintEvent *e) {
-	Painter p(this);
+	auto p = QPainter(this);
 	auto brush = _groupCall
 		? _groupBrush
 		: (_muted ? st::callBarBgMuted : st::callBarBg);

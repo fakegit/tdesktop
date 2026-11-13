@@ -18,7 +18,7 @@ int AbstractLayoutItem::minHeight() const {
 }
 
 int AbstractLayoutItem::resizeGetHeight(int width) {
-	_width = qMin(width, _maxw);
+	_width = std::min(width, _maxw);
 	_height = _minh;
 	return _height;
 }
@@ -35,6 +35,18 @@ void AbstractLayoutItem::setPosition(int position) {
 }
 int AbstractLayoutItem::position() const {
 	return _position;
+}
+
+void AbstractLayoutItem::setShiftX(int x) {
+	_shiftX = x;
+}
+
+void AbstractLayoutItem::setShiftY(int y) {
+	_shiftY = y;
+}
+
+QPoint AbstractLayoutItem::shift() const {
+	return { _shiftX, _shiftY };
 }
 
 bool AbstractLayoutItem::hasPoint(QPoint point) const {

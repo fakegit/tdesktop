@@ -20,6 +20,8 @@ public:
 	void remove(SharedMediaRemoveOne &&query);
 	void remove(SharedMediaRemoveAll &&query);
 	void invalidate(SharedMediaInvalidateBottom &&query);
+	void unload(SharedMediaUnloadThread &&query);
+	void unload(SharedMediaUnloadAllTopics &&query);
 	rpl::producer<SharedMediaResult> query(SharedMediaQuery &&query) const;
 	SharedMediaResult snapshot(const SharedMediaQuery &query) const;
 	bool empty(const SharedMediaKey &key) const;
@@ -28,10 +30,12 @@ public:
 	rpl::producer<SharedMediaRemoveAll> sharedMediaAllRemoved() const;
 	rpl::producer<SharedMediaInvalidateBottom> sharedMediaBottomInvalidated() const;
 
+	void add(UserPhotosSetBack &&query);
 	void add(UserPhotosAddNew &&query);
 	void add(UserPhotosAddSlice &&query);
 	void remove(UserPhotosRemoveOne &&query);
 	void remove(UserPhotosRemoveAfter &&query);
+	void replace(UserPhotosReplace &&query);
 	rpl::producer<UserPhotosResult> query(UserPhotosQuery &&query) const;
 	rpl::producer<UserPhotosSliceUpdate> userPhotosSliceUpdated() const;
 
@@ -65,6 +69,14 @@ void Facade::Impl::invalidate(SharedMediaInvalidateBottom &&query) {
 	_sharedMedia.invalidate(std::move(query));
 }
 
+void Facade::Impl::unload(SharedMediaUnloadThread &&query) {
+	_sharedMedia.unload(std::move(query));
+}
+
+void Facade::Impl::unload(SharedMediaUnloadAllTopics &&query) {
+	_sharedMedia.unload(std::move(query));
+}
+
 rpl::producer<SharedMediaResult> Facade::Impl::query(SharedMediaQuery &&query) const {
 	return _sharedMedia.query(std::move(query));
 }
@@ -93,6 +105,10 @@ rpl::producer<SharedMediaInvalidateBottom> Facade::Impl::sharedMediaBottomInvali
 	return _sharedMedia.bottomInvalidated();
 }
 
+void Facade::Impl::add(UserPhotosSetBack &&query) {
+	return _userPhotos.add(std::move(query));
+}
+
 void Facade::Impl::add(UserPhotosAddNew &&query) {
 	return _userPhotos.add(std::move(query));
 }
@@ -107,6 +123,10 @@ void Facade::Impl::remove(UserPhotosRemoveOne &&query) {
 
 void Facade::Impl::remove(UserPhotosRemoveAfter &&query) {
 	return _userPhotos.remove(std::move(query));
+}
+
+void Facade::Impl::replace(UserPhotosReplace &&query) {
+	return _userPhotos.replace(std::move(query));
 }
 
 rpl::producer<UserPhotosResult> Facade::Impl::query(UserPhotosQuery &&query) const {
@@ -144,6 +164,14 @@ void Facade::invalidate(SharedMediaInvalidateBottom &&query) {
 	_impl->invalidate(std::move(query));
 }
 
+void Facade::unload(SharedMediaUnloadThread &&query) {
+	_impl->unload(std::move(query));
+}
+
+void Facade::unload(SharedMediaUnloadAllTopics &&query) {
+	_impl->unload(std::move(query));
+}
+
 rpl::producer<SharedMediaResult> Facade::query(SharedMediaQuery &&query) const {
 	return _impl->query(std::move(query));
 }
@@ -172,6 +200,10 @@ rpl::producer<SharedMediaInvalidateBottom> Facade::sharedMediaBottomInvalidated(
 	return _impl->sharedMediaBottomInvalidated();
 }
 
+void Facade::add(UserPhotosSetBack &&query) {
+	return _impl->add(std::move(query));
+}
+
 void Facade::add(UserPhotosAddNew &&query) {
 	return _impl->add(std::move(query));
 }
@@ -186,6 +218,10 @@ void Facade::remove(UserPhotosRemoveOne &&query) {
 
 void Facade::remove(UserPhotosRemoveAfter &&query) {
 	return _impl->remove(std::move(query));
+}
+
+void Facade::replace(UserPhotosReplace &&query) {
+	return _impl->replace(std::move(query));
 }
 
 rpl::producer<UserPhotosResult> Facade::query(UserPhotosQuery &&query) const {

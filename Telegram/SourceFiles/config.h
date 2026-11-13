@@ -7,7 +7,6 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #pragma once
 
-#include "core/version.h"
 #include "settings.h"
 
 enum {
@@ -17,21 +16,11 @@ enum {
 	LocalEncryptNoPwdIterCount = 4, // key derivation iteration count without pwd (not secure anyway)
 	LocalEncryptSaltSize = 32, // 256 bit
 
-	AnimationTimerDelta = 7,
-	RecentInlineBotsLimit = 10,
-
 	AutoSearchTimeout = 900, // 0.9 secs
-	SearchPerPage = 50,
-	SearchManyPerPage = 100,
-	LinksOverviewPerPage = 12,
-	MediaOverviewStartPerPage = 5,
 
 	PreloadHeightsCount = 3, // when 3 screens to scroll left make a preload request
 
 	SearchPeopleLimit = 5,
-	UsernameCheckTimeout = 200,
-
-	MaxMessageSize = 4096,
 
 	WebPageUserId = 701000,
 
@@ -52,22 +41,6 @@ inline const char *cGUIDStr() {
 
 	return gGuidStr;
 }
-
-static const char *UpdatesPublicKey = "\
------BEGIN RSA PUBLIC KEY-----\n\
-MIGJAoGBAMA4ViQrjkPZ9xj0lrer3r23JvxOnrtE8nI69XLGSr+sRERz9YnUptnU\n\
-BZpkIfKaRcl6XzNJiN28cVwO1Ui5JSa814UAiDHzWUqCaXUiUEQ6NmNTneiGx2sQ\n\
-+9PKKlb8mmr3BB9A45ZNwLT6G9AK3+qkZLHojeSA+m84/a6GP4svAgMBAAE=\n\
------END RSA PUBLIC KEY-----\
-";
-
-static const char *UpdatesPublicBetaKey = "\
------BEGIN RSA PUBLIC KEY-----\n\
-MIGJAoGBALWu9GGs0HED7KG7BM73CFZ6o0xufKBRQsdnq3lwA8nFQEvmdu+g/I1j\n\
-0LQ+0IQO7GW4jAgzF/4+soPDb6uHQeNFrlVx1JS9DZGhhjZ5rf65yg11nTCIHZCG\n\
-w/CVnbwQOw0g5GBwwFV3r0uTTvy44xx8XXxk+Qknu4eBCsmrAFNnAgMBAAE=\n\
------END RSA PUBLIC KEY-----\
-";
 
 #if defined TDESKTOP_API_ID && defined TDESKTOP_API_HASH
 
@@ -114,7 +87,7 @@ static const char *AlphaPrivateKey = "";
 extern QString gKeyFile;
 inline const QString &cDataFile() {
 	if (!gKeyFile.isEmpty()) return gKeyFile;
-	static const QString res(qsl("data"));
+	static const QString res(u"data"_q);
 	return res;
 }
 

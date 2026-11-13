@@ -13,6 +13,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "ui/widgets/labels.h"
 #include "ui/wrap/slide_wrap.h"
 #include "ui/wrap/vertical_layout.h"
+#include "styles/style_boxes.h"
 #include "styles/style_info.h"
 
 namespace Info {
@@ -22,17 +23,17 @@ TextWithLabel CreateTextWithLabel(
 		QWidget *parent,
 		rpl::producer<TextWithEntities> &&label,
 		rpl::producer<TextWithEntities> &&text,
+		const style::FlatLabel &labelSt,
 		const style::FlatLabel &textSt,
-		const style::margins &padding) {
+		const style::margins &padding,
+		const style::PopupMenu &stMenu) {
 	auto result = object_ptr<Ui::SlideWrap<Ui::VerticalLayout>>(
 		parent,
 		object_ptr<Ui::VerticalLayout>(parent),
 		padding);
-	result->setDuration(
-		st::infoSlideDuration
-	);
+	result->setDuration(st::infoSlideDuration);
 	auto layout = result->entity();
-	auto nonEmptyText = std::move(
+	auto nonEmptyText = rpl::duplicate(
 		text
 	) | rpl::before_next([slide = result.data()](
 			const TextWithEntities &value) {
@@ -45,22 +46,26 @@ TextWithLabel CreateTextWithLabel(
 			const TextWithEntities &value) {
 		slide->show(anim::type::normal);
 	});
-	auto labeled = layout->add(object_ptr<Ui::FlatLabel>(
+	const auto labeled = layout->add(object_ptr<Ui::FlatLabel>(
 		layout,
 		std::move(nonEmptyText),
-		textSt));
+		textSt,
+		stMenu));
+	std::move(text) | rpl::on_next([=] {
+		labeled->resizeToWidth(layout->widthNoMargins());
+	}, labeled->lifetime());
 	labeled->setSelectable(true);
 	layout->add(Ui::CreateSkipWidget(layout, st::infoLabelSkip));
-	layout->add(object_ptr<Ui::FlatLabel>(
+	const auto subtext = layout->add(object_ptr<Ui::FlatLabel>(
 		layout,
 		std::move(
 			label
 		) | rpl::after_next([=] {
 			layout->resizeToWidth(layout->widthNoMargins());
 		}),
-		st::infoLabel));
+		labelSt));
 	result->finishAnimating();
-	return { std::move(result), labeled };
+	return { std::move(result), labeled, subtext };
 }
 
 } // namespace Profile

@@ -1,10 +1,8 @@
-#!/usr/bin/scl enable llvm-toolset-7.0 -- scl enable devtoolset-9 -- bash
+#!/bin/bash
+set -e
 
 cd Telegram
 ./configure.sh "$@"
-
-if [ -n "$DEBUG" ]; then
-	cmake3 --build ../out/Debug -j$(nproc)
-else
-	cmake3 --build ../out/Release -j$(nproc)
-fi
+# KEEP_GOING=1 lets ninja report every failing translation unit in one
+# run instead of stopping at the first; the exit status still fails.
+cmake --build ../out --config "${CONFIG:-Release}" ${KEEP_GOING:+-- -k 0}

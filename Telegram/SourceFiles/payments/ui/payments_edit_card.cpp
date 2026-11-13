@@ -39,14 +39,15 @@ struct SimpleFieldState {
 }
 
 [[nodiscard]] QString RemoveNonNumbers(QString value) {
-	return value.replace(QRegularExpression("[^0-9]"), QString());
+	static const auto RegExp = QRegularExpression("[^0-9]");
+	return value.replace(RegExp, QString());
 }
 
 [[nodiscard]] SimpleFieldState NumbersOnlyState(SimpleFieldState state) {
 	return {
 		.value = RemoveNonNumbers(state.value),
-		.position = RemoveNonNumbers(
-			state.value.mid(0, state.position)).size(),
+		.position = int(RemoveNonNumbers(
+			state.value.mid(0, state.position)).size()),
 	};
 }
 
@@ -72,7 +73,9 @@ struct SimpleFieldState {
 		SimpleFieldState result) {
 	if (result.value.isEmpty()) {
 		return result;
-	} else if (result.value[0] == '1' && result.value[1] > '2') {
+	} else if (result.value[0] == '1'
+		&& (result.value.size() > 1)
+		&& result.value[1] > '2') {
 		result.value = result.value.mid(0, 2);
 		return result;
 	} else if (result.value[0] > '1') {
@@ -94,19 +97,19 @@ struct SimpleFieldState {
 [[nodiscard]] bool IsBackspace(const FieldValidateRequest &request) {
 	return (request.wasAnchor == request.wasPosition)
 		&& (request.wasPosition == request.nowPosition + 1)
-		&& (request.wasValue.midRef(0, request.wasPosition - 1)
-			== request.nowValue.midRef(0, request.nowPosition))
-		&& (request.wasValue.midRef(request.wasPosition)
-			== request.nowValue.midRef(request.nowPosition));
+		&& (request.wasValue.mid(0, request.wasPosition - 1)
+			== request.nowValue.mid(0, request.nowPosition))
+		&& (request.wasValue.mid(request.wasPosition)
+			== request.nowValue.mid(request.nowPosition));
 }
 
 [[nodiscard]] bool IsDelete(const FieldValidateRequest &request) {
 	return (request.wasAnchor == request.wasPosition)
 		&& (request.wasPosition == request.nowPosition)
-		&& (request.wasValue.midRef(0, request.wasPosition)
-			== request.nowValue.midRef(0, request.nowPosition))
-		&& (request.wasValue.midRef(request.wasPosition + 1)
-			== request.nowValue.midRef(request.nowPosition));
+		&& (request.wasValue.mid(0, request.wasPosition)
+			== request.nowValue.mid(0, request.nowPosition))
+		&& (request.wasValue.mid(request.wasPosition + 1)
+			== request.nowValue.mid(request.nowPosition));
 }
 
 template <
@@ -163,10 +166,11 @@ template <
 		PostprocessCardValidateResult);
 }
 
-[[nodiscard]] auto ExpireDateValidator() {
-	return ComplexNumberValidator(
-		Stripe::ValidateExpireDate,
-		PostprocessExpireDateValidateResult);
+[[nodiscard]] auto ExpireDateValidator(
+		const std::optional<QDate> &overrideExpireDateThreshold) {
+	return ComplexNumberValidator([=](const QString &date) {
+		return Stripe::ValidateExpireDate(date, overrideExpireDateThreshold);
+	}, PostprocessExpireDateValidateResult);
 }
 
 [[nodiscard]] auto CvcValidator(Fn<QString()> number) {
@@ -217,6 +221,8 @@ EditCard::EditCard(
 		this,
 		tr::lng_cancel(),
 		st::paymentsPanelButton) {
+	_submit->setTextTransform(RoundButtonTextTransform::ToUpper);
+	_cancel->setTextTransform(RoundButtonTextTransform::ToUpper);
 	setupControls();
 }
 
@@ -269,7 +275,7 @@ not_null<RpWidget*> EditCard::setupContent() {
 		object_ptr<VerticalLayout>(this));
 
 	_scroll->widthValue(
-	) | rpl::start_with_next([=](int width) {
+	) | rpl::on_next([=](int width) {
 		inner->resizeToWidth(width);
 	}, inner->lifetime());
 
@@ -304,7 +310,8 @@ not_null<RpWidget*> EditCard::setupContent() {
 	_expire = make(container, {
 		.type = FieldType::CardExpireDate,
 		.placeholder = tr::lng_payments_card_expire_date(),
-		.validator = ExpireDateValidator(),
+		.validator = ExpireDateValidator(
+			_delegate->panelOverrideExpireDateThreshold()),
 	});
 	_cvc = make(container, {
 		.type = FieldType::CardCVC,
@@ -312,7 +319,7 @@ not_null<RpWidget*> EditCard::setupContent() {
 		.validator = CvcValidator([=] { return _number->value(); }),
 	});
 	container->widthValue(
-	) | rpl::start_with_next([=](int width) {
+	) | rpl::on_next([=](int width) {
 		const auto left = (width - st::paymentsExpireCvcSkip) / 2;
 		const auto right = width - st::paymentsExpireCvcSkip - left;
 		_expire->widget()->resizeToWidth(left);
@@ -354,7 +361,7 @@ not_null<RpWidget*> EditCard::setupContent() {
 		});
 		if (_country) {
 			_country->finished(
-			) | rpl::start_with_next([=] {
+			) | rpl::on_next([=] {
 				_zip->setFocus();
 			}, lifetime());
 		}
@@ -369,7 +376,7 @@ not_null<RpWidget*> EditCard::setupContent() {
 	}
 
 	last->submitted(
-	) | rpl::start_with_next([=] {
+	) | rpl::on_next([=] {
 		_delegate->panelValidateCard(collect(), _save && _save->checked());
 	}, lifetime());
 

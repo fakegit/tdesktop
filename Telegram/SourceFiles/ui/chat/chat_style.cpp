@@ -8,10 +8,17 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "ui/chat/chat_style.h"
 
 #include "ui/chat/chat_theme.h"
+#include "ui/chat/chat_theme_readability.h"
 #include "ui/image/image_prepare.h" // ImageRoundRadius
+#include "ui/text/text_custom_emoji.h"
+#include "ui/color_contrast.h"
+#include "ui/painter.h"
 #include "ui/ui_utility.h"
+#include "wallet/wallet_card_angle.h"
 #include "styles/style_chat.h"
+#include "styles/style_chat_style.h"
 #include "styles/style_dialogs.h"
+#include "styles/style_polls.h"
 #include "styles/style_widgets.h"
 
 namespace Ui {
@@ -23,51 +30,43 @@ void EnsureCorners(
 		const style::color &color,
 		const style::color *shadow = nullptr) {
 	if (corners.p[0].isNull()) {
-		corners = Ui::PrepareCornerPixmaps(radius, color, shadow);
+		corners = PrepareCornerPixmaps(radius, color, shadow);
 	}
 }
 
-void RectWithCorners(
-		Painter &p,
-		QRect rect,
-		const style::color &bg,
-		const CornersPixmaps &corners,
-		RectParts roundCorners) {
-	const auto parts = RectPart::Top
-		| RectPart::NoTopBottom
-		| RectPart::Bottom
-		| roundCorners;
-	FillRoundRect(p, rect, bg, corners, nullptr, parts);
-	if ((roundCorners & RectPart::AllCorners) != RectPart::AllCorners) {
-		const auto size = corners.p[0].width() / style::DevicePixelRatio();
-		if (!(roundCorners & RectPart::TopLeft)) {
-			p.fillRect(rect.x(), rect.y(), size, size, bg);
-		}
-		if (!(roundCorners & RectPart::TopRight)) {
-			p.fillRect(
-				rect.x() + rect.width() - size,
-				rect.y(),
-				size,
-				size,
-				bg);
-		}
-		if (!(roundCorners & RectPart::BottomLeft)) {
-			p.fillRect(
-				rect.x(),
-				rect.y() + rect.height() - size,
-				size,
-				size,
-				bg);
-		}
-		if (!(roundCorners & RectPart::BottomRight)) {
-			p.fillRect(
-				rect.x() + rect.width() - size,
-				rect.y() + rect.height() - size,
-				size,
-				size,
-				bg);
-		}
+void EnsureBlockquoteCache(
+		std::unique_ptr<Text::QuotePaintCache> &cache,
+		Fn<ColorIndexValues()> values) {
+	if (cache) {
+		return;
 	}
+	cache = std::make_unique<Text::QuotePaintCache>();
+	const auto &colors = values();
+	cache->bg = colors.bg;
+	cache->outlines = colors.outlines;
+	cache->icon = colors.name;
+}
+
+void EnsurePreCache(
+		std::unique_ptr<Text::QuotePaintCache> &cache,
+		const style::color &color,
+		Fn<std::optional<QColor>()> bgOverride) {
+	if (cache) {
+		return;
+	}
+	cache = std::make_unique<Text::QuotePaintCache>();
+	const auto bg = bgOverride();
+	cache->bg = bg.value_or(color->c);
+	if (!bg) {
+		cache->bg.setAlpha(kDefaultBgOpacity * 255);
+	}
+	cache->outlines[0] = color->c;
+	cache->outlines[0].setAlpha(kDefaultOutline1Opacity * 255);
+	cache->outlines[1] = cache->outlines[2] = QColor(0, 0, 0, 0);
+	cache->header = color->c;
+	cache->header.setAlpha(kDefaultOutline2Opacity * 255);
+	cache->icon = cache->outlines[0];
+	cache->icon.setAlpha(kDefaultOutline3Opacity * 255);
 }
 
 } // namespace
@@ -78,6 +77,18 @@ not_null<const MessageStyle*> ChatPaintContext::messageStyle() const {
 
 not_null<const MessageImageStyle*> ChatPaintContext::imageStyle() const {
 	return &st->imageStyle(selected());
+}
+
+not_null<Text::QuotePaintCache*> ChatPaintContext::quoteCache(
+		const std::shared_ptr<ColorCollectible> &colorCollectible,
+		uint8 colorIndex) const {
+	return outbg
+		? messageStyle()->quoteCache[colorCollectible
+			? 2
+			: st->colorPatternIndex(colorIndex)].get()
+		: colorCollectible
+		? st->collectibleQuoteCache(selected(), colorCollectible).get()
+		: st->coloredQuoteCache(selected(), colorIndex).get();
 }
 
 int HistoryServiceMsgRadius() {
@@ -105,11 +116,109 @@ int HistoryServiceMsgInvertedShrink() {
 	return result;
 }
 
-ChatStyle::ChatStyle() {
+ColorIndexValues SimpleColorIndexValues(QColor color, int patternIndex) {
+	auto bg = color;
+	bg.setAlpha(kDefaultBgOpacity * 255);
+	auto result = ColorIndexValues{
+		.name = color,
+		.bg = bg,
+	};
+	result.outlines[0] = color;
+	result.outlines[0].setAlpha(kDefaultOutline1Opacity * 255);
+	if (patternIndex > 1) {
+		result.outlines[1] = result.outlines[0];
+		result.outlines[1].setAlpha(kDefaultOutline2Opacity * 255);
+		result.outlines[2] = result.outlines[0];
+		result.outlines[2].setAlpha(kDefaultOutline3Opacity * 255);
+	} else if (patternIndex > 0) {
+		result.outlines[1] = result.outlines[0];
+		result.outlines[1].setAlpha(kDefaultOutlineOpacitySecond * 255);
+		result.outlines[2] = QColor(0, 0, 0, 0);
+	} else {
+		result.outlines[1] = result.outlines[2] = QColor(0, 0, 0, 0);
+	}
+	return result;
+}
+
+std::vector<Text::SpecialColor> SyntaxHighlightColors(
+		not_null<const style::palette*> palette) {
+	auto result = std::vector<Text::SpecialColor>();
+	result.reserve(8);
+	const auto push = [&](const style::color &color) {
+		result.push_back({ &color->p, &color->p });
+	};
+	push(palette->statisticsChartLineLightblue());
+	push(palette->statisticsChartLineRed());
+	push(palette->statisticsChartLineRed());
+	push(palette->statisticsChartLineOrange());
+	push(palette->statisticsChartLineRed());
+	push(palette->statisticsChartLineBlue());
+	push(palette->statisticsChartLinePurple());
+	push(palette->statisticsChartLineGreen());
+	return result;
+}
+
+int BackgroundEmojiData::CacheIndex(
+		bool selected,
+		bool outbg,
+		bool inbubble,
+		uint8 colorIndexPlusOne) {
+	const auto base = colorIndexPlusOne
+		? (colorIndexPlusOne - 1)
+		: (kColorIndexCount + (!inbubble ? 0 : outbg ? 1 : 2));
+	return (base * 2) + (selected ? 1 : 0);
+};
+
+int ColorPatternIndex(
+		const ColorIndicesCompressed &indices,
+		uint8 colorIndex,
+		bool dark) {
+	Expects(colorIndex >= 0 && colorIndex < kColorIndexCount);
+
+	if (!indices.colors
+		|| colorIndex < kSimpleColorIndexCount) {
+		return 0;
+	}
+	auto &data = (*indices.colors)[colorIndex];
+	const auto &colors = dark ? data.dark : data.light;
+	return colors[2] ? 2 : colors[1] ? 1 : 0;
+}
+
+ChatStyle::ColoredPalette::ColoredPalette() = default;
+ChatStyle::ColoredPalette::ColoredPalette(const ColoredPalette &other)
+: linkFg(other.linkFg)
+, data(other.data) {
+	if (linkFg) {
+		data.linkFg = linkFg->color();
+		data.selectLinkFg = data.linkFg;
+	}
+}
+
+ChatStyle::ColoredPalette &ChatStyle::ColoredPalette::operator=(
+		const ColoredPalette &other) {
+	linkFg = other.linkFg;
+	data = other.data;
+	if (linkFg) {
+		data.linkFg = linkFg->color();
+		data.selectLinkFg = data.linkFg;
+	}
+	return *this;
+}
+
+ChatStyle::ChatStyle(rpl::producer<ColorIndicesCompressed> colorIndices) {
+	if (colorIndices) {
+		_colorIndicesLifetime = std::move(
+			colorIndices
+		) | rpl::on_next([=](ColorIndicesCompressed &&indices) {
+			_colorIndices = std::move(indices);
+		});
+	}
+
 	finalize();
 	make(_historyPsaForwardPalette, st::historyPsaForwardPalette);
 	make(_imgReplyTextPalette, st::imgReplyTextPalette);
 	make(_serviceTextPalette, st::serviceTextPalette);
+	make(_priceTagTextPalette, st::priceTagTextPalette);
 	make(_historyRepliesInvertedIcon, st::historyRepliesInvertedIcon);
 	make(_historyViewsInvertedIcon, st::historyViewsInvertedIcon);
 	make(_historyViewsSendingIcon, st::historyViewsSendingIcon);
@@ -117,6 +226,8 @@ ChatStyle::ChatStyle() {
 		_historyViewsSendingInvertedIcon,
 		st::historyViewsSendingInvertedIcon);
 	make(_historyPinInvertedIcon, st::historyPinInvertedIcon);
+	make(_historySilentInvertedIcon, st::historySilentInvertedIcon);
+	make(_historyEphemeralInvertedIcon, st::historyEphemeralInvertedIcon);
 	make(_historySendingIcon, st::historySendingIcon);
 	make(_historySendingInvertedIcon, st::historySendingInvertedIcon);
 	make(_historySentInvertedIcon, st::historySentInvertedIcon);
@@ -124,9 +235,15 @@ ChatStyle::ChatStyle() {
 	make(_msgBotKbUrlIcon, st::msgBotKbUrlIcon);
 	make(_msgBotKbPaymentIcon, st::msgBotKbPaymentIcon);
 	make(_msgBotKbSwitchPmIcon, st::msgBotKbSwitchPmIcon);
+	make(_msgBotKbWebviewIcon, st::msgBotKbWebviewIcon);
+	make(_msgBotKbCopyIcon, st::msgBotKbCopyIcon);
 	make(_historyFastCommentsIcon, st::historyFastCommentsIcon);
 	make(_historyFastShareIcon, st::historyFastShareIcon);
+	make(_historyFastTranscribeIcon, st::historyFastTranscribeIcon);
+	make(_historyFastTranscribeLock, st::historyFastTranscribeLock);
 	make(_historyGoToOriginalIcon, st::historyGoToOriginalIcon);
+	make(_historyFastCloseIcon, st::historyFastCloseIcon);
+	make(_historyFastMoreIcon, st::historyFastMoreIcon);
 	make(_historyMapPoint, st::historyMapPoint);
 	make(_historyMapPointInner, st::historyMapPointInner);
 	make(_youtubeIcon, st::youtubeIcon);
@@ -236,6 +353,12 @@ ChatStyle::ChatStyle() {
 		st::outReplyTextPalette,
 		st::outReplyTextPaletteSelected);
 	make(
+		&MessageStyle::richPageStyle,
+		st::messageMarkdown,
+		st::messageMarkdownSelected,
+		st::messageMarkdownOut,
+		st::messageMarkdownOutSelected);
+	make(
 		&MessageStyle::tailLeft,
 		st::historyBubbleTailInLeft,
 		st::historyBubbleTailInLeftSelected,
@@ -266,6 +389,12 @@ ChatStyle::ChatStyle() {
 		st::historyPinOutIcon,
 		st::historyPinOutSelectedIcon);
 	make(
+		&MessageStyle::historySilentIcon,
+		st::historySilentInIcon,
+		st::historySilentInSelectedIcon,
+		st::historySilentOutIcon,
+		st::historySilentOutSelectedIcon);
+	make(
 		&MessageStyle::historySentIcon,
 		st::historySentIcon,
 		st::historySentSelectedIcon,
@@ -283,6 +412,12 @@ ChatStyle::ChatStyle() {
 		st::historyPsaIconInSelected,
 		st::historyPsaIconOut,
 		st::historyPsaIconOutSelected);
+	make(
+		&MessageStyle::historyEphemeralIcon,
+		st::historyEphemeralIconIn,
+		st::historyEphemeralIconInSelected,
+		st::historyEphemeralIconOut,
+		st::historyEphemeralIconOutSelected);
 	make(
 		&MessageStyle::historyCommentsOpen,
 		st::historyCommentsOpenIn,
@@ -319,6 +454,12 @@ ChatStyle::ChatStyle() {
 		st::historyCallCameraInIconSelected,
 		st::historyCallCameraOutIcon,
 		st::historyCallCameraOutIconSelected);
+	make(
+		&MessageStyle::historyCallGroupIcon,
+		st::historyCallGroupInIcon,
+		st::historyCallGroupInIconSelected,
+		st::historyCallGroupOutIcon,
+		st::historyCallGroupOutIconSelected);
 	make(
 		&MessageStyle::historyFilePlay,
 		st::historyFileInPlay,
@@ -392,6 +533,30 @@ ChatStyle::ChatStyle() {
 		st::historyPollOutChosen,
 		st::historyPollOutChosenSelected);
 	make(
+		&MessageStyle::historyPollChoiceRight,
+		st::historyPollInChoiceRight,
+		st::historyPollInChoiceRightSelected,
+		st::historyPollOutChoiceRight,
+		st::historyPollOutChoiceRightSelected);
+	make(
+		&MessageStyle::historyTranscribeIcon,
+		st::historyTranscribeInIcon,
+		st::historyTranscribeInIconSelected,
+		st::historyTranscribeOutIcon,
+		st::historyTranscribeOutIconSelected);
+	make(
+		&MessageStyle::historyTranscribeLock,
+		st::historyTranscribeInLock,
+		st::historyTranscribeInLockSelected,
+		st::historyTranscribeOutLock,
+		st::historyTranscribeOutLockSelected);
+	make(
+		&MessageStyle::historyTranscribeHide,
+		st::historyTranscribeInHide,
+		st::historyTranscribeInHideSelected,
+		st::historyTranscribeOutHide,
+		st::historyTranscribeOutHideSelected);
+	make(
 		&MessageImageStyle::msgDateImgBg,
 		st::msgDateImgBg,
 		st::msgDateImgBgSelected);
@@ -439,39 +604,140 @@ ChatStyle::ChatStyle() {
 		&MessageImageStyle::historyVideoMessageMute,
 		st::historyVideoMessageMute,
 		st::historyVideoMessageMuteSelected);
+	make(
+		&MessageImageStyle::historyVideoMessageTtlIcon,
+		st::historyVideoMessageTtlIcon,
+		st::historyVideoMessageTtlIconSelected);
+	make(
+		&MessageImageStyle::historyPageEnlarge,
+		st::historyPageEnlarge,
+		st::historyPageEnlargeSelected);
+	make(
+		&MessageStyle::historyVoiceMessageTTL,
+		st::historyVoiceMessageInTTL,
+		st::historyVoiceMessageInTTLSelected,
+		st::historyVoiceMessageOutTTL,
+		st::historyVoiceMessageOutTTLSelected);
+	make(
+		&MessageStyle::liveLocationLongIcon,
+		st::liveLocationLongInIcon,
+		st::liveLocationLongInIconSelected,
+		st::liveLocationLongOutIcon,
+		st::liveLocationLongOutIconSelected);
+
+	updateDarkValue();
 }
 
+ChatStyle::ChatStyle(not_null<const style::palette*> isolated)
+: ChatStyle(rpl::producer<ColorIndicesCompressed>()) {
+	assignPalette(isolated);
+}
+
+ChatStyle::~ChatStyle() = default;
+
 void ChatStyle::apply(not_null<ChatTheme*> theme) {
-	const auto themePalette = theme->palette();
-	assignPalette(themePalette
-		? themePalette
-		: style::main_palette::get().get());
-	if (themePalette) {
+	applyCustomPalette(theme->palette());
+}
+
+void ChatStyle::updateDarkValue() {
+	const auto withBg = [&](const QColor &color) {
+		return CountContrast(windowBg()->c, color);
+	};
+	const auto dark = (withBg({ 0, 0, 0 }) < withBg({ 255, 255, 255 }));
+	if (_dark != dark) {
+		_dark = dark;
+		_collectibleCaches.clear();
+	}
+}
+
+void ChatStyle::applyCustomPalette(const style::palette *palette) {
+	assignPalette(palette ? palette : style::main_palette::get().get());
+	if (palette) {
 		_defaultPaletteChangeLifetime.destroy();
 	} else {
 		style::PaletteChanged(
-		) | rpl::start_with_next([=] {
+		) | rpl::on_next([=] {
 			assignPalette(style::main_palette::get());
 		}, _defaultPaletteChangeLifetime);
 	}
 }
 
+void ChatStyle::applyAdjustedServiceBg(QColor serviceBg) {
+	auto r = 0, g = 0, b = 0, a = 0;
+	serviceBg.getRgb(&r, &g, &b, &a);
+	msgServiceBg().set(uchar(r), uchar(g), uchar(b), uchar(a));
+}
+
+std::span<Text::SpecialColor> ChatStyle::highlightColors() const {
+	if (_highlightColors.empty()) {
+		_highlightColors = SyntaxHighlightColors(this);
+	}
+	return _highlightColors;
+}
+
+void ChatStyle::clearColorIndexCaches() {
+	for (auto &style : _messageStyles) {
+		for (auto &cache : style.quoteCache) {
+			cache = nullptr;
+		}
+		for (auto &cache : style.replyCache) {
+			cache = nullptr;
+		}
+	}
+	for (auto &values : _coloredValues) {
+		values.reset();
+	}
+	for (auto &palette : _coloredTextPalettes) {
+		palette.linkFg.reset();
+	}
+	for (auto &cache : _coloredReplyCaches) {
+		cache = nullptr;
+	}
+	for (auto &cache : _coloredQuoteCaches) {
+		cache = nullptr;
+	}
+	_collectibleCaches.clear();
+}
+
 void ChatStyle::assignPalette(not_null<const style::palette*> palette) {
 	*static_cast<style::palette*>(this) = *palette;
-	style::internal::resetIcons();
+
+	// Only our own icons. style::internal::ResetIcons() would instead reset
+	// every icon in the process - including the app's, which this palette has
+	// nothing to do with - while iterating a registry that the GUI thread may
+	// be mutating, and theme previews build a ChatStyle off the GUI thread.
+	for (const auto &icon : _ownedIcons) {
+		icon->reset();
+	}
+
+	clearColorIndexCaches();
 	for (auto &style : _messageStyles) {
-		style.msgBgCorners = {};
+		style.msgBgCornersSmall = {};
+		style.msgBgCornersLarge = {};
+		style.preCache = nullptr;
+		style.textPalette.linkAlwaysActive
+			= style.semiboldPalette.linkAlwaysActive
+			= (style.textPalette.linkFg->c == style.historyTextFg->c);
+		style.richPageStyle.textPalette.linkAlwaysActive
+			= (style.richPageStyle.textPalette.linkFg->c
+				== style.richPageStyle.textColor->c);
 	}
 	for (auto &style : _imageStyles) {
 		style.msgDateImgBgCorners = {};
-		style.msgServiceBgCorners = {};
-		style.msgShadowCorners = {};
+		style.msgServiceBgCornersSmall = {};
+		style.msgServiceBgCornersLarge = {};
+		style.msgShadowCornersSmall = {};
+		style.msgShadowCornersLarge = {};
 	}
 	_serviceBgCornersNormal = {};
 	_serviceBgCornersInverted = {};
-	_msgBotKbOverBgAddCorners = {};
-	_msgSelectOverlayCornersSmall = {};
-	_msgSelectOverlayCornersLarge = {};
+	_msgBotKbOverBgAddCornersSmall = {};
+	_msgBotKbOverBgAddCornersLarge = {};
+	for (auto &corners : _msgSelectOverlayCorners) {
+		corners = {};
+	}
+	updateDarkValue();
+	++_paletteVersion;
 
 	_paletteChanged.fire({});
 }
@@ -486,20 +752,9 @@ const CornersPixmaps &ChatStyle::serviceBgCornersNormal() const {
 
 const CornersPixmaps &ChatStyle::serviceBgCornersInverted() const {
 	if (_serviceBgCornersInverted.p[0].isNull()) {
-		const auto radius = HistoryServiceMsgInvertedRadius();
-		const auto size = radius * style::DevicePixelRatio();
-		auto circle = style::colorizeImage(
-			style::createInvertedCircleMask(radius * 2),
+		_serviceBgCornersInverted = PrepareInvertedCornerPixmaps(
+			HistoryServiceMsgInvertedRadius(),
 			msgServiceBg());
-		circle.setDevicePixelRatio(style::DevicePixelRatio());
-		const auto fill = [&](int index, int xoffset, int yoffset) {
-			_serviceBgCornersInverted.p[index] = PixmapFromImage(
-				circle.copy(QRect(xoffset, yoffset, size, size)));
-		};
-		fill(0, 0, 0);
-		fill(1, size, 0);
-		fill(2, size, size);
-		fill(3, 0, size);
 	}
 	return _serviceBgCornersInverted;
 }
@@ -507,10 +762,35 @@ const CornersPixmaps &ChatStyle::serviceBgCornersInverted() const {
 const MessageStyle &ChatStyle::messageStyle(bool outbg, bool selected) const {
 	auto &result = messageStyleRaw(outbg, selected);
 	EnsureCorners(
-		result.msgBgCorners,
-		st::historyMessageRadius,
+		result.msgBgCornersSmall,
+		BubbleRadiusSmall(),
 		result.msgBg,
 		&result.msgShadow);
+	EnsureCorners(
+		result.msgBgCornersLarge,
+		BubbleRadiusLarge(),
+		result.msgBg,
+		&result.msgShadow);
+	const auto &replyBar = result.msgReplyBarColor->c;
+	for (auto i = 0; i != kColorPatternsCount; ++i) {
+		EnsureBlockquoteCache(
+			result.replyCache[i],
+			[&] { return SimpleColorIndexValues(replyBar, i); });
+		if (!result.quoteCache[i]) {
+			result.quoteCache[i] = std::make_unique<Text::QuotePaintCache>(
+				*result.replyCache[i]);
+		}
+	}
+
+	const auto preBgOverride = [&] {
+		return _dark ? QColor(0, 0, 0, 192) : std::optional<QColor>();
+	};
+	EnsurePreCache(
+		result.preCache,
+		(selected
+			? result.textPalette.selectMonoFg
+			: result.textPalette.monoFg),
+		preBgOverride);
 	return result;
 }
 
@@ -518,41 +798,328 @@ const MessageImageStyle &ChatStyle::imageStyle(bool selected) const {
 	auto &result = imageStyleRaw(selected);
 	EnsureCorners(
 		result.msgDateImgBgCorners,
-		st::dateRadius,
+		(st::msgDateImgPadding.y() * 2 + st::normalFont->height) / 2,
 		result.msgDateImgBg);
 	EnsureCorners(
-		result.msgServiceBgCorners,
-		st::dateRadius,
+		result.msgServiceBgCornersSmall,
+		BubbleRadiusSmall(),
 		result.msgServiceBg);
 	EnsureCorners(
-		result.msgShadowCorners,
-		st::historyMessageRadius,
+		result.msgServiceBgCornersLarge,
+		BubbleRadiusLarge(),
+		result.msgServiceBg);
+	EnsureCorners(
+		result.msgShadowCornersSmall,
+		BubbleRadiusSmall(),
 		result.msgShadow);
+	EnsureCorners(
+		result.msgShadowCornersLarge,
+		BubbleRadiusLarge(),
+		result.msgShadow);
+
 	return result;
 }
 
-const CornersPixmaps &ChatStyle::msgBotKbOverBgAddCorners() const {
+int ChatStyle::colorPatternIndex(uint8 colorIndex) const {
+	Expects(colorIndex >= 0 && colorIndex < kColorIndexCount);
+
+	if (!_colorIndices.colors
+		|| colorIndex < kSimpleColorIndexCount) {
+		return 0;
+	}
+	auto &data = (*_colorIndices.colors)[colorIndex];
+	const auto &colors = _dark ? data.dark : data.light;
+	return colors[2] ? 2 : colors[1] ? 1 : 0;
+}
+
+int ChatStyle::collectiblePatternIndex(
+		const std::shared_ptr<ColorCollectible> &collectible) const {
+	const auto &strip = (_dark && !collectible->darkStrip.empty())
+		? collectible->darkStrip
+		: collectible->strip;
+	return std::clamp(int(strip.size()), 1, 3) - 1;
+}
+
+ColorIndexValues ChatStyle::computeColorIndexValues(
+		bool selected,
+		uint8 colorIndex) const {
+	if (!_colorIndices.colors) {
+		colorIndex %= kSimpleColorIndexCount;
+	}
+	if (colorIndex < kSimpleColorIndexCount) {
+		const auto list = std::array{
+			&historyPeer1NameFg(),
+			&historyPeer2NameFg(),
+			&historyPeer3NameFg(),
+			&historyPeer4NameFg(),
+			&historyPeer5NameFg(),
+			&historyPeer6NameFg(),
+			&historyPeer7NameFg(),
+			&historyPeer8NameFg(),
+		};
+		const auto listSelected = std::array{
+			&historyPeer1NameFgSelected(),
+			&historyPeer2NameFgSelected(),
+			&historyPeer3NameFgSelected(),
+			&historyPeer4NameFgSelected(),
+			&historyPeer5NameFgSelected(),
+			&historyPeer6NameFgSelected(),
+			&historyPeer7NameFgSelected(),
+			&historyPeer8NameFgSelected(),
+		};
+		const auto paletteIndex = ColorIndexToPaletteIndex(colorIndex);
+		auto result = ColorIndexValues{
+			.name = (*(selected ? listSelected : list)[paletteIndex])->c,
+		};
+		result.bg = result.name;
+		result.bg.setAlpha(kDefaultBgOpacity * 255);
+		result.outlines[0] = result.name;
+		result.outlines[0].setAlpha(kDefaultOutline1Opacity * 255);
+		result.outlines[1] = result.outlines[2] = QColor(0, 0, 0, 0);
+		return result;
+	}
+	auto &data = (*_colorIndices.colors)[colorIndex];
+	const auto &colors = _dark ? data.dark : data.light;
+	if (!colors[0]) {
+		return computeColorIndexValues(
+			selected,
+			colorIndex % kSimpleColorIndexCount);
+	}
+	const auto color = [&](int index) {
+		const auto v = colors[index];
+		return v ? Ui::ColorFromSerialized(v) : QColor(0, 0, 0, 0);
+	};
+	auto result = ColorIndexValues{
+		.outlines = { color(0), color(1), color(2) }
+	};
+	result.bg = result.outlines[0];
+	result.bg.setAlpha(kDefaultBgOpacity * 255);
+	result.name = selected
+		? EnsurePeerNameReadable(
+			result.outlines[0],
+			msgInBgSelected()->c,
+			_dark)
+		: result.outlines[0];
+	return result;
+}
+
+not_null<Text::QuotePaintCache*> ChatStyle::serviceQuoteCache(
+		bool twoColored) const {
+	const auto index = (twoColored ? 1 : 0);
+	const auto &service = msgServiceFg()->c;
+	EnsureBlockquoteCache(
+		_serviceQuoteCache[index],
+		[&] { return SimpleColorIndexValues(service, twoColored); });
+	return _serviceQuoteCache[index].get();
+}
+
+not_null<Text::QuotePaintCache*> ChatStyle::serviceReplyCache(
+		bool twoColored) const {
+	const auto index = (twoColored ? 1 : 0);
+	const auto &service = msgServiceFg()->c;
+	EnsureBlockquoteCache(
+		_serviceReplyCache[index],
+		[&] { return SimpleColorIndexValues(service, twoColored); });
+	return _serviceReplyCache[index].get();
+}
+
+const ColorIndexValues &ChatStyle::coloredValues(
+		bool selected,
+		uint8 colorIndex) const {
+	Expects(colorIndex >= 0 && colorIndex < kColorIndexCount);
+
+	const auto shift = (selected ? kColorIndexCount : 0);
+	auto &result = _coloredValues[shift + colorIndex];
+	if (!result) {
+		result.emplace(computeColorIndexValues(selected, colorIndex));
+	}
+	return *result;
+}
+
+QColor ChatStyle::collectibleNameColor(
+		const std::shared_ptr<ColorCollectible> &collectible,
+		bool selected) const {
+	const auto result = (_dark && collectible->darkAccentColor.alpha() > 0)
+		? collectible->darkAccentColor
+		: collectible->accentColor;
+	if (!selected) {
+		return result;
+	}
+	auto &entry = resolveCollectibleCaches(collectible);
+	if (!entry.nameSelected.isValid()) {
+		entry.nameSelected = EnsurePeerNameReadable(
+			result,
+			msgInBgSelected()->c,
+			_dark);
+	}
+	return entry.nameSelected;
+}
+
+const style::TextPalette &ChatStyle::coloredTextPalette(
+		bool selected,
+		uint8 colorIndex) const {
+	Expects(colorIndex >= 0 && colorIndex < kColorIndexCount);
+
+	const auto shift = (selected ? kColorIndexCount : 0);
+	auto &result = _coloredTextPalettes[shift + colorIndex];
+	if (!result.linkFg) {
+		result.linkFg.emplace(coloredValues(selected, colorIndex).name);
+		make(
+			result.data,
+			(selected
+				? st::inReplyTextPaletteSelected
+				: st::inReplyTextPalette));
+		result.data.linkFg = result.linkFg->color();
+		result.data.selectLinkFg = result.data.linkFg;
+	}
+	return result.data;
+}
+
+const style::TextPalette &ChatStyle::collectibleTextPalette(
+		bool selected,
+		const std::shared_ptr<ColorCollectible> &collectible) const {
+	auto &entry = resolveCollectibleCaches(collectible);
+	auto &result = selected ? entry.paletteSelected : entry.palette;
+	if (!result.linkFg) {
+		result.linkFg.emplace(collectibleNameColor(collectible, selected));
+		make(
+			result.data,
+			(selected
+				? st::inReplyTextPaletteSelected
+				: st::inReplyTextPalette));
+		result.data.linkFg = result.linkFg->color();
+		result.data.selectLinkFg = result.data.linkFg;
+	}
+	return result.data;
+}
+
+not_null<BackgroundEmojiData*> ChatStyle::backgroundEmojiData(
+		uint64 emojiId,
+		const std::shared_ptr<ColorCollectible> &collectible) const {
+	const auto id = collectible ? collectible->collectibleId : emojiId;
+	return &_backgroundEmojis[id];
+}
+
+not_null<Wallet::CardAngle*> ChatStyle::gramCardAngle() const {
+	if (!_gramCardAngle) {
+		_gramCardAngle = std::make_unique<Wallet::CardAngle>();
+	}
+	return _gramCardAngle.get();
+}
+
+not_null<Text::QuotePaintCache*> ChatStyle::coloredQuoteCache(
+		bool selected,
+		uint8 colorIndex) const {
+	return coloredCache(_coloredQuoteCaches, selected, colorIndex);
+}
+
+not_null<Text::QuotePaintCache*> ChatStyle::coloredReplyCache(
+		bool selected,
+		uint8 colorIndex) const {
+	return coloredCache(_coloredReplyCaches, selected, colorIndex);
+}
+
+not_null<Text::QuotePaintCache*> ChatStyle::collectibleQuoteCache(
+		bool selected,
+		const std::shared_ptr<ColorCollectible> &collectible) const {
+	auto &entry = resolveCollectibleCaches(collectible);
+	return collectibleCache(
+		selected ? entry.quoteSelected : entry.quote,
+		collectible,
+		selected);
+}
+
+not_null<Text::QuotePaintCache*> ChatStyle::collectibleReplyCache(
+		bool selected,
+		const std::shared_ptr<ColorCollectible> &collectible) const {
+	auto &entry = resolveCollectibleCaches(collectible);
+	return collectibleCache(
+		selected ? entry.replySelected : entry.reply,
+		collectible,
+		selected);
+}
+
+not_null<Text::QuotePaintCache*> ChatStyle::coloredCache(
+		ColoredQuotePaintCaches &caches,
+		bool selected,
+		uint8 colorIndex) const {
+	Expects(colorIndex >= 0 && colorIndex < kColorIndexCount);
+
+	const auto shift = (selected ? kColorIndexCount : 0);
+	auto &cache = caches[shift + colorIndex];
+	EnsureBlockquoteCache(cache, [&] {
+		return coloredValues(selected, colorIndex);
+	});
+	return cache.get();
+}
+
+not_null<Text::QuotePaintCache*> ChatStyle::collectibleCache(
+		std::unique_ptr<Text::QuotePaintCache> &cache,
+		const std::shared_ptr<ColorCollectible> &collectible,
+		bool selected) const {
+	EnsureBlockquoteCache(cache, [&] {
+		const auto name = collectibleNameColor(collectible, selected);
+		auto bg = name;
+		bg.setAlpha(kDefaultBgOpacity * 255);
+
+		const auto &strip = (_dark && !collectible->darkStrip.empty())
+			? collectible->darkStrip
+			: collectible->strip;
+		return ColorIndexValues{
+			.outlines = {
+				strip.empty() ? name : strip[0],
+				(strip.size() < 2) ? QColor(0, 0, 0, 0) : strip[1],
+				(strip.size() < 3) ? QColor(0, 0, 0, 0) : strip[2],
+			},
+			.name = name,
+			.bg = bg,
+		};
+	});
+	return cache.get();
+}
+
+ChatStyle::CollectibleColors &ChatStyle::resolveCollectibleCaches(
+		const std::shared_ptr<ColorCollectible> &collectible) const {
+	const auto i = _collectibleCaches.find(collectible);
+	if (i != end(_collectibleCaches)) {
+		return i->second;
+	}
+	for (auto i = begin(_collectibleCaches); i != end(_collectibleCaches);) {
+		if (i->first.expired()) {
+			i = _collectibleCaches.erase(i);
+		} else {
+			++i;
+		}
+	}
+	return _collectibleCaches.emplace(collectible).first->second;
+}
+
+const CornersPixmaps &ChatStyle::msgBotKbOverBgAddCornersSmall() const {
 	EnsureCorners(
-		_msgBotKbOverBgAddCorners,
-		st::dateRadius,
+		_msgBotKbOverBgAddCornersSmall,
+		BubbleRadiusSmall(),
 		msgBotKbOverBgAdd());
-	return _msgBotKbOverBgAddCorners;
+	return _msgBotKbOverBgAddCornersSmall;
 }
 
-const CornersPixmaps &ChatStyle::msgSelectOverlayCornersSmall() const {
+const CornersPixmaps &ChatStyle::msgBotKbOverBgAddCornersLarge() const {
 	EnsureCorners(
-		_msgSelectOverlayCornersSmall,
-		st::roundRadiusSmall,
-		msgSelectOverlay());
-	return _msgSelectOverlayCornersSmall;
+		_msgBotKbOverBgAddCornersLarge,
+		BubbleRadiusLarge(),
+		msgBotKbOverBgAdd());
+	return _msgBotKbOverBgAddCornersLarge;
 }
 
-const CornersPixmaps &ChatStyle::msgSelectOverlayCornersLarge() const {
+const CornersPixmaps &ChatStyle::msgSelectOverlayCorners(
+		CachedCornerRadius radius) const {
+	const auto index = static_cast<int>(radius);
+	Assert(index >= 0 && index < int(CachedCornerRadius::kCount));
+
 	EnsureCorners(
-		_msgSelectOverlayCornersLarge,
-		st::historyMessageRadius,
+		_msgSelectOverlayCorners[index],
+		CachedCornerRadiusValue(radius),
 		msgSelectOverlay());
-	return _msgSelectOverlayCornersLarge;
+	return _msgSelectOverlayCorners[index];
 }
 
 MessageStyle &ChatStyle::messageStyleRaw(bool outbg, bool selected) const {
@@ -593,18 +1160,293 @@ void ChatStyle::make(style::color &my, const style::color &original) const {
 
 void ChatStyle::make(style::icon &my, const style::icon &original) const {
 	my = original.withPalette(*this);
+	if (_collectOwnedIcons) {
+		_ownedIcons.push_back(&my);
+	}
+}
+
+void ChatStyle::forgetOwnedIcons(
+		const std::vector<not_null<style::icon*>> &icons) const {
+	_ownedIcons.erase(
+		ranges::remove_if(_ownedIcons, [&](not_null<style::icon*> icon) {
+			return ranges::contains(icons, icon);
+		}),
+		_ownedIcons.end());
 }
 
 void ChatStyle::make(
 		style::TextPalette &my,
 		const style::TextPalette &original) const {
+	my.linkAlwaysActive = original.linkAlwaysActive;
 	make(my.linkFg, original.linkFg);
 	make(my.monoFg, original.monoFg);
+	make(my.markBg, original.markBg);
+	make(my.spoilerFg, original.spoilerFg);
 	make(my.selectBg, original.selectBg);
 	make(my.selectFg, original.selectFg);
 	make(my.selectLinkFg, original.selectLinkFg);
 	make(my.selectMonoFg, original.selectMonoFg);
+	make(my.selectSpoilerFg, original.selectSpoilerFg);
 	make(my.selectOverlay, original.selectOverlay);
+}
+
+void ChatStyle::make(
+		style::QuoteStyle &my,
+		const style::QuoteStyle &original) const {
+	my = original;
+	make(my.icon, original.icon);
+	make(my.expand, original.expand);
+	make(my.collapse, original.collapse);
+}
+
+void ChatStyle::make(
+		style::TextStyle &my,
+		const style::TextStyle &original) const {
+	my = original;
+	make(my.blockquote, original.blockquote);
+	make(my.pre, original.pre);
+}
+
+void ChatStyle::make(
+		style::FlatLabel &my,
+		const style::FlatLabel &original) const {
+	my = original;
+	make(my.textFg, original.textFg);
+	make(my.style, original.style);
+	make(my.palette, original.palette);
+}
+
+void ChatStyle::make(style::Check &my, const style::Check &original) const {
+	my = original;
+	make(my.bg, original.bg);
+	make(my.untoggledFg, original.untoggledFg);
+	make(my.toggledFg, original.toggledFg);
+	make(my.icon, original.icon);
+}
+
+void ChatStyle::make(
+		style::MarkdownList &my,
+		const style::MarkdownList &original) const {
+	my = original;
+	make(my.bulletFg, original.bulletFg);
+	make(my.taskCheck, original.taskCheck);
+}
+
+void ChatStyle::make(
+		style::MarkdownQuotePaintColors &my,
+		const style::MarkdownQuotePaintColors &original) const {
+	my = original;
+	make(my.blockquote, original.blockquote);
+	make(my.pre, original.pre);
+	make(my.preBg, original.preBg);
+}
+
+void ChatStyle::make(
+		style::MarkdownRule &my,
+		const style::MarkdownRule &original) const {
+	my = original;
+	make(my.fg, original.fg);
+}
+
+void ChatStyle::make(
+		style::MarkdownDisplayMath &my,
+		const style::MarkdownDisplayMath &original) const {
+	my = original;
+	make(my.fg, original.fg);
+	make(my.fallbackStyle, original.fallbackStyle);
+	make(my.fallbackBg, original.fallbackBg);
+	make(my.overflowFg, original.overflowFg);
+}
+
+void ChatStyle::make(
+		style::MarkdownTable &my,
+		const style::MarkdownTable &original) const {
+	my = original;
+	make(my.borderFg, original.borderFg);
+	make(my.headerBg, original.headerBg);
+	make(my.headerStyle, original.headerStyle);
+	make(my.bodyStyle, original.bodyStyle);
+	make(my.overflowFg, original.overflowFg);
+}
+
+void ChatStyle::make(
+		style::MarkdownDetails &my,
+		const style::MarkdownDetails &original) const {
+	my = original;
+	make(my.borderFg, original.borderFg);
+	make(my.headerBg, original.headerBg);
+	make(my.bodyBg, original.bodyBg);
+	make(my.summaryFg, original.summaryFg);
+	make(my.summaryStyle, original.summaryStyle);
+	make(my.icon, original.icon);
+}
+
+void ChatStyle::make(
+		style::MarkdownEmbedPost &my,
+		const style::MarkdownEmbedPost &original) const {
+	my = original;
+	make(my.accentFg, original.accentFg);
+	make(my.authorStyle, original.authorStyle);
+	make(my.authorFg, original.authorFg);
+	make(my.dateStyle, original.dateStyle);
+	make(my.dateFg, original.dateFg);
+}
+
+void ChatStyle::make(
+		style::MarkdownPlaceholder &my,
+		const style::MarkdownPlaceholder &original) const {
+	my = original;
+	make(my.bg, original.bg);
+	make(my.bgActive, original.bgActive);
+	make(my.rippleBg, original.rippleBg);
+	make(my.borderFg, original.borderFg);
+	make(my.spinnerFg, original.spinnerFg);
+	make(my.labelStyle, original.labelStyle);
+	make(my.labelFg, original.labelFg);
+	make(my.labelFgActive, original.labelFgActive);
+}
+
+void ChatStyle::make(
+		style::MarkdownPhoto &my,
+		const style::MarkdownPhoto &original) const {
+	my = original;
+	make(my.progressBg, original.progressBg);
+	make(my.progressFg, original.progressFg);
+	make(my.fallbackBg, original.fallbackBg);
+	make(my.fallbackFg, original.fallbackFg);
+}
+
+void ChatStyle::make(
+		style::MarkdownAudio &my,
+		const style::MarkdownAudio &original) const {
+	my = original;
+	make(my.borderFg, original.borderFg);
+	make(my.bg, original.bg);
+	make(my.titleStyle, original.titleStyle);
+	make(my.titleFg, original.titleFg);
+	make(my.subtitleStyle, original.subtitleStyle);
+	make(my.subtitleFg, original.subtitleFg);
+}
+
+void ChatStyle::make(
+		style::MarkdownChannelButton &my,
+		const style::MarkdownChannelButton &original) const {
+	my = original;
+	make(my.borderFg, original.borderFg);
+	make(my.bg, original.bg);
+	make(my.textStyle, original.textStyle);
+	make(my.textFg, original.textFg);
+}
+
+void ChatStyle::make(
+		style::MarkdownChannel &my,
+		const style::MarkdownChannel &original) const {
+	my = original;
+	make(my.borderFg, original.borderFg);
+	make(my.bg, original.bg);
+	make(my.titleStyle, original.titleStyle);
+	make(my.titleFg, original.titleFg);
+	make(my.subtitleStyle, original.subtitleStyle);
+	make(my.subtitleFg, original.subtitleFg);
+	make(my.button, original.button);
+}
+
+void ChatStyle::make(
+		style::MarkdownRelatedArticle &my,
+		const style::MarkdownRelatedArticle &original) const {
+	my = original;
+	make(my.borderFg, original.borderFg);
+	make(my.bg, original.bg);
+	make(my.headerBg, original.headerBg);
+	make(my.separatorFg, original.separatorFg);
+	make(my.titleStyle, original.titleStyle);
+	make(my.titleFg, original.titleFg);
+	make(my.subtitleStyle, original.subtitleStyle);
+	make(my.subtitleFg, original.subtitleFg);
+	make(my.footerStyle, original.footerStyle);
+	make(my.footerFg, original.footerFg);
+}
+
+void ChatStyle::make(
+		style::MarkdownGroupedMedia &my,
+		const style::MarkdownGroupedMedia &original) const {
+	my = original;
+	make(my.fallbackBg, original.fallbackBg);
+	make(my.fallbackFg, original.fallbackFg);
+	make(my.navButtonBg, original.navButtonBg);
+	make(my.navButtonBgOver, original.navButtonBgOver);
+	make(my.navPreviousIcon, original.navPreviousIcon);
+	make(my.navPreviousIconOver, original.navPreviousIconOver);
+	make(my.navNextIcon, original.navNextIcon);
+	make(my.navNextIconOver, original.navNextIconOver);
+}
+
+void ChatStyle::make(
+		style::MarkdownFailure &my,
+		const style::MarkdownFailure &original) const {
+	my = original;
+	make(my.label, original.label);
+}
+
+void ChatStyle::make(
+		style::MarkdownButtonRow &my,
+		const style::MarkdownButtonRow &original) const {
+	my = original;
+	make(my.labelStyle, original.labelStyle);
+	make(my.defaultBg, original.defaultBg);
+	make(my.defaultRipple, original.defaultRipple);
+	make(my.defaultFg, original.defaultFg);
+	make(my.primaryBg, original.primaryBg);
+	make(my.primaryRipple, original.primaryRipple);
+	make(my.primaryFg, original.primaryFg);
+	make(my.successFg, original.successFg);
+	make(my.dangerFg, original.dangerFg);
+}
+
+void ChatStyle::make(
+		style::MarkdownInlineButton &my,
+		const style::MarkdownInlineButton &original) const {
+	my = original;
+	make(my.labelStyle, original.labelStyle);
+	make(my.defaultFg, original.defaultFg);
+	make(my.primaryBg, original.primaryBg);
+	make(my.successFg, original.successFg);
+	make(my.dangerFg, original.dangerFg);
+}
+
+void ChatStyle::make(
+		style::Markdown &my,
+		const style::Markdown &original) const {
+	my = original;
+	make(my.textPalette, original.textPalette);
+	make(my.textColor, original.textColor);
+	make(my.supplementaryTextColor, original.supplementaryTextColor);
+	make(my.body, original.body);
+	make(my.heading1, original.heading1);
+	make(my.heading2, original.heading2);
+	make(my.heading3, original.heading3);
+	make(my.heading4, original.heading4);
+	make(my.heading5, original.heading5);
+	make(my.heading6, original.heading6);
+	make(my.footer, original.footer);
+	make(my.code, original.code);
+	make(my.list, original.list);
+	make(my.quotePaintColors, original.quotePaintColors);
+	make(my.quoteAuthorStyle, original.quoteAuthorStyle);
+	make(my.rule, original.rule);
+	make(my.displayMath, original.displayMath);
+	make(my.table, original.table);
+	make(my.details, original.details);
+	make(my.embedPost, original.embedPost);
+	make(my.placeholder, original.placeholder);
+	make(my.photo, original.photo);
+	make(my.audio, original.audio);
+	make(my.channel, original.channel);
+	make(my.relatedArticle, original.relatedArticle);
+	make(my.groupedMedia, original.groupedMedia);
+	make(my.failure, original.failure);
+	make(my.buttonRow, original.buttonRow);
+	make(my.inlineButton, original.inlineButton);
 }
 
 void ChatStyle::make(
@@ -651,34 +1493,139 @@ void ChatStyle::make(
 	make(imageSelected().*my, originalSelected);
 }
 
-void FillComplexOverlayRect(
-		Painter &p,
+uint8 DecideColorIndex(uint64 id) {
+	return id % kSimpleColorIndexCount;
+}
+
+uint8 ColorIndexToPaletteIndex(uint8 colorIndex) {
+	Expects(colorIndex >= 0 && colorIndex < kColorIndexCount);
+
+	const int8 map[] = { 0, 7, 4, 1, 6, 3, 5 };
+	return map[colorIndex % kSimpleColorIndexCount];
+}
+
+QColor FromNameFg(
 		not_null<const ChatStyle*> st,
+		bool selected,
+		uint8 colorIndex,
+		const std::shared_ptr<Ui::ColorCollectible> &colorCollectible) {
+	return !colorCollectible
+		? st->coloredValues(selected, colorIndex).name
+		: st->collectibleNameColor(colorCollectible, selected);
+}
+
+void FillComplexOverlayRect(
+		QPainter &p,
 		QRect rect,
-		ImageRoundRadius radius,
-		RectParts roundCorners) {
-	const auto bg = st->msgSelectOverlay();
-	if (radius == ImageRoundRadius::Ellipse) {
-		PainterHighQualityEnabler hq(p);
-		p.setPen(Qt::NoPen);
-		p.setBrush(bg);
-		p.drawEllipse(rect);
-	} else {
-		const auto &corners = (radius == ImageRoundRadius::Small)
-			? st->msgSelectOverlayCornersSmall()
-			: st->msgSelectOverlayCornersLarge();
-		RectWithCorners(p, rect, bg, corners, roundCorners);
+		const style::color &color,
+		const CornersPixmaps &corners) {
+	using namespace Images;
+
+	const auto pix = corners.p;
+	const auto fillRect = [&](QRect rect) {
+		p.fillRect(rect, color);
+	};
+	if (pix[kTopLeft].isNull()
+		&& pix[kTopRight].isNull()
+		&& pix[kBottomLeft].isNull()
+		&& pix[kBottomRight].isNull()) {
+		fillRect(rect);
+		return;
+	}
+
+	const auto ratio = style::DevicePixelRatio();
+	const auto fillCorner = [&](int left, int top, int index) {
+		p.drawPixmap(left, top, pix[index]);
+	};
+	const auto cornerSize = [&](int index) {
+		const auto &p = pix[index];
+		return p.isNull() ? 0 : p.width() / ratio;
+	};
+	const auto verticalSkip = [&](int left, int right) {
+		return std::max(cornerSize(left), cornerSize(right));
+	};
+	const auto top = verticalSkip(kTopLeft, kTopRight);
+	const auto bottom = verticalSkip(kBottomLeft, kBottomRight);
+	if (top) {
+		const auto left = cornerSize(kTopLeft);
+		const auto right = cornerSize(kTopRight);
+		if (left) {
+			fillCorner(rect.left(), rect.top(), kTopLeft);
+			if (const auto add = top - left) {
+				fillRect({ rect.left(), rect.top() + left, left, add });
+			}
+		}
+		if (const auto fill = rect.width() - left - right; fill > 0) {
+			fillRect({ rect.left() + left, rect.top(), fill, top });
+		}
+		if (right) {
+			fillCorner(
+				rect.left() + rect.width() - right,
+				rect.top(),
+				kTopRight);
+			if (const auto add = top - right) {
+				fillRect({
+					rect.left() + rect.width() - right,
+					rect.top() + right,
+					right,
+					add,
+				});
+			}
+		}
+	}
+	if (const auto h = rect.height() - top - bottom; h > 0) {
+		fillRect({ rect.left(), rect.top() + top, rect.width(), h });
+	}
+	if (bottom) {
+		const auto left = cornerSize(kBottomLeft);
+		const auto right = cornerSize(kBottomRight);
+		if (left) {
+			fillCorner(
+				rect.left(),
+				rect.top() + rect.height() - left,
+				kBottomLeft);
+			if (const auto add = bottom - left) {
+				fillRect({
+					rect.left(),
+					rect.top() + rect.height() - bottom,
+					left,
+					add,
+				});
+			}
+		}
+		if (const auto fill = rect.width() - left - right; fill > 0) {
+			fillRect({
+				rect.left() + left,
+				rect.top() + rect.height() - bottom,
+				fill,
+				bottom,
+			});
+		}
+		if (right) {
+			fillCorner(
+				rect.left() + rect.width() - right,
+				rect.top() + rect.height() - right,
+				kBottomRight);
+			if (const auto add = bottom - right) {
+				fillRect({
+					rect.left() + rect.width() - right,
+					rect.top() + rect.height() - bottom,
+					right,
+					add,
+				});
+			}
+		}
 	}
 }
 
-void FillComplexLocationRect(
-		Painter &p,
+void FillComplexEllipse(
+		QPainter &p,
 		not_null<const ChatStyle*> st,
-		QRect rect,
-		ImageRoundRadius radius,
-		RectParts roundCorners) {
-	const auto stm = &st->messageStyle(false, false);
-	RectWithCorners(p, rect, stm->msgBg, stm->msgBgCorners, roundCorners);
+		QRect rect) {
+	PainterHighQualityEnabler hq(p);
+	p.setPen(Qt::NoPen);
+	p.setBrush(st->msgSelectOverlay());
+	p.drawEllipse(rect);
 }
 
 } // namespace Ui

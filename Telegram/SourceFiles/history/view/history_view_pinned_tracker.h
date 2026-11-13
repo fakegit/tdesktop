@@ -13,19 +13,21 @@ class History;
 
 namespace Data {
 enum class LoadDirection : char;
+class Thread;
 } // namespace Data
 
 namespace HistoryView {
 
 class PinnedTracker final {
 public:
-	using UniversalMsgId = int32;
+	using UniversalMsgId = MsgId;
 
-	explicit PinnedTracker(not_null<History*> history);
+	explicit PinnedTracker(not_null<Data::Thread*> thread);
 	~PinnedTracker();
 
 	[[nodiscard]] rpl::producer<PinnedId> shownMessageId() const;
 	[[nodiscard]] PinnedId currentMessageId() const;
+	[[nodiscard]] FullMsgId nextPinnedId(UniversalMsgId messageId) const;
 	void trackAround(UniversalMsgId messageId);
 	void reset();
 
@@ -44,7 +46,7 @@ private:
 	void refreshViewer();
 	void refreshCurrentFromSlice();
 
-	const not_null<History*> _history;
+	const not_null<Data::Thread*> _thread;
 	PeerData *_migratedPeer = nullptr;
 
 	rpl::variable<PinnedId> _current;

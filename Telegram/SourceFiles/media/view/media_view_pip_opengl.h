@@ -11,7 +11,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "ui/gl/gl_image.h"
 #include "ui/gl/gl_primitives.h"
 
-#include <QtGui/QOpenGLBuffer>
+#include <QOpenGLBuffer>
 
 namespace Media::View {
 
@@ -19,13 +19,9 @@ class Pip::RendererGL final : public Pip::Renderer {
 public:
 	explicit RendererGL(not_null<Pip*> owner);
 
-	void init(
-		not_null<QOpenGLWidget*> widget,
-		QOpenGLFunctions &f) override;
+	void init(QOpenGLFunctions &f) override;
 
-	void deinit(
-		not_null<QOpenGLWidget*> widget,
-		QOpenGLFunctions *f) override;
+	void deinit(QOpenGLFunctions *f) override;
 
 	void paint(
 		not_null<QOpenGLWidget*> widget,
@@ -34,11 +30,6 @@ public:
 	std::optional<QColor> clearColor() override;
 
 private:
-	struct Control {
-		int index = -1;
-		not_null<const style::icon*> icon;
-		not_null<const style::icon*> iconOver;
-	};
 	void createShadowTexture();
 
 	void paintTransformedVideoFrame(ContentGeometry geometry) override;
@@ -65,7 +56,7 @@ private:
 	void paintUsingRaster(
 		Ui::GL::Image &image,
 		QRect rect,
-		Fn<void(Painter&&)> method,
+		Fn<void(QPainter&&)> method,
 		int bufferOffset,
 		bool transparent = false);
 
@@ -93,6 +84,7 @@ private:
 	QOpenGLFunctions *_f = nullptr;
 	QSize _viewport;
 	float _factor = 1.;
+	int _ifactor = 1;
 	QVector2D _uniformViewport;
 
 	std::optional<QOpenGLBuffer> _contentBuffer;
@@ -101,12 +93,16 @@ private:
 	QOpenGLShader *_texturedVertexShader = nullptr;
 	std::optional<QOpenGLShaderProgram> _argb32Program;
 	std::optional<QOpenGLShaderProgram> _yuv420Program;
+	std::optional<QOpenGLShaderProgram> _nv12Program;
 	Ui::GL::Textures<4> _textures;
 	QSize _rgbaSize;
 	QSize _lumaSize;
-	QSize _chromaSize;
+	QSize _chromaSize; // size of texture 2 (UV for NV12, U for YUV420)
+	QSize _chromaSizeV; // size of texture 3 (V for YUV420 only)
 	quint64 _cacheKey = 0;
 	int _trackFrameIndex = 0;
+	bool _chromaNV12 = false;
+	GLenum _nv12ChromaFormat = GL_RG;
 
 	Ui::GL::Image _radialImage;
 	Ui::GL::Image _controlsImage;
@@ -114,7 +110,6 @@ private:
 	Ui::GL::Image _volumeControllerImage;
 	Ui::GL::Image _shadowImage;
 
-	static constexpr auto kControlsCount = 7;
 	[[nodiscard]] static Control ControlMeta(
 		OverState control,
 		int index = 0);

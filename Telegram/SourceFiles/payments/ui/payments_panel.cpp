@@ -16,9 +16,11 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "ui/widgets/checkbox.h"
 #include "ui/wrap/fade_wrap.h"
 #include "ui/boxes/single_choice_box.h"
+#include "ui/chat/attach/attach_bot_webview.h"
 #include "ui/text/format_values.h"
 #include "ui/text/text_utilities.h"
 #include "ui/effects/radial_animation.h"
+#include "ui/click_handler.h"
 #include "lang/lang_keys.h"
 #include "webview/webview_embed.h"
 #include "webview/webview_interface.h"
@@ -49,6 +51,7 @@ struct Panel::WebviewWithLifetime {
 		Webview::WindowConfig config = Webview::WindowConfig());
 
 	Webview::Window window;
+	QPointer<RpWidget> lastHidingBox;
 	rpl::lifetime lifetime;
 };
 
@@ -65,25 +68,40 @@ Panel::Progress::Progress(QWidget *parent, Fn<QRect()> rect)
 	st::paymentsLoading) {
 }
 
+not_null<QWidget*> Panel::widget() const {
+	return _widget.get();
+}
+
 Panel::Panel(not_null<PanelDelegate*> delegate)
 : _delegate(delegate)
 , _widget(std::make_unique<SeparatePanel>()) {
-	_widget->setInnerSize(st::paymentsPanelSize);
 	_widget->setWindowFlag(Qt::WindowStaysOnTopHint, false);
+	_widget->setInnerSize(st::paymentsPanelSize);
 
 	_widget->closeRequests(
-	) | rpl::start_with_next([=] {
+	) | rpl::on_next([=] {
 		_delegate->panelRequestClose();
 	}, _widget->lifetime());
 
 	_widget->closeEvents(
-	) | rpl::start_with_next([=] {
+	) | rpl::on_next([=] {
 		_delegate->panelCloseSure();
 	}, _widget->lifetime());
+
+	style::PaletteChanged(
+	) | rpl::filter([=] {
+		return !_themeUpdateScheduled;
+	}) | rpl::on_next([=] {
+		_themeUpdateScheduled = true;
+		crl::on_main(_widget.get(), [=] {
+			_themeUpdateScheduled = false;
+			updateThemeParams(_delegate->panelWebviewThemeParams());
+		});
+	}, lifetime());
 }
 
 Panel::~Panel() {
-	_webview = nullptr;
+	base::take(_webview);
 	_progress = nullptr;
 	_widget = nullptr;
 }
@@ -101,7 +119,7 @@ void Panel::toggleProgress(bool shown) {
 			_widget.get(),
 			[=] { return progressRect(); });
 		_progress->widget.paintRequest(
-		) | rpl::start_with_next([=](QRect clip) {
+		) | rpl::on_next([=](QRect clip) {
 			auto p = QPainter(&_progress->widget);
 			p.setOpacity(
 				_progress->shownAnimation.value(_progress->shown ? 1. : 0.));
@@ -169,7 +187,7 @@ void Panel::setupProgressGeometry() {
 	_progress->geometryLifetime.destroy();
 	if (_webviewBottom) {
 		_webviewBottom->geometryValue(
-		) | rpl::start_with_next([=](QRect bottom) {
+		) | rpl::on_next([=](QRect bottom) {
 			const auto height = bottom.height();
 			const auto size = st::paymentsLoading.size;
 			const auto skip = (height - size.height()) / 2;
@@ -187,7 +205,7 @@ void Panel::setupProgressGeometry() {
 		}, _progress->geometryLifetime);
 	} else if (_weakFormSummary) {
 		_weakFormSummary->sizeValue(
-		) | rpl::start_with_next([=](QSize form) {
+		) | rpl::on_next([=](QSize form) {
 			const auto full = _widget->innerGeometry();
 			const auto size = st::defaultBoxButton.height;
 			const auto inner = _weakFormSummary->contentHeight();
@@ -204,12 +222,12 @@ void Panel::setupProgressGeometry() {
 		}, _progress->geometryLifetime);
 	} else if (_weakEditInformation) {
 		_weakEditInformation->geometryValue(
-		) | rpl::start_with_next([=] {
+		) | rpl::on_next([=] {
 			_progress->widget.setGeometry(_widget->innerGeometry());
 		}, _progress->geometryLifetime);
 	} else if (_weakEditCard) {
 		_weakEditCard->geometryValue(
-		) | rpl::start_with_next([=] {
+		) | rpl::on_next([=] {
 			_progress->widget.setGeometry(_widget->innerGeometry());
 		}, _progress->geometryLifetime);
 	}
@@ -225,7 +243,9 @@ void Panel::showForm(
 		const RequestedInformation &current,
 		const PaymentMethodDetails &method,
 		const ShippingOptions &options) {
-	if (invoice && !method.ready && !method.native.supported) {
+	if (invoice
+		&& method.savedMethods.empty()
+		&& !method.native.supported) {
 		const auto available = Webview::Availability();
 		if (available.error != Webview::Available::Error::None) {
 			showWebviewError(
@@ -333,7 +353,7 @@ void Panel::chooseShippingOption(const ShippingOptions &options) {
 			const auto area = CreateChild<AbstractButton>(layout.get());
 			area->setClickedCallback([=] { group->setValue(index); });
 			button->geometryValue(
-			) | rpl::start_with_next([=](QRect geometry) {
+			) | rpl::on_next([=](QRect geometry) {
 				label->move(
 					geometry.topLeft() + st::paymentsShippingLabelPosition);
 				price->move(
@@ -401,32 +421,45 @@ void Panel::chooseTips(const Invoice &invoice) {
 			}
 		};
 		row->submitted(
-		) | rpl::start_with_next(submit, box->lifetime());
+		) | rpl::on_next(submit, box->lifetime());
 		box->addButton(tr::lng_settings_save(), submit);
 		box->addButton(tr::lng_cancel(), [=] { box->closeBox(); });
 	}));
 }
 
 void Panel::showEditPaymentMethod(const PaymentMethodDetails &method) {
-	auto bottomText = method.canSaveInformation
-		? rpl::producer<QString>()
-		: tr::lng_payments_processed_by(
-			lt_provider,
-			rpl::single(method.provider));
 	setTitle(tr::lng_payments_card_title());
 	if (method.native.supported) {
 		showEditCard(method.native, CardField::Number);
-	} else if (!showWebview(method.url, true, std::move(bottomText))) {
+	} else {
+		showEditCardByUrl(
+			method.url,
+			method.provider,
+			method.canSaveInformation);
+	}
+}
+
+void Panel::showEditCardByUrl(
+		const QString &url,
+		const QString &provider,
+		bool canSaveInformation) {
+	auto bottomText = canSaveInformation
+		? rpl::producer<QString>()
+		: tr::lng_payments_processed_by(lt_provider, rpl::single(provider));
+	if (!showWebview(
+			url,
+			WebviewMode::PaymentMethod,
+			std::move(bottomText))) {
 		const auto available = Webview::Availability();
 		if (available.error != Webview::Available::Error::None) {
 			showWebviewError(
-				tr::lng_payments_webview_no_card(tr::now),
+				tr::lng_payments_webview_no_use(tr::now),
 				available);
 		} else {
 			showCriticalError({ "Error: Could not initialize WebView." });
 		}
 		_widget->setBackAllowed(true);
-	} else if (method.canSaveInformation) {
+	} else if (canSaveInformation) {
 		const auto &padding = st::paymentsPanelPadding;
 		_saveWebviewInformation = CreateChild<Checkbox>(
 			_webviewBottom.get(),
@@ -439,6 +472,14 @@ void Panel::showEditPaymentMethod(const PaymentMethodDetails &method) {
 		_saveWebviewInformation->show();
 		_webviewBottom->resize(_webviewBottom->width(), height);
 	}
+}
+
+void Panel::showAdditionalMethod(
+		const PaymentMethodAdditional &method,
+		const QString &provider,
+		bool canSaveInformation) {
+	setTitle(rpl::single(method.title));
+	showEditCardByUrl(method.url, provider, canSaveInformation);
 }
 
 void Panel::showWebviewProgress() {
@@ -459,15 +500,18 @@ void Panel::hideWebviewProgress() {
 
 bool Panel::showWebview(
 		const QString &url,
-		bool allowBack,
+		WebviewMode mode,
 		rpl::producer<QString> bottomText) {
-	if (!_webview && !createWebview()) {
+	_webviewMode = mode;
+	const auto params = _delegate->panelWebviewThemeParams();
+	if (!_webview && !createWebview(params)) {
 		return false;
 	}
 	showWebviewProgress();
-	_widget->destroyLayer();
+	_widget->hideLayer(anim::type::instant);
+	updateThemeParams(params);
 	_webview->window.navigate(url);
-	_widget->setBackAllowed(allowBack);
+	_widget->setBackAllowed(mode == WebviewMode::PaymentMethod);
 	if (bottomText) {
 		const auto &padding = st::paymentsPanelPadding;
 		const auto label = CreateChild<FlatLabel>(
@@ -480,7 +524,7 @@ bool Panel::showWebview(
 		rpl::combine(
 			_webviewBottom->widthValue(),
 			label->widthValue()
-		) | rpl::start_with_next([=](int outerWidth, int width) {
+		) | rpl::on_next([=](int outerWidth, int width) {
 			label->move((outerWidth - width) / 2, padding.top());
 		}, label->lifetime());
 		label->show();
@@ -489,31 +533,39 @@ bool Panel::showWebview(
 	return true;
 }
 
-bool Panel::createWebview() {
-	auto container = base::make_unique_q<RpWidget>(_widget.get());
+bool Panel::createWebview(const Webview::ThemeParams &params) {
+	auto outer = base::make_unique_q<RpWidget>(_widget.get());
+	const auto container = outer.get();
+	_widget->showInner(std::move(outer));
+	const auto webviewParent = QPointer<RpWidget>(container);
 
 	_webviewBottom = std::make_unique<RpWidget>(_widget.get());
 	const auto bottom = _webviewBottom.get();
 	bottom->show();
 
-	bottom->heightValue(
-	) | rpl::start_with_next([=, raw = container.get()](int height) {
-		const auto inner = _widget->innerGeometry();
+	rpl::combine(
+		container->geometryValue() | rpl::map([=] {
+			return _widget->innerGeometry();
+		}),
+		bottom->heightValue()
+	) | rpl::on_next([=](QRect inner, int height) {
 		bottom->move(inner.x(), inner.y() + inner.height() - height);
-		raw->resize(inner.width(), inner.height() - height);
 		bottom->resizeToWidth(inner.width());
+		_footerHeight = bottom->height();
 	}, bottom->lifetime());
 	container->show();
 
 	_webview = std::make_unique<WebviewWithLifetime>(
-		container.get(),
+		container,
 		Webview::WindowConfig{
-			.userDataPath = _delegate->panelWebviewDataPath(),
+			.opaqueBg = params.bodyBg,
+			.storageId = _delegate->panelWebviewStorageId(),
 		});
+
 	const auto raw = &_webview->window;
-	QObject::connect(container.get(), &QObject::destroyed, [=] {
+	QObject::connect(container, &QObject::destroyed, [=] {
 		if (_webview && &_webview->window == raw) {
-			_webview = nullptr;
+			base::take(_webview);
 			if (_webviewProgress) {
 				hideWebviewProgress();
 				if (_progress && !_progress->shown) {
@@ -528,24 +580,48 @@ bool Panel::createWebview() {
 	if (!raw->widget()) {
 		return false;
 	}
+	QObject::connect(raw->widget(), &QObject::destroyed, [=] {
+		const auto parent = webviewParent.data();
+		if (!_webview
+			|| &_webview->window != raw
+			|| !parent
+			|| _widget->inner() != parent) {
+			// If we destroyed _webview ourselves,
+			// or if we changed _widget->inner ourselves,
+			// we don't show any message, nothing crashed.
+			return;
+		}
+		crl::on_main(this, [=] {
+			showCriticalError({ "Error: WebView has crashed." });
+		});
+	});
 
-	container->geometryValue(
-	) | rpl::start_with_next([=](QRect geometry) {
-		raw->widget()->setGeometry(geometry);
+	rpl::combine(
+		container->geometryValue(),
+		_footerHeight.value()
+	) | rpl::on_next([=](QRect geometry, int footer) {
+		if (const auto view = raw->widget()) {
+			view->setGeometry(geometry.marginsRemoved({ 0, 0, 0, footer }));
+		}
 	}, _webview->lifetime);
 
 	raw->setMessageHandler([=](const QJsonDocument &message) {
+		if (_webviewMode != WebviewMode::PaymentMethod) {
+			return;
+		}
 		const auto save = _saveWebviewInformation
 			&& _saveWebviewInformation->checked();
 		_delegate->panelWebviewMessage(message, save);
 	});
 
-	raw->setNavigationStartHandler([=](const QString &uri) {
+	raw->setNavigationPolicyHandler([=](const QString &uri, bool newWindow) {
 		if (!_delegate->panelWebviewNavigationAttempt(uri)) {
 			return false;
 		}
+		return !newWindow;
+	});
+	raw->setNavigationStartHandler([=] {
 		showWebviewProgress();
-		return true;
 	});
 	raw->setNavigationDoneHandler([=](bool success) {
 		hideWebviewProgress();
@@ -560,7 +636,9 @@ postEvent: function(eventType, eventData) {
 }
 };)");
 
-	_widget->showInner(std::move(container));
+	if (!_webview) {
+		return false;
+	}
 
 	setupProgressGeometry();
 
@@ -568,20 +646,42 @@ postEvent: function(eventType, eventData) {
 }
 
 void Panel::choosePaymentMethod(const PaymentMethodDetails &method) {
-	if (!method.ready) {
+	if (method.savedMethods.empty() && method.additionalMethods.empty()) {
 		showEditPaymentMethod(method);
 		return;
 	}
 	showBox(Box([=](not_null<GenericBox*> box) {
 		const auto save = [=](int option) {
-			if (option) {
+			const auto saved = int(method.savedMethods.size());
+			if (!option) {
 				showEditPaymentMethod(method);
+			} else if (option > saved) {
+				const auto index = option - saved - 1;
+				Assert(index < method.additionalMethods.size());
+				showAdditionalMethod(
+					method.additionalMethods[index],
+					method.provider,
+					method.canSaveInformation);
+			} else {
+				const auto index = option - 1;
+				_savedMethodChosen.fire_copy(method.savedMethods[index].id);
 			}
 		};
+		auto options = std::vector{
+			tr::lng_payments_new_card(tr::now),
+		};
+		for (const auto &saved : method.savedMethods) {
+			options.push_back(saved.title);
+		}
+		for (const auto &additional : method.additionalMethods) {
+			options.push_back(additional.title);
+		}
 		SingleChoiceBox(box, {
 			.title = tr::lng_payments_payment_method(),
-			.options = { method.title, tr::lng_payments_new_card(tr::now) },
-			.initialSelection = 0,
+			.options = std::move(options),
+			.initialSelection = (method.savedMethods.empty()
+				? -1
+				: (method.savedMethodIndex + 1)),
 			.callback = save,
 		});
 	}));
@@ -641,6 +741,73 @@ void Panel::showWarning(const QString &bot, const QString &provider) {
 	}));
 }
 
+void Panel::requestTermsAcceptance(
+		const QString &username,
+		const QString &url,
+		bool recurring) {
+	showBox(Box([=](not_null<GenericBox*> box) {
+		box->setTitle(tr::lng_payments_terms_title());
+		box->addRow(object_ptr<Ui::FlatLabel>(
+			box.get(),
+			(recurring
+				? tr::lng_payments_terms_text
+				: tr::lng_payments_terms_text_once)(
+					lt_bot,
+					rpl::single(tr::bold('@' + username)),
+					tr::marked),
+			st::boxLabel));
+		const auto update = std::make_shared<Fn<void()>>();
+		auto checkView = std::make_unique<Ui::CheckView>(
+			st::defaultCheck,
+			false,
+			[=] { if (*update) { (*update)(); } });
+		const auto check = checkView.get();
+		const auto row = box->addRow(
+			object_ptr<Ui::Checkbox>(
+				box.get(),
+				tr::lng_payments_terms_agree(
+					lt_link,
+					rpl::single(tr::link(
+						tr::lng_payments_terms_link(tr::now),
+						url)),
+					tr::marked),
+				st::defaultBoxCheckbox,
+				std::move(checkView)),
+			{
+				st::boxRowPadding.left(),
+				st::boxRowPadding.left(),
+				st::boxRowPadding.right(),
+				st::defaultBoxCheckbox.margin.bottom(),
+			});
+		row->setAllowTextLines(5);
+		row->setClickHandlerFilter([=](
+				const ClickHandlerPtr &link,
+				Qt::MouseButton button) {
+			ActivateClickHandler(_widget.get(), link, ClickContext{
+				.button = button,
+				.other = _delegate->panelClickHandlerContext(),
+			});
+			return false;
+		});
+
+		(*update) = [=] { row->update(); };
+
+		const auto showError = Ui::CheckView::PrepareNonToggledError(
+			check,
+			box->lifetime());
+
+		box->addButton(tr::lng_payments_terms_accept(), [=] {
+			if (check->checked()) {
+				_delegate->panelAcceptTermsAndSubmit();
+				box->closeBox();
+			} else {
+				showError();
+			}
+		});
+		box->addButton(tr::lng_cancel(), [=] { box->closeBox(); });
+	}));
+}
+
 void Panel::showEditCard(
 		const NativeMethodDetails &native,
 		CardField field) {
@@ -686,25 +853,52 @@ rpl::producer<> Panel::backRequests() const {
 	return _widget->backRequests();
 }
 
+rpl::producer<QString> Panel::savedMethodChosen() const {
+	return _savedMethodChosen.events();
+}
+
 void Panel::showBox(object_ptr<BoxContent> box) {
+	if (const auto widget = _webview ? _webview->window.widget() : nullptr) {
+		const auto hideNow = !widget->isHidden();
+		if (hideNow || _webview->lastHidingBox) {
+			const auto raw = _webview->lastHidingBox = box.data();
+			box->boxClosing(
+			) | rpl::on_next([=] {
+				const auto widget = _webview
+					? _webview->window.widget()
+					: nullptr;
+				if (widget
+					&& widget->isHidden()
+					&& _webview->lastHidingBox == raw) {
+					widget->show();
+				}
+			}, _webview->lifetime);
+			if (hideNow) {
+				widget->hide();
+			}
+		}
+	}
 	_widget->showBox(
 		std::move(box),
 		LayerOption::KeepOther,
 		anim::type::normal);
 }
 
-void Panel::showToast(const TextWithEntities &text) {
-	_widget->showToast(text);
+void Panel::showToast(TextWithEntities &&text) {
+	_widget->showToast(std::move(text));
 }
 
 void Panel::showCriticalError(const TextWithEntities &text) {
 	_progress = nullptr;
 	_webviewProgress = false;
 	if (!_weakFormSummary || !_weakFormSummary->showCriticalError(text)) {
-		auto error = base::make_unique_q<PaddingWrap<FlatLabel>>(
-			_widget.get(),
+		auto wrap = base::make_unique_q<RpWidget>(_widget.get());
+		const auto raw = wrap.get();
+
+		const auto error = CreateChild<PaddingWrap<FlatLabel>>(
+			raw,
 			object_ptr<FlatLabel>(
-				_widget.get(),
+				raw,
 				rpl::single(text),
 				st::paymentsCriticalError),
 			st::paymentsCriticalErrorPadding);
@@ -718,46 +912,45 @@ void Panel::showCriticalError(const TextWithEntities &text) {
 			_delegate->panelOpenUrl(entity.data);
 			return false;
 		});
-		_widget->showInner(std::move(error));
+
+		raw->widthValue() | rpl::on_next([=](int width) {
+			error->resizeToWidth(width);
+			raw->resize(width, error->height());
+		}, raw->lifetime());
+
+		_widget->showInner(std::move(wrap));
 	}
+}
+
+std::shared_ptr<Show> Panel::uiShow() {
+	return _widget->uiShow();
 }
 
 void Panel::showWebviewError(
 		const QString &text,
 		const Webview::Available &information) {
-	using Error = Webview::Available::Error;
-	Expects(information.error != Error::None);
+	showCriticalError(TextWithEntities{ text }.append(
+		"\n\n"
+	).append(BotWebView::ErrorText(information)));
+}
 
-	auto rich = TextWithEntities{ text };
-	rich.append("\n\n");
-	switch (information.error) {
-	case Error::NoWebview2: {
-		const auto command = QString(QChar(TextCommand));
-		const auto text = tr::lng_payments_webview_install_edge(
-			tr::now,
-			lt_link,
-			command);
-		const auto parts = text.split(command);
-		rich.append(parts.value(0))
-			.append(Text::Link(
-				"Microsoft Edge WebView2 Runtime",
-				"https://go.microsoft.com/fwlink/p/?LinkId=2124703"))
-			.append(parts.value(1));
-	} break;
-	case Error::NoGtkOrWebkit2Gtk:
-		rich.append(tr::lng_payments_webview_install_webkit(tr::now));
-		break;
-	case Error::MutterWM:
-		rich.append(tr::lng_payments_webview_switch_mutter(tr::now));
-		break;
-	case Error::Wayland:
-		rich.append(tr::lng_payments_webview_switch_wayland(tr::now));
-		break;
-	default:
-		rich.append(QString::fromStdString(information.details));
-		break;
+void Panel::updateThemeParams(const Webview::ThemeParams &params) {
+	if (!_webview || !_webview->window.widget()) {
+		return;
 	}
-	showCriticalError(rich);
+	_webview->window.updateTheme(
+		params.bodyBg,
+		params.scrollBg,
+		params.scrollBgOver,
+		params.scrollBarBg,
+		params.scrollBarBgOver);
+	_webview->window.eval(R"(
+if (window.TelegramGameProxy) {
+	window.TelegramGameProxy.receiveEvent(
+		"theme_changed",
+		{ "theme_params": )" + params.json + R"( });
+}
+)");
 }
 
 rpl::lifetime &Panel::lifetime() {

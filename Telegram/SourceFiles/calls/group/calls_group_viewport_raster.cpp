@@ -13,6 +13,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "data/data_peer.h"
 #include "media/view/media_view_pip.h"
 #include "webrtc/webrtc_video_track.h"
+#include "ui/image/image_prepare.h"
+#include "ui/painter.h"
 #include "lang/lang_keys.h"
 #include "styles/style_calls.h"
 #include "styles/palette.h"
@@ -35,7 +37,7 @@ Viewport::RendererSW::RendererSW(not_null<Viewport*> owner)
 }
 
 void Viewport::RendererSW::paintFallback(
-		Painter &&p,
+		Painter &p,
 		const QRegion &clip,
 		Ui::GL::Backend backend) {
 	auto bg = clip;
@@ -50,8 +52,14 @@ void Viewport::RendererSW::paintFallback(
 		}
 		paintTile(p, tile.get(), bounding, bg);
 	}
-	for (const auto &rect : bg) {
-		p.fillRect(rect, st::groupCallBg);
+	if (_owner->borrowedOrigin().isNull()) {
+		const auto fullscreen = _owner->_fullscreen;
+		const auto color = fullscreen
+			? QColor(0, 0, 0)
+			: st::groupCallBg->c;
+		for (const auto &rect : bg) {
+			p.fillRect(rect, color);
+		}
 	}
 	for (auto i = _tileData.begin(); i != _tileData.end();) {
 		if (i->second.stale) {
@@ -73,10 +81,11 @@ void Viewport::RendererSW::validateUserpicFrame(
 	}
 	const auto size = tile->trackOrUserpicSize();
 	data.userpicFrame = Images::BlurLargeImage(
-		tile->row()->peer()->generateUserpicImage(
+		PeerData::GenerateUserpicImage(
+			tile->peer(),
 			tile->row()->ensureUserpicView(),
 			size.width(),
-			ImageRoundRadius::None),
+			0),
 		kBlurRadius);
 }
 
@@ -101,27 +110,31 @@ void Viewport::RendererSW::paintTile(
 		tileData.blurredFrame = Images::BlurLargeImage(
 			data.original.scaled(
 				VideoTile::PausedVideoSize(),
-				Qt::KeepAspectRatio),
+				Qt::KeepAspectRatio).mirrored(tile->mirror(), false),
 			kBlurRadius);
 	}
 	const auto &image = _userpicFrame
 		? tileData.userpicFrame
 		: _pausedFrame
 		? tileData.blurredFrame
-		: data.original;
+		: data.original.mirrored(tile->mirror(), false);
 	const auto frameRotation = _userpicFrame ? 0 : data.rotation;
 	Assert(!image.isNull());
 
+	const auto background = _owner->_fullscreen
+		? QColor(0, 0, 0)
+		: st::groupCallMembersBg->c;
 	const auto fill = [&](QRect rect) {
 		const auto intersected = rect.intersected(clip);
 		if (!intersected.isEmpty()) {
-			p.fillRect(intersected, st::groupCallMembersBg);
+			p.fillRect(intersected, background);
 			bg -= intersected;
 		}
 	};
 
 	using namespace Media::View;
-	const auto geometry = tile->geometry();
+	const auto geometry = tile->geometry().translated(
+		_owner->borrowedOrigin());
 	const auto x = geometry.x();
 	const auto y = geometry.y();
 	const auto width = geometry.width();
@@ -242,7 +255,7 @@ void Viewport::RendererSW::paintTileControls(
 		const auto pauseIconTop = !_owner->wide()
 			? (y + (height - st::groupCallPaused.height()) / 2)
 			: (pausedSpace < 3 * st::semiboldFont->height)
-			? (pausedSpace / 3)
+			? (y + (pausedSpace / 3))
 			: std::min(
 				y + (height / 2) - pauseIconSkip,
 				(nameTop
@@ -277,7 +290,10 @@ void Viewport::RendererSW::paintTileControls(
 
 	// Shadow.
 	if (_shadow.isNull()) {
-		_shadow = GenerateShadow(st.shadowHeight, 0, kShadowMaxAlpha);
+		_shadow = Images::GenerateShadow(
+			st.shadowHeight,
+			0,
+			kShadowMaxAlpha);
 	}
 	const auto shadowRect = QRect(
 		x,

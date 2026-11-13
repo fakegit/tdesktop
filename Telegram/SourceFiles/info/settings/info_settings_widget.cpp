@@ -8,8 +8,10 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "info/settings/info_settings_widget.h"
 
 #include "info/info_memento.h"
-#include "info/info_controller.h"
-#include "settings/settings_common.h"
+#include "settings/sections/settings_main.h"
+#include "settings/sections/settings_information.h"
+#include "settings/settings_common_session.h"
+#include "menu/menu_send.h"
 #include "ui/ui_utility.h"
 
 namespace Info {
@@ -43,17 +45,118 @@ Widget::Widget(
 : ContentWidget(parent, controller)
 , _self(controller->key().settingsSelf())
 , _type(controller->section().settingsType())
-, _inner(setInnerWidget(
-	::Settings::CreateSection(
-		_type,
-		this,
-		controller->parentController()))) {
+, _inner(setupFlexibleInnerWidget(
+		_type->create(
+			this,
+			controller->parentController(),
+			scroll(),
+			controller->wrapValue(
+			) | rpl::map([](Wrap wrap) { return (wrap == Wrap::Layer)
+				? ::Settings::Container::Layer
+				: ::Settings::Container::Section; })),
+		_flexibleScroll,
+		[=](Ui::RpWidget*) {
+			controller->stepDataReference() = SectionCustomTopBarData{
+				.backButtonEnables = _flexibleScroll.backButtonEnables.events(),
+				.wrapValue = controller->wrapValue(),
+			};
+		}))
+, _pinnedToTop(_inner->createPinnedToTop(this))
+, _pinnedToBottom(_inner->createPinnedToBottom(this)) {
 	_inner->sectionShowOther(
-	) | rpl::start_with_next([=](Type type) {
+	) | rpl::on_next([=](Type type) {
 		controller->showSettings(type);
 	}, _inner->lifetime());
 
-	controller->setCanSaveChanges(_inner->sectionCanSaveChanges());
+	_inner->sectionShowBack(
+	) | rpl::on_next([=] {
+		controller->showBackFromStack();
+	}, _inner->lifetime());
+
+	_inner->setStepDataReference(controller->stepDataReference());
+
+	_removesFromStack.events(
+	) | rpl::on_next([=](const std::vector<Type> &types) {
+		const auto sections = ranges::views::all(
+			types
+		) | ranges::views::transform([](Type type) {
+			return Section(type);
+		}) | ranges::to_vector;
+		controller->removeFromStack(sections);
+	}, _inner->lifetime());
+
+	if (_pinnedToTop) {
+		_inner->widthValue(
+		) | rpl::on_next([=](int w) {
+			_pinnedToTop->resizeToWidth(w);
+			setScrollTopSkip(_pinnedToTop->height());
+		}, _pinnedToTop->lifetime());
+
+		_pinnedToTop->heightValue(
+		) | rpl::on_next([=](int h) {
+			setScrollTopSkip(h);
+		}, _pinnedToTop->lifetime());
+	}
+
+	if (_pinnedToBottom) {
+		const auto processHeight = [=] {
+			setScrollBottomSkip(_pinnedToBottom->height());
+			_pinnedToBottom->moveToLeft(
+				_pinnedToBottom->x(),
+				height() - _pinnedToBottom->height());
+		};
+
+		_inner->sizeValue(
+		) | rpl::on_next([=](const QSize &s) {
+			_pinnedToBottom->resizeToWidth(s.width());
+			//processHeight();
+		}, _pinnedToBottom->lifetime());
+
+		rpl::combine(
+			_pinnedToBottom->heightValue(),
+			heightValue()
+		) | rpl::on_next(processHeight, _pinnedToBottom->lifetime());
+	}
+
+	if (_pinnedToTop
+		&& _pinnedToTop->minimumHeight()
+		&& _inner->hasFlexibleTopBar()) {
+		const auto heightDiff = [=] {
+			return _pinnedToTop->maximumHeight()
+				- _pinnedToTop->minimumHeight();
+		};
+
+		rpl::combine(
+			_pinnedToTop->heightValue(),
+			_inner->heightValue()
+		) | rpl::on_next([=](int, int h) {
+			_flexibleScroll.contentHeightValue.fire(h + heightDiff());
+		}, _pinnedToTop->lifetime());
+
+		scrollTopValue(
+		) | rpl::on_next([=](int top) {
+			if (!_pinnedToTop) {
+				return;
+			}
+			const auto current = heightDiff() - top;
+			_inner->moveToLeft(0, std::min(0, current));
+			_pinnedToTop->resize(
+				_pinnedToTop->width(),
+				std::max(current + _pinnedToTop->minimumHeight(), 0));
+		}, _inner->lifetime());
+
+		_flexibleScroll.fillerWidthValue.events(
+		) | rpl::on_next([=](int w) {
+			_inner->resizeToWidth(w);
+		}, _inner->lifetime());
+
+		setPaintPadding({ 0, _pinnedToTop->minimumHeight(), 0, 0 });
+
+		setViewport(_pinnedToTop->events(
+		) | rpl::filter([](not_null<QEvent*> e) {
+			return e->type() == QEvent::Wheel;
+		}));
+	}
 }
 
 Widget::~Widget() = default;
@@ -81,18 +184,66 @@ void Widget::setInternalState(
 	restoreState(memento);
 }
 
-rpl::producer<bool> Widget::canSaveChanges() const {
-	return _inner->sectionCanSaveChanges();
-}
-
 void Widget::saveChanges(FnMut<void()> done) {
 	_inner->sectionSaveChanges(std::move(done));
 }
 
+SendMenu::Details Widget::sendMenuDetails() const {
+	return _inner->sendMenuDetails();
+}
+
+bool Widget::processChosenSticker(ChatHelpers::FileChosen &&chosen) {
+	return _inner->processChosenSticker(std::move(chosen));
+}
+
+void Widget::showFinished() {
+	_inner->showFinished();
+
+	_inner->removeFromStack(
+	) | rpl::start_to_stream(_removesFromStack, lifetime());
+}
+
+void Widget::setInnerFocus() {
+	_inner->setInnerFocus();
+}
+
+const Ui::RoundRect *Widget::bottomSkipRounding() const {
+	return _inner->bottomSkipRounding();
+}
+
 rpl::producer<bool> Widget::desiredShadowVisibility() const {
-	return (_type == Type::Main || _type == Type::Information)
+	return (_type == ::Settings::MainId()
+		|| _type == ::Settings::InformationId())
 		? ContentWidget::desiredShadowVisibility()
 		: rpl::single(true);
+}
+
+bool Widget::closeByOutsideClick() const {
+	return _inner->closeByOutsideClick();;
+}
+
+void Widget::checkBeforeClose(Fn<void()> close) {
+	_inner->checkBeforeClose(std::move(close));
+}
+
+void Widget::checkBeforeCloseByEscape(Fn<void()> close) {
+	ContentWidget::checkBeforeCloseByEscape([&] {
+		_inner->checkBeforeClose(std::move(close));
+	});
+}
+
+rpl::producer<QString> Widget::title() {
+	return _inner->title();
+}
+
+rpl::producer<QString> Widget::titleBadge() {
+	return _inner->titleBadge();
+}
+
+void Widget::paintEvent(QPaintEvent *e) {
+	if (!_inner->paintOuter(this, maxVisibleHeight(), e->rect())) {
+		ContentWidget::paintEvent(e);
+	}
 }
 
 std::shared_ptr<ContentMemento> Widget::doCreateMemento() {
@@ -101,11 +252,31 @@ std::shared_ptr<ContentMemento> Widget::doCreateMemento() {
 	return result;
 }
 
+void Widget::enableBackButton() {
+	_flexibleScroll.backButtonEnables.fire({});
+}
+
+rpl::producer<SelectedItems> Widget::selectedListValue() const {
+	return _inner->selectedListValue();
+}
+
+void Widget::selectionAction(SelectionAction action) {
+	_inner->selectionAction(action);
+}
+
+void Widget::fillTopBarMenu(const Ui::Menu::MenuCallback &addAction) {
+	_inner->fillTopBarMenu(addAction);
+}
+
 void Widget::saveState(not_null<Memento*> memento) {
 	memento->setScrollTop(scrollTopSave());
+	auto sectionState = std::any();
+	_inner->sectionSaveState(sectionState);
+	memento->setSectionState(std::move(sectionState));
 }
 
 void Widget::restoreState(not_null<Memento*> memento) {
+	_inner->sectionRestoreState(memento->sectionState());
 	scrollTopRestore(memento->scrollTop());
 }
 

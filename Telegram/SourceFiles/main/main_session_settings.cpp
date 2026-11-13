@@ -6,9 +6,10 @@ For license and copyright information please follow this link:
 https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "main/main_session_settings.h"
+#include "chat_helpers/spellchecker_locale_ids.h"
 
 #include "chat_helpers/tabbed_selector.h"
-#include "ui/widgets/input_fields.h"
+#include "ui/widgets/fields/input_field.h"
 #include "ui/chat/attach/attach_send_files_way.h"
 #include "window/section_widget.h"
 #include "support/support_common.h"
@@ -16,6 +17,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "boxes/send_files_box.h"
 #include "core/application.h"
 #include "core/core_settings.h"
+#include "data/components/promo_suggestions.h"
 
 namespace Main {
 namespace {
@@ -23,64 +25,186 @@ namespace {
 constexpr auto kLegacyCallsPeerToPeerNobody = 4;
 constexpr auto kVersionTag = -1;
 constexpr auto kVersion = 2;
-constexpr auto kMaxSavedPlaybackPositions = 16;
 
 } // namespace
 
 SessionSettings::SessionSettings()
 : _selectorTab(ChatHelpers::SelectorTab::Emoji)
-, _supportSwitch(Support::SwitchSettings::Next) {
+, _supportSwitch(Support::SwitchSettings::Next)
+, _setupEmailState(Data::SetupEmailState::None) {
 }
 
 QByteArray SessionSettings::serialize() const {
 	const auto autoDownload = _autoDownload.serialize();
-	auto size = sizeof(qint32) * 38;
-	size += _groupStickersSectionHidden.size() * sizeof(quint64);
-	size += _mediaLastPlaybackPosition.size() * 2 * sizeof(quint64);
-	size += Serialize::bytearraySize(autoDownload);
-	size += sizeof(qint32) + _hiddenPinnedMessages.size() * (sizeof(quint64) + sizeof(qint32));
+	auto size = sizeof(qint32) // kVersionTag
+		+ sizeof(qint32) // kVersion
+		+ sizeof(qint32) // _selectorTab
+		+ sizeof(qint32) // _groupStickersSectionHidden size
+		+ _groupStickersSectionHidden.size() * sizeof(quint64)
+		+ sizeof(qint32) // _supportSwitch
+		+ sizeof(qint32) // _supportFixChatsOrder
+		+ sizeof(qint32) // _supportTemplatesAutocomplete
+		+ sizeof(qint32) // _supportChatsTimeSlice
+		+ Serialize::bytearraySize(autoDownload)
+		+ sizeof(qint32) // _supportAllSearchResults
+		+ sizeof(qint32) // _archiveCollapsed
+		+ sizeof(qint32) // _archiveInMainMenu
+		+ sizeof(qint32) // old _skipArchiveInSearch
+		+ sizeof(qint32) // old _mediaLastPlaybackPosition size
+		+ sizeof(qint32) // very very old _hiddenPinnedMessages size
+		+ sizeof(qint32) // _dialogsFiltersEnabled
+		+ sizeof(qint32) // _supportAllSilent
+		+ sizeof(qint32) // _photoEditorHintShowsCount
+		+ sizeof(qint32) // very old _hiddenPinnedMessages size
+		+ sizeof(qint32) // _mutePeriods size
+		+ (_mutePeriods.size() * sizeof(quint64))
+		+ sizeof(qint32) // old _skipPremiumStickersSet
+		+ sizeof(qint32) // old _hiddenPinnedMessages size
+		+ sizeof(qint32) // _groupEmojiSectionHidden size
+		+ _groupEmojiSectionHidden.size() * sizeof(quint64)
+		+ sizeof(qint32) // _lastNonPremiumLimitDownload
+		+ sizeof(qint32) // _lastNonPremiumLimitUpload
+		+ sizeof(qint32) // _hiddenPinnedMessages size
+		+ _hiddenPinnedMessages.size() * (sizeof(quint64) * 4)
+		+ sizeof(qint32) // legacy subsection tabs modes count
+		+ sizeof(qint32) // _ringtoneDefaultVolumes size
+		+ (_ringtoneDefaultVolumes.size()
+			* (0
+				+ sizeof(uint8_t) * 1 // Data::DefaultNotify
+				+ sizeof(ushort))) // Volume
+		+ sizeof(qint32) // _ringtoneVolumes size
+		+ (_ringtoneVolumes.size()
+			* (0
+				+ sizeof(quint64) * 3 // ThreadId
+				+ sizeof(ushort))) // Volume
+		+ sizeof(qint32) // _ratedTranscriptions size
+		+ (_ratedTranscriptions.size() * sizeof(quint64))
+		+ sizeof(qint32); // _unreviewed size
+	for (const auto &auth : _unreviewed) {
+		size += sizeof(quint64) + sizeof(qint32) + sizeof(qint32)
+			+ Serialize::stringSize(auth.device)
+			+ Serialize::stringSize(auth.location);
+	}
+	size += sizeof(qint32); // _setupEmailState
+	size += sizeof(qint32) // _moderateCommonGroups size
+		+ (_moderateCommonGroups.size() * sizeof(qint32));
+	size += sizeof(qint32); // _disableSharingBoxShowsCount
+	size += sizeof(qint32) // _subsectionTabsModes size
+		+ _subsectionTabsModes.size() * (sizeof(quint64) + sizeof(qint32));
+	size += sizeof(qint32); // _phoneNumberHidden
+	size += sizeof(qint32); // _extraFavoriteReactions size
+	for (const auto &id : _extraFavoriteReactions) {
+		size += sizeof(quint64) + Serialize::stringSize(id.emoji());
+	}
+	size += sizeof(qint32); // _stashHintShowsCount
 
 	auto result = QByteArray();
 	result.reserve(size);
 	{
 		QDataStream stream(&result, QIODevice::WriteOnly);
 		stream.setVersion(QDataStream::Qt_5_1);
-		stream << qint32(kVersionTag) << qint32(kVersion);
-		stream << static_cast<qint32>(_selectorTab);
-		stream << qint32(_groupStickersSectionHidden.size());
+		stream
+			<< qint32(kVersionTag) << qint32(kVersion)
+			<< static_cast<qint32>(_selectorTab)
+			<< qint32(_groupStickersSectionHidden.size());
 		for (const auto &peerId : _groupStickersSectionHidden) {
 			stream << SerializePeerId(peerId);
 		}
-		stream << qint32(_supportSwitch);
-		stream << qint32(_supportFixChatsOrder ? 1 : 0);
-		stream << qint32(_supportTemplatesAutocomplete ? 1 : 0);
-		stream << qint32(_supportChatsTimeSlice.current());
-		stream << autoDownload;
-		stream << qint32(_supportAllSearchResults.current() ? 1 : 0);
-		stream << qint32(_archiveCollapsed.current() ? 1 : 0);
-		stream << qint32(_archiveInMainMenu.current() ? 1 : 0);
-		stream << qint32(_skipArchiveInSearch.current() ? 1 : 0);
-		stream << qint32(_mediaLastPlaybackPosition.size());
-		for (const auto &[id, time] : _mediaLastPlaybackPosition) {
-			stream << quint64(id) << qint64(time);
+		stream
+			<< qint32(_supportSwitch)
+			<< qint32(_supportFixChatsOrder ? 1 : 0)
+			<< qint32(_supportTemplatesAutocomplete ? 1 : 0)
+			<< qint32(_supportChatsTimeSlice.current())
+			<< autoDownload
+			<< qint32(_supportAllSearchResults.current() ? 1 : 0)
+			<< qint32(_archiveCollapsed.current() ? 1 : 0)
+			<< qint32(_archiveInMainMenu.current() ? 1 : 0)
+			<< qint32(0) // old _skipArchiveInSearch
+			<< qint32(0) // old _mediaLastPlaybackPosition.size());
+			<< qint32(0) // very very old _hiddenPinnedMessages.size());
+			<< qint32(_dialogsFiltersEnabled ? 1 : 0)
+			<< qint32(_supportAllSilent ? 1 : 0)
+			<< qint32(_photoEditorHintShowsCount)
+			<< qint32(0) // very old _hiddenPinnedMessages.size());
+			<< qint32(_mutePeriods.size());
+		for (const auto &period : _mutePeriods) {
+			stream << quint64(period);
 		}
-		stream << qint32(_hiddenPinnedMessages.size());
+		stream
+			<< qint32(0) // old _skipPremiumStickersSet
+			<< qint32(0) // old _hiddenPinnedMessages.size());
+			<< qint32(_groupEmojiSectionHidden.size());
+		for (const auto &peerId : _groupEmojiSectionHidden) {
+			stream << SerializePeerId(peerId);
+		}
+		stream
+			<< qint32(_lastNonPremiumLimitDownload)
+			<< qint32(_lastNonPremiumLimitUpload)
+			<< qint32(_hiddenPinnedMessages.size());
 		for (const auto &[key, value] : _hiddenPinnedMessages) {
-			stream << SerializePeerId(key) << qint32(value);
+			stream
+				<< SerializePeerId(key.peerId)
+				<< qint64(key.topicRootId.bare)
+				<< SerializePeerId(key.monoforumPeerId)
+				<< qint64(value.bare);
 		}
-		stream << qint32(_dialogsFiltersEnabled ? 1 : 0);
-		stream << qint32(_supportAllSilent ? 1 : 0);
-		stream << qint32(_photoEditorHintShowsCount);
+		stream << qint32(0);
+		stream << qint32(_ringtoneDefaultVolumes.size());
+		for (const auto &[key, value] : _ringtoneDefaultVolumes) {
+			stream << uint8_t(key) << ushort(value);
+		}
+		stream << qint32(_ringtoneVolumes.size());
+		for (const auto &[key, value] : _ringtoneVolumes) {
+			stream
+				<< SerializePeerId(key.peerId)
+				<< qint64(key.topicRootId.bare)
+				<< SerializePeerId(key.monoforumPeerId)
+				<< ushort(value);
+		}
+		stream << qint32(_ratedTranscriptions.size());
+		for (const auto &transcriptionId : _ratedTranscriptions) {
+			stream << quint64(transcriptionId);
+		}
+		stream << qint32(_unreviewed.size());
+		for (const auto &auth : _unreviewed) {
+			stream
+				<< quint64(auth.hash)
+				<< qint32(auth.unconfirmed ? 1 : 0)
+				<< qint32(auth.date)
+				<< auth.device
+				<< auth.location;
+		}
+		stream << qint32(static_cast<int>(_setupEmailState));
+		stream << qint32(_moderateCommonGroups.size());
+		for (const auto &filterId : _moderateCommonGroups) {
+			stream << qint32(filterId);
+		}
+		stream << qint32(_disableSharingBoxShowsCount);
+		stream << qint32(_subsectionTabsModes.size());
+		for (const auto &[peerId, mode] : _subsectionTabsModes) {
+			stream << SerializePeerId(peerId) << qint32(mode);
+		}
+		stream << qint32(_phoneNumberHidden.current() ? 1 : 0);
+		stream << qint32(_extraFavoriteReactions.size());
+		for (const auto &id : _extraFavoriteReactions) {
+			stream << quint64(id.custom()) << id.emoji();
+		}
+		stream << qint32(_stashHintShowsCount);
 	}
+
+	Ensures(result.size() == size);
 	return result;
 }
 
-void SessionSettings::addFromSerialized(const QByteArray &serialized) {
+void SessionSettings::addFromSerialized(
+		const QByteArray &serialized,
+		int writerVersion) {
 	if (serialized.isEmpty()) {
 		return;
 	}
 
 	auto &app = Core::App().settings();
+	const auto appColumns = app.windowColumns();
 
 	QDataStream stream(serialized);
 	stream.setVersion(QDataStream::Qt_5_1);
@@ -94,11 +218,12 @@ void SessionSettings::addFromSerialized(const QByteArray &serialized) {
 	qint32 appFloatPlayerCorner = static_cast<qint32>(RectPart::TopRight);
 	base::flat_map<QString, QString> appSoundOverrides;
 	base::flat_set<PeerId> groupStickersSectionHidden;
+	base::flat_set<PeerId> groupEmojiSectionHidden;
 	qint32 appThirdSectionInfoEnabled = 0;
 	qint32 legacySmallDialogsList = 0;
-	float64 appDialogsWidthRatio = app.dialogsWidthRatio();
-	int appThirdColumnWidth = app.thirdColumnWidth();
-	int appThirdSectionExtendedBy = app.thirdSectionExtendedBy();
+	float64 appDialogsWidthRatio = appColumns.dialogsWithChatWidthRatio;
+	int appThirdColumnWidth = appColumns.thirdColumnWidth;
+	int appThirdSectionExtendedBy = appColumns.thirdSectionExtendedBy;
 	qint32 appSendFilesWay = app.sendFilesWay().serialize();
 	qint32 legacyCallsPeerToPeer = qint32(0);
 	qint32 appSendSubmitWay = static_cast<qint32>(app.sendSubmitWay());
@@ -108,13 +233,13 @@ void SessionSettings::addFromSerialized(const QByteArray &serialized) {
 	qint32 supportChatsTimeSlice = _supportChatsTimeSlice.current();
 	qint32 appIncludeMutedCounter = app.includeMutedCounter() ? 1 : 0;
 	qint32 appCountUnreadMessages = app.countUnreadMessages() ? 1 : 0;
-	qint32 appExeLaunchWarning = app.exeLaunchWarning() ? 1 : 0;
+	qint32 legacyAppExeLaunchWarning = 1;
 	QByteArray autoDownload;
 	qint32 supportAllSearchResults = _supportAllSearchResults.current() ? 1 : 0;
 	qint32 archiveCollapsed = _archiveCollapsed.current() ? 1 : 0;
 	qint32 appNotifyAboutPinned = app.notifyAboutPinned() ? 1 : 0;
 	qint32 archiveInMainMenu = _archiveInMainMenu.current() ? 1 : 0;
-	qint32 skipArchiveInSearch = _skipArchiveInSearch.current() ? 1 : 0;
+	qint32 skipArchiveInSearch = 0;
 	qint32 legacyAutoplayGifs = 1;
 	qint32 appLoopAnimatedStickers = app.loopAnimatedStickers() ? 1 : 0;
 	qint32 appLargeEmoji = app.largeEmoji() ? 1 : 0;
@@ -122,15 +247,29 @@ void SessionSettings::addFromSerialized(const QByteArray &serialized) {
 	qint32 appSuggestEmoji = app.suggestEmoji() ? 1 : 0;
 	qint32 appSuggestStickersByEmoji = app.suggestStickersByEmoji() ? 1 : 0;
 	qint32 appSpellcheckerEnabled = app.spellcheckerEnabled() ? 1 : 0;
-	std::vector<std::pair<DocumentId, crl::time>> mediaLastPlaybackPosition;
-	qint32 appVideoPlaybackSpeed = Core::Settings::SerializePlaybackSpeed(app.videoPlaybackSpeed());
+	qint32 appVideoPlaybackSpeed = app.videoPlaybackSpeedSerialized();
 	QByteArray appVideoPipGeometry = app.videoPipGeometry();
 	std::vector<int> appDictionariesEnabled;
 	qint32 appAutoDownloadDictionaries = app.autoDownloadDictionaries() ? 1 : 0;
-	base::flat_map<PeerId, MsgId> hiddenPinnedMessages;
+	base::flat_map<ThreadId, MsgId> hiddenPinnedMessages;
+	base::flat_map<PeerId, qint32> subsectionTabsModes;
 	qint32 dialogsFiltersEnabled = _dialogsFiltersEnabled ? 1 : 0;
 	qint32 supportAllSilent = _supportAllSilent ? 1 : 0;
 	qint32 photoEditorHintShowsCount = _photoEditorHintShowsCount;
+	std::vector<TimeId> mutePeriods;
+	qint32 legacySkipPremiumStickersSet = 0;
+	qint32 lastNonPremiumLimitDownload = 0;
+	qint32 lastNonPremiumLimitUpload = 0;
+	base::flat_map<Data::DefaultNotify, ushort> ringtoneDefaultVolumes;
+	base::flat_map<ThreadId, ushort> ringtoneVolumes;
+	base::flat_set<uint64> ratedTranscriptions;
+	std::vector<Data::UnreviewedAuth> unreviewed;
+	qint32 setupEmailState = 0;
+	std::vector<int32> moderateCommonGroups;
+	qint32 disableSharingBoxShowsCount = 0;
+	qint32 phoneNumberHidden = 0;
+	std::vector<Data::ReactionId> extraFavoriteReactions;
+	qint32 stashHintShowsCount = 0;
 
 	stream >> versionTag;
 	if (versionTag == kVersionTag) {
@@ -226,7 +365,7 @@ void SessionSettings::addFromSerialized(const QByteArray &serialized) {
 			stream >> appCountUnreadMessages;
 		}
 		if (!stream.atEnd()) {
-			stream >> appExeLaunchWarning;
+			stream >> legacyAppExeLaunchWarning;
 		}
 	}
 	if (!stream.atEnd()) {
@@ -275,7 +414,7 @@ void SessionSettings::addFromSerialized(const QByteArray &serialized) {
 						"Bad data for SessionSettings::addFromSerialized()"));
 					return;
 				}
-				mediaLastPlaybackPosition.emplace_back(documentId, time);
+				// Old mediaLastPlaybackPosition.
 			}
 		}
 	}
@@ -310,6 +449,7 @@ void SessionSettings::addFromSerialized(const QByteArray &serialized) {
 		auto count = qint32(0);
 		stream >> count;
 		if (stream.status() == QDataStream::Ok) {
+			// Legacy.
 			for (auto i = 0; i != count; ++i) {
 				auto key = quint64();
 				auto value = qint32();
@@ -319,7 +459,9 @@ void SessionSettings::addFromSerialized(const QByteArray &serialized) {
 						"Bad data for SessionSettings::addFromSerialized()"));
 					return;
 				}
-				hiddenPinnedMessages.emplace(DeserializePeerId(key), value);
+				hiddenPinnedMessages.emplace(
+					ThreadId{ DeserializePeerId(key), MsgId(0) },
+					value);
 			}
 		}
 	}
@@ -331,6 +473,287 @@ void SessionSettings::addFromSerialized(const QByteArray &serialized) {
 	}
 	if (!stream.atEnd()) {
 		stream >> photoEditorHintShowsCount;
+	}
+	if (!stream.atEnd()) {
+		auto count = qint32(0);
+		stream >> count;
+		if (stream.status() == QDataStream::Ok) {
+			for (auto i = 0; i != count; ++i) {
+				auto key = quint64();
+				auto value = qint64();
+				stream >> key >> value;
+				if (stream.status() != QDataStream::Ok) {
+					LOG(("App Error: "
+						"Bad data for SessionSettings::addFromSerialized()"));
+					return;
+				}
+				hiddenPinnedMessages.emplace(
+					ThreadId{ DeserializePeerId(key), MsgId(0) },
+					value);
+			}
+		}
+	}
+	if (!stream.atEnd()) {
+		auto count = qint32(0);
+		stream >> count;
+		if (stream.status() == QDataStream::Ok) {
+			for (auto i = 0; i != count; ++i) {
+				auto period = quint64();
+				stream >> period;
+				mutePeriods.emplace_back(period);
+			}
+		}
+	}
+	if (!stream.atEnd()) {
+		stream >> legacySkipPremiumStickersSet;
+	}
+	if (!stream.atEnd()) {
+		auto count = qint32(0);
+		stream >> count;
+		if (stream.status() == QDataStream::Ok) {
+			// Legacy.
+			for (auto i = 0; i != count; ++i) {
+				auto keyPeerId = quint64();
+				auto keyTopicRootId = qint64();
+				auto value = qint64();
+				stream >> keyPeerId >> keyTopicRootId >> value;
+				if (stream.status() != QDataStream::Ok) {
+					LOG(("App Error: "
+						"Bad data for SessionSettings::addFromSerialized()"));
+					return;
+				}
+				hiddenPinnedMessages.emplace(
+					ThreadId{ DeserializePeerId(keyPeerId), keyTopicRootId },
+					value);
+			}
+		}
+	}
+	if (!stream.atEnd()) {
+		auto count = qint32(0);
+		stream >> count;
+		if (stream.status() == QDataStream::Ok) {
+			for (auto i = 0; i != count; ++i) {
+				quint64 peerId;
+				stream >> peerId;
+				if (stream.status() != QDataStream::Ok) {
+					LOG(("App Error: "
+						"Bad data for SessionSettings::addFromSerialized()"));
+					return;
+				}
+				groupEmojiSectionHidden.emplace(DeserializePeerId(peerId));
+			}
+		}
+	}
+	if (!stream.atEnd()) {
+		stream
+			>> lastNonPremiumLimitDownload
+			>> lastNonPremiumLimitUpload;
+	}
+	if (!stream.atEnd()) {
+		auto count = qint32(0);
+		stream >> count;
+		if (stream.status() == QDataStream::Ok) {
+			for (auto i = 0; i != count; ++i) {
+				auto keyPeerId = quint64();
+				auto keyTopicRootId = qint64();
+				auto keyMonoforumPeerId = quint64();
+				auto value = qint64();
+				stream
+					>> keyPeerId
+					>> keyTopicRootId
+					>> keyMonoforumPeerId
+					>> value;
+				if (stream.status() != QDataStream::Ok) {
+					LOG(("App Error: "
+						"Bad data for SessionSettings::addFromSerialized()"));
+					return;
+				}
+				hiddenPinnedMessages.emplace(ThreadId{
+					DeserializePeerId(keyPeerId),
+					keyTopicRootId,
+					DeserializePeerId(keyMonoforumPeerId),
+				}, value);
+			}
+		}
+	}
+	if (!stream.atEnd()) {
+		auto count = qint32(0);
+		stream >> count;
+		if (stream.status() == QDataStream::Ok) {
+			for (auto i = 0; i != count; ++i) {
+				auto peerId = quint64();
+				stream >> peerId;
+				if (stream.status() != QDataStream::Ok) {
+					LOG(("App Error: "
+						"Bad data for SessionSettings::addFromSerialized()"));
+					return;
+				}
+				subsectionTabsModes.emplace(
+					DeserializePeerId(peerId), qint32(1));
+			}
+		}
+	}
+	if (!stream.atEnd()) {
+		auto count = qint32(0);
+		stream >> count;
+		if (stream.status() == QDataStream::Ok) {
+			for (auto i = 0; i != count; ++i) {
+				auto keyDefaultNotify = uint8_t();
+				auto value = ushort();
+				stream
+					>> keyDefaultNotify
+					>> value;
+				if (stream.status() != QDataStream::Ok) {
+					LOG(("App Error: "
+						"Bad data for SessionSettings::addFromSerialized()"));
+					return;
+				}
+				ringtoneDefaultVolumes.emplace(
+					static_cast<Data::DefaultNotify>(keyDefaultNotify),
+					value);
+			}
+		}
+	}
+	if (!stream.atEnd()) {
+		auto count = qint32(0);
+		stream >> count;
+		if (stream.status() == QDataStream::Ok) {
+			for (auto i = 0; i != count; ++i) {
+				auto keyPeerId = quint64();
+				auto keyTopicRootId = qint64();
+				auto keyMonoforumPeerId = quint64();
+				auto value = ushort();
+				stream
+					>> keyPeerId
+					>> keyTopicRootId
+					>> keyMonoforumPeerId
+					>> value;
+				if (stream.status() != QDataStream::Ok) {
+					LOG(("App Error: "
+						"Bad data for SessionSettings::addFromSerialized()"));
+					return;
+				}
+				ringtoneVolumes.emplace(ThreadId{
+					DeserializePeerId(keyPeerId),
+					keyTopicRootId,
+					DeserializePeerId(keyMonoforumPeerId),
+				}, value);
+			}
+		}
+	}
+	if (!stream.atEnd()) {
+		auto count = qint32(0);
+		stream >> count;
+		if (stream.status() == QDataStream::Ok) {
+			for (auto i = 0; i != count; ++i) {
+				auto transcriptionId = quint64();
+				stream >> transcriptionId;
+				if (stream.status() != QDataStream::Ok) {
+					LOG(("App Error: "
+						"Bad data for SessionSettings::addFromSerialized()"
+						"with ratedTranscriptions"));
+					return;
+				}
+				ratedTranscriptions.emplace(transcriptionId);
+			}
+		}
+	}
+	if (!stream.atEnd()) {
+		auto count = qint32(0);
+		stream >> count;
+		if (stream.status() == QDataStream::Ok) {
+			for (auto i = 0; i != count; ++i) {
+				auto hash = quint64();
+				auto unconfirmed = qint32();
+				auto date = qint32();
+				QString device, location;
+				stream >> hash >> unconfirmed >> date >> device >> location;
+				if (stream.status() != QDataStream::Ok) {
+					LOG(("App Error: "
+						"Bad data for SessionSettings::addFromSerialized()"
+						"with unreviewed"));
+					return;
+				}
+				unreviewed.emplace_back(Data::UnreviewedAuth{
+					.hash = hash,
+					.unconfirmed = (unconfirmed == 1),
+					.date = TimeId(date),
+					.device = device,
+					.location = location,
+				});
+			}
+		}
+	}
+	if (!stream.atEnd()) {
+		stream >> setupEmailState;
+	}
+	if (!stream.atEnd()) {
+		auto count = qint32(0);
+		stream >> count;
+		if (stream.status() == QDataStream::Ok) {
+			for (auto i = 0; i != count; ++i) {
+				qint32 filterId;
+				stream >> filterId;
+				if (stream.status() != QDataStream::Ok) {
+					LOG(("App Error: "
+						"Bad data for SessionSettings::addFromSerialized()"
+						"with moderateCommonGroups"));
+					return;
+				}
+				moderateCommonGroups.emplace_back(filterId);
+			}
+		}
+	}
+	if (!stream.atEnd()) {
+		stream >> disableSharingBoxShowsCount;
+	}
+	if (!stream.atEnd()) {
+		auto count = qint32(0);
+		stream >> count;
+		if (stream.status() == QDataStream::Ok) {
+			for (auto i = 0; i != count; ++i) {
+				auto peerId = quint64();
+				auto mode = qint32(0);
+				stream >> peerId >> mode;
+				if (stream.status() != QDataStream::Ok) {
+					LOG(("App Error: "
+						"Bad data for SessionSettings::addFromSerialized()"));
+					return;
+				}
+				subsectionTabsModes.emplace(
+					DeserializePeerId(peerId), mode);
+			}
+		}
+	}
+	if (!stream.atEnd()) {
+		stream >> phoneNumberHidden;
+	}
+	if (!stream.atEnd()) {
+		auto count = qint32(0);
+		stream >> count;
+		if (stream.status() == QDataStream::Ok) {
+			for (auto i = 0; i != count; ++i) {
+				auto custom = quint64();
+				auto emoji = QString();
+				stream >> custom >> emoji;
+				if (stream.status() != QDataStream::Ok) {
+					LOG(("App Error: "
+						"Bad data for SessionSettings::addFromSerialized()"
+						"with extraFavoriteReactions"));
+					return;
+				}
+				if (custom) {
+					extraFavoriteReactions.push_back(
+						Data::ReactionId{ DocumentId(custom) });
+				} else if (!emoji.isEmpty()) {
+					extraFavoriteReactions.push_back(
+						Data::ReactionId{ emoji });
+				}
+			}
+		}
+	}
+	if (!stream.atEnd()) {
+		stream >> stashHintShowsCount;
 	}
 	if (stream.status() != QDataStream::Ok) {
 		LOG(("App Error: "
@@ -355,6 +778,7 @@ void SessionSettings::addFromSerialized(const QByteArray &serialized) {
 	case ChatHelpers::SelectorTab::Gifs: _selectorTab = uncheckedTab; break;
 	}
 	_groupStickersSectionHidden = std::move(groupStickersSectionHidden);
+	_groupEmojiSectionHidden = std::move(groupEmojiSectionHidden);
 	auto uncheckedSupportSwitch = static_cast<Support::SwitchSettings>(
 		supportSwitch);
 	switch (uncheckedSupportSwitch) {
@@ -369,12 +793,35 @@ void SessionSettings::addFromSerialized(const QByteArray &serialized) {
 	_supportAllSearchResults = (supportAllSearchResults == 1);
 	_archiveCollapsed = (archiveCollapsed == 1);
 	_archiveInMainMenu = (archiveInMainMenu == 1);
-	_skipArchiveInSearch = (skipArchiveInSearch == 1);
-	_mediaLastPlaybackPosition = std::move(mediaLastPlaybackPosition);
 	_hiddenPinnedMessages = std::move(hiddenPinnedMessages);
 	_dialogsFiltersEnabled = (dialogsFiltersEnabled == 1);
 	_supportAllSilent = (supportAllSilent == 1);
 	_photoEditorHintShowsCount = std::move(photoEditorHintShowsCount);
+	_mutePeriods = std::move(mutePeriods);
+	_lastNonPremiumLimitDownload = lastNonPremiumLimitDownload;
+	_lastNonPremiumLimitUpload = lastNonPremiumLimitUpload;
+	_subsectionTabsModes = std::move(subsectionTabsModes);
+	_ringtoneDefaultVolumes = std::move(ringtoneDefaultVolumes);
+	_ringtoneVolumes = std::move(ringtoneVolumes);
+	_ratedTranscriptions = std::move(ratedTranscriptions);
+	_unreviewed = std::move(unreviewed);
+	auto uncheckedSetupEmailState = static_cast<Data::SetupEmailState>(
+		setupEmailState);
+	switch (uncheckedSetupEmailState) {
+	case Data::SetupEmailState::None:
+	case Data::SetupEmailState::Setup:
+	case Data::SetupEmailState::SetupNoSkip:
+	case Data::SetupEmailState::SettingUp:
+	case Data::SetupEmailState::SettingUpNoSkip:
+		_setupEmailState = uncheckedSetupEmailState;
+		break;
+	}
+
+	_moderateCommonGroups = std::move(moderateCommonGroups);
+	_disableSharingBoxShowsCount = disableSharingBoxShowsCount;
+	_phoneNumberHidden = (phoneNumberHidden == 1);
+	_extraFavoriteReactions = std::move(extraFavoriteReactions);
+	_stashHintShowsCount = stashHintShowsCount;
 
 	if (version < 2) {
 		app.setLastSeenWarningSeen(appLastSeenWarningSeen == 1);
@@ -392,7 +839,6 @@ void SessionSettings::addFromSerialized(const QByteArray &serialized) {
 		}
 		app.setIncludeMutedCounter(appIncludeMutedCounter == 1);
 		app.setCountUnreadMessages(appCountUnreadMessages == 1);
-		app.setExeLaunchWarning(appExeLaunchWarning == 1);
 		app.setNotifyAboutPinned(appNotifyAboutPinned == 1);
 		app.setLoopAnimatedStickers(appLoopAnimatedStickers == 1);
 		app.setLargeEmoji(appLargeEmoji == 1);
@@ -400,8 +846,25 @@ void SessionSettings::addFromSerialized(const QByteArray &serialized) {
 		app.setSuggestEmoji(appSuggestEmoji == 1);
 		app.setSuggestStickersByEmoji(appSuggestStickersByEmoji == 1);
 		app.setSpellcheckerEnabled(appSpellcheckerEnabled == 1);
-		app.setVideoPlaybackSpeed(Core::Settings::DeserializePlaybackSpeed(appVideoPlaybackSpeed));
+		app.setVideoPlaybackSpeedSerialized(appVideoPlaybackSpeed);
 		app.setVideoPipGeometry(appVideoPipGeometry);
+		const auto local = Spellchecker::LocalIdScheme();
+		const auto scheme = Spellchecker::LangIdSchemeForAppVersion(
+			writerVersion);
+		if (scheme != local) {
+			auto converted = std::vector<int>();
+			for (const auto id : appDictionariesEnabled) {
+				const auto value = Spellchecker::ConvertLangId(
+					id,
+					scheme,
+					local);
+				if (!value || ranges::contains(converted, value)) {
+					continue;
+				}
+				converted.push_back(value);
+			}
+			appDictionariesEnabled = std::move(converted);
+		}
 		app.setDictionariesEnabled(std::move(appDictionariesEnabled));
 		app.setAutoDownloadDictionaries(appAutoDownloadDictionaries == 1);
 		app.setTabbedSelectorSectionEnabled(appTabbedSelectorSectionEnabled == 1);
@@ -419,7 +882,7 @@ void SessionSettings::addFromSerialized(const QByteArray &serialized) {
 		case RectPart::BottomRight: app.setFloatPlayerCorner(uncheckedCorner); break;
 		}
 		app.setThirdSectionInfoEnabled(appThirdSectionInfoEnabled);
-		app.setDialogsWidthRatio(appDialogsWidthRatio);
+		app.updateDialogsWidthRatio(appDialogsWidthRatio);
 		app.setThirdColumnWidth(appThirdColumnWidth);
 		app.setThirdSectionExtendedBy(appThirdSectionExtendedBy);
 	}
@@ -449,34 +912,6 @@ rpl::producer<bool> SessionSettings::supportAllSearchResultsValue() const {
 	return _supportAllSearchResults.value();
 }
 
-void SessionSettings::setMediaLastPlaybackPosition(DocumentId id, crl::time time) {
-	auto &map = _mediaLastPlaybackPosition;
-	const auto i = ranges::find(
-		map,
-		id,
-		&std::pair<DocumentId, crl::time>::first);
-	if (i != map.end()) {
-		if (time > 0) {
-			i->second = time;
-		} else {
-			map.erase(i);
-		}
-	} else if (time > 0) {
-		if (map.size() >= kMaxSavedPlaybackPositions) {
-			map.erase(map.begin());
-		}
-		map.emplace_back(id, time);
-	}
-}
-
-crl::time SessionSettings::mediaLastPlaybackPosition(DocumentId id) const {
-	const auto i = ranges::find(
-		_mediaLastPlaybackPosition,
-		id,
-		&std::pair<DocumentId, crl::time>::first);
-	return (i != _mediaLastPlaybackPosition.end()) ? i->second : 0;
-}
-
 void SessionSettings::setArchiveCollapsed(bool collapsed) {
 	_archiveCollapsed = collapsed;
 }
@@ -501,16 +936,44 @@ rpl::producer<bool> SessionSettings::archiveInMainMenuChanges() const {
 	return _archiveInMainMenu.changes();
 }
 
-void SessionSettings::setSkipArchiveInSearch(bool skip) {
-	_skipArchiveInSearch = skip;
+MsgId SessionSettings::hiddenPinnedMessageId(
+		PeerId peerId,
+		MsgId topicRootId,
+		PeerId monoforumPeerId) const {
+	const auto i = _hiddenPinnedMessages.find({
+		peerId,
+		topicRootId,
+		monoforumPeerId,
+	});
+	return (i != end(_hiddenPinnedMessages)) ? i->second : 0;
 }
 
-bool SessionSettings::skipArchiveInSearch() const {
-	return _skipArchiveInSearch.current();
+void SessionSettings::setHiddenPinnedMessageId(
+		PeerId peerId,
+		MsgId topicRootId,
+		PeerId monoforumPeerId,
+		MsgId msgId) {
+	const auto id = ThreadId{ peerId, topicRootId, monoforumPeerId };
+	if (msgId) {
+		_hiddenPinnedMessages[id] = msgId;
+	} else {
+		_hiddenPinnedMessages.remove(id);
+	}
 }
 
-rpl::producer<bool> SessionSettings::skipArchiveInSearchChanges() const {
-	return _skipArchiveInSearch.changes();
+qint32 SessionSettings::subsectionTabsMode(PeerId peerId) const {
+	const auto i = _subsectionTabsModes.find(peerId);
+	return (i != end(_subsectionTabsModes)) ? i->second : 0;
+}
+
+void SessionSettings::setSubsectionTabsMode(
+		PeerId peerId,
+		qint32 mode) {
+	if (mode) {
+		_subsectionTabsModes[peerId] = mode;
+	} else {
+		_subsectionTabsModes.remove(peerId);
+	}
 }
 
 bool SessionSettings::photoEditorHintShown() const {
@@ -521,6 +984,122 @@ void SessionSettings::incrementPhotoEditorHintShown() {
 	if (photoEditorHintShown()) {
 		_photoEditorHintShowsCount++;
 	}
+}
+
+bool SessionSettings::shouldShowDisableSharingBox() const {
+	return _disableSharingBoxShowsCount < kDisableSharingBoxMaxShowsCount;
+}
+
+void SessionSettings::incrementDisableSharingBoxShown() {
+	if (shouldShowDisableSharingBox()) {
+		_disableSharingBoxShowsCount++;
+	}
+}
+
+void SessionSettings::resetDisableSharingBoxShown() {
+	_disableSharingBoxShowsCount = 0;
+}
+
+bool SessionSettings::shouldShowStashHint() const {
+	return _stashHintShowsCount < kStashHintMaxShowsCount;
+}
+
+void SessionSettings::incrementStashHintShown() {
+	if (shouldShowStashHint()) {
+		_stashHintShowsCount++;
+	}
+}
+
+void SessionSettings::markStashHintUsed() {
+	_stashHintShowsCount = kStashHintMaxShowsCount;
+}
+
+std::vector<TimeId> SessionSettings::mutePeriods() const {
+	return _mutePeriods;
+}
+
+void SessionSettings::addMutePeriod(TimeId period) {
+	if (_mutePeriods.empty()) {
+		_mutePeriods.push_back(period);
+	} else if (_mutePeriods.back() != period) {
+		if (_mutePeriods.back() < period) {
+			_mutePeriods = { _mutePeriods.back(), period };
+		} else {
+			_mutePeriods = { period, _mutePeriods.back() };
+		}
+	}
+}
+
+ushort SessionSettings::ringtoneVolume(
+		Data::DefaultNotify defaultNotify) const {
+	const auto i = _ringtoneDefaultVolumes.find(defaultNotify);
+	return (i != end(_ringtoneDefaultVolumes)) ? i->second : 0;
+}
+
+void SessionSettings::setRingtoneVolume(
+		Data::DefaultNotify defaultNotify,
+		ushort volume) {
+	if (volume > 0 && volume <= 100) {
+		_ringtoneDefaultVolumes[defaultNotify] = volume;
+	} else {
+		_ringtoneDefaultVolumes.remove(defaultNotify);
+	}
+}
+
+ushort SessionSettings::ringtoneVolume(
+		PeerId peerId,
+		MsgId topicRootId,
+		PeerId monoforumPeerId) const {
+	const auto i = _ringtoneVolumes.find(
+		ThreadId{ peerId, topicRootId, monoforumPeerId });
+	return (i != end(_ringtoneVolumes)) ? i->second : 0;
+}
+
+void SessionSettings::setRingtoneVolume(
+		PeerId peerId,
+		MsgId topicRootId,
+		PeerId monoforumPeerId,
+		ushort volume) {
+	const auto id = ThreadId{ peerId, topicRootId, monoforumPeerId };
+	if (volume > 0 && volume <= 100) {
+		_ringtoneVolumes[id] = volume;
+	} else {
+		_ringtoneVolumes.remove(id);
+	}
+}
+
+void SessionSettings::markTranscriptionAsRated(uint64 transcriptionId) {
+	_ratedTranscriptions.emplace(transcriptionId);
+}
+
+bool SessionSettings::isTranscriptionRated(uint64 transcriptionId) const {
+	return _ratedTranscriptions.contains(transcriptionId);
+}
+
+void SessionSettings::setUnreviewed(std::vector<Data::UnreviewedAuth> auths) {
+	_unreviewed = std::move(auths);
+}
+
+const std::vector<Data::UnreviewedAuth> &SessionSettings::unreviewed() const {
+	return _unreviewed;
+}
+
+void SessionSettings::setSetupEmailState(Data::SetupEmailState state) {
+	_setupEmailState = state;
+}
+
+Data::SetupEmailState SessionSettings::setupEmailState() const {
+	return _setupEmailState;
+}
+
+void SessionSettings::setExtraFavoriteReactions(
+		std::vector<Data::ReactionId> list) {
+	_extraFavoriteReactions = std::move(list);
+}
+
+auto SessionSettings::extraFavoriteReactions() const
+-> const std::vector<Data::ReactionId> & {
+	return _extraFavoriteReactions;
 }
 
 } // namespace Main

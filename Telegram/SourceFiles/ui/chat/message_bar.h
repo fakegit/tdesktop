@@ -7,8 +7,9 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #pragma once
 
-#include "ui/rp_widget.h"
 #include "ui/effects/animations.h"
+#include "ui/rect_part.h"
+#include "ui/rp_widget.h"
 
 class Painter;
 
@@ -18,25 +19,33 @@ struct MessageBar;
 
 namespace Ui {
 
+class DynamicImage;
+
 struct MessageBarContent {
 	int index = 0;
 	int count = 1;
 	QString title;
 	TextWithEntities text;
-	QImage preview;
+	Text::MarkedContext context;
+	std::shared_ptr<DynamicImage> preview;
+	style::margins margins;
 };
 
 class MessageBar final {
 public:
-	MessageBar(not_null<QWidget*> parent, const style::MessageBar &st);
+	MessageBar(
+		not_null<QWidget*> parent,
+		const style::MessageBar &st,
+		Fn<bool()> customEmojiPaused);
 
 	void set(MessageBarContent &&content);
 	void set(rpl::producer<MessageBarContent> content);
 
-	[[nodiscard]] not_null<Ui::RpWidget*> widget() {
+	[[nodiscard]] not_null<RpWidget*> widget() {
 		return &_widget;
 	}
 
+	void customEmojiRepaint();
 	void finishAnimating();
 
 private:
@@ -46,10 +55,10 @@ private:
 		None,
 	};
 	struct Animation {
-		Ui::Animations::Simple bodyMoved;
-		Ui::Animations::Simple imageShown;
-		Ui::Animations::Simple barScroll;
-		Ui::Animations::Simple barTop;
+		Animations::Simple bodyMoved;
+		Animations::Simple imageShown;
+		Animations::Simple barScroll;
+		Animations::Simple barTop;
 		QPixmap bodyOrTextFrom;
 		QPixmap bodyOrTextTo;
 		QPixmap titleSame;
@@ -67,11 +76,11 @@ private:
 		float64 offset = 0.;
 	};
 	void setup();
+	void refreshImage();
 	void paint(Painter &p);
 	void paintLeftBar(Painter &p);
 	void tweenTo(MessageBarContent &&content);
 	void updateFromContent(MessageBarContent &&content);
-	[[nodiscard]] QPixmap prepareImage(const QImage &preview);
 
 	[[nodiscard]] QRect imageRect() const;
 	[[nodiscard]] QRect titleRangeRect(int from, int till) const;
@@ -98,12 +107,15 @@ private:
 		const MessageBarContent &nextContent);
 
 	const style::MessageBar &_st;
-	Ui::RpWidget _widget;
+	RpWidget _widget;
+	Fn<bool()> _customEmojiPaused;
 	MessageBarContent _content;
 	rpl::lifetime _contentLifetime;
-	Ui::Text::String _title, _text;
+	Text::String _title, _text;
 	QPixmap _image, _topBarGradient, _bottomBarGradient;
 	std::unique_ptr<Animation> _animation;
+	bool _customEmojiRepaintScheduled = false;
+	bool _imageRefreshScheduled = false;
 
 };
 

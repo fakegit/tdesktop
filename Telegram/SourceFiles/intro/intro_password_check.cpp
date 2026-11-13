@@ -8,19 +8,20 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "intro/intro_password_check.h"
 
 #include "intro/intro_widget.h"
-#include "core/file_utilities.h"
 #include "core/core_cloud_password.h"
-#include "boxes/confirm_box.h"
+#include "ui/boxes/confirm_box.h"
+#include "boxes/abstract_box.h"
 #include "boxes/passcode_box.h"
 #include "lang/lang_keys.h"
 #include "intro/intro_signup.h"
+#include "ui/text/text_utilities.h"
 #include "ui/widgets/buttons.h"
-#include "ui/widgets/input_fields.h"
-#include "ui/widgets/labels.h"
+#include "ui/widgets/fields/input_field.h"
+#include "ui/widgets/fields/password_input.h"
 #include "main/main_account.h"
-#include "base/openssl_help.h"
+#include "base/random.h"
 #include "styles/style_intro.h"
-#include "styles/style_boxes.h"
+#include "styles/style_widgets.h"
 
 namespace Intro {
 namespace details {
@@ -36,17 +37,24 @@ PasswordCheckWidget::PasswordCheckWidget(
 , _codeField(this, st::introPassword, tr::lng_signin_code())
 , _toRecover(this, tr::lng_signin_recover(tr::now))
 , _toPassword(this, tr::lng_signin_try_password(tr::now)) {
-	Expects(!!_passwordState.request);
+	Expects(_passwordState.hasPassword);
 
 	Lang::Updated(
-	) | rpl::start_with_next([=] {
+	) | rpl::on_next([=] {
 		refreshLang();
 	}, lifetime());
 
 	_toRecover->addClickHandler([=] { toRecover(); });
 	_toPassword->addClickHandler([=] { toPassword(); });
 	connect(_pwdField, &Ui::PasswordInput::changed, [=] { hideError(); });
-	connect(_codeField, &Ui::InputField::changed, [=] { hideError(); });
+	_codeField->changes(
+	) | rpl::on_next([=] {
+		hideError();
+	}, _codeField->lifetime());
+	_codeField->submits(
+	) | rpl::on_next([=] {
+		submit();
+	}, _codeField->lifetime());
 
 	setTitleText(tr::lng_signin_title());
 	updateDescriptionText();
@@ -122,17 +130,14 @@ void PasswordCheckWidget::cancelled() {
 	api().request(base::take(_sentRequest)).cancel();
 }
 
-void PasswordCheckWidget::pwdSubmitDone(bool recover, const MTPauth_Authorization &result) {
+void PasswordCheckWidget::pwdSubmitDone(
+		bool recover,
+		const MTPauth_Authorization &result) {
 	_sentRequest = 0;
 	if (recover) {
 		cSetPasswordRecovered(true);
 	}
-	auto &d = result.c_auth_authorization();
-	if (d.vuser().type() != mtpc_user || !d.vuser().c_user().is_self()) { // wtf?
-		showError(rpl::single(Lang::Hard::ServerError()));
-		return;
-	}
-	finish(d.vuser());
+	finish(result);
 }
 
 void PasswordCheckWidget::pwdSubmitFail(const MTP::Error &error) {
@@ -145,22 +150,18 @@ void PasswordCheckWidget::pwdSubmitFail(const MTP::Error &error) {
 
 	_sentRequest = 0;
 	const auto &type = error.type();
-	if (type == qstr("PASSWORD_HASH_INVALID")
-		|| type == qstr("SRP_PASSWORD_CHANGED")) {
+	if (type == u"PASSWORD_HASH_INVALID"_q
+		|| type == u"SRP_PASSWORD_CHANGED"_q) {
 		showError(tr::lng_signin_bad_password());
 		_pwdField->selectAll();
 		_pwdField->showError();
-	} else if (type == qstr("PASSWORD_EMPTY")
-		|| type == qstr("AUTH_KEY_UNREGISTERED")) {
+	} else if (type == u"PASSWORD_EMPTY"_q
+		|| type == u"AUTH_KEY_UNREGISTERED"_q) {
 		goBack();
-	} else if (type == qstr("SRP_ID_INVALID")) {
+	} else if (type == u"SRP_ID_INVALID"_q) {
 		handleSrpIdInvalid();
-	} else {
-		if (Logs::DebugEnabled()) { // internal server error
-			showError(rpl::single(type + ": " + error.description()));
-		} else {
-			showError(rpl::single(Lang::Hard::ServerError()));
-		}
+	} else if (!MTP::IgnoreError(error)) {
+		showError(rpl::single(type));
 		_pwdField->setFocus();
 	}
 }
@@ -169,7 +170,7 @@ void PasswordCheckWidget::handleSrpIdInvalid() {
 	const auto now = crl::now();
 	if (_lastSrpIdInvalidTime > 0
 		&& now - _lastSrpIdInvalidTime < Core::kHandleSrpIdInvalidTimeout) {
-		_passwordState.request.id = 0;
+		_passwordState.mtp.request.id = 0;
 		showError(rpl::single(Lang::Hard::ServerError()));
 	} else {
 		_lastSrpIdInvalidTime = now;
@@ -178,7 +179,7 @@ void PasswordCheckWidget::handleSrpIdInvalid() {
 }
 
 void PasswordCheckWidget::checkPasswordHash() {
-	if (_passwordState.request.id) {
+	if (_passwordState.mtp.request.id) {
 		passwordChecked();
 	} else {
 		requestPasswordData();
@@ -192,7 +193,7 @@ void PasswordCheckWidget::requestPasswordData() {
 	).done([=](const MTPaccount_Password &result) {
 		_sentRequest = 0;
 		result.match([&](const MTPDaccount_password &data) {
-			openssl::AddRandomSeed(bytes::make_span(data.vsecure_random().v));
+			base::RandomAddSeed(bytes::make_span(data.vsecure_random().v));
 			_passwordState = Core::ParseCloudPasswordState(data);
 			passwordChecked();
 		});
@@ -200,13 +201,22 @@ void PasswordCheckWidget::requestPasswordData() {
 }
 
 void PasswordCheckWidget::passwordChecked() {
+	if (!_passwordState.mtp.request) {
+		if (_passwordState.mtp.unknownAlgorithm) {
+			// Switched to an algorithm this build cannot compute.
+			return serverError();
+		}
+		// The password was removed after this step was created, which is the
+		// same situation the PASSWORD_EMPTY error reports.
+		return goBack();
+	}
 	const auto check = Core::ComputeCloudPasswordCheck(
-		_passwordState.request,
+		_passwordState.mtp.request,
 		_passwordHash);
 	if (!check) {
 		return serverError();
 	}
-	_passwordState.request.id = 0;
+	_passwordState.mtp.request.id = 0;
 	_sentRequest = api().request(
 		MTPauth_CheckPassword(check.result)
 	).done([=](const MTPauth_Authorization &result) {
@@ -226,12 +236,13 @@ void PasswordCheckWidget::codeSubmitDone(
 	auto fields = PasscodeBox::CloudFields::From(_passwordState);
 	fields.fromRecoveryCode = code;
 	fields.hasRecovery = false;
-	fields.curRequest = {};
+	fields.mtp.curRequest = {};
+	fields.hasPassword = false;
 	auto box = Box<PasscodeBox>(&api().instance(), nullptr, fields);
-	const auto boxShared = std::make_shared<QPointer<PasscodeBox>>();
+	const auto boxShared = std::make_shared<base::weak_qptr<PasscodeBox>>();
 
 	box->newAuthorization(
-	) | rpl::start_with_next([=](const MTPauth_Authorization &result) {
+	) | rpl::on_next([=](const MTPauth_Authorization &result) {
 		if (boxShared) {
 			(*boxShared)->closeBox();
 		}
@@ -250,24 +261,20 @@ void PasswordCheckWidget::codeSubmitFail(const MTP::Error &error) {
 
 	_sentRequest = 0;
 	const auto &type = error.type();
-	if (type == qstr("PASSWORD_EMPTY")
-		|| type == qstr("AUTH_KEY_UNREGISTERED")) {
+	if (type == u"PASSWORD_EMPTY"_q
+		|| type == u"AUTH_KEY_UNREGISTERED"_q) {
 		goBack();
-	} else if (type == qstr("PASSWORD_RECOVERY_NA")) {
+	} else if (type == u"PASSWORD_RECOVERY_NA"_q) {
 		recoverStartFail(error);
-	} else if (type == qstr("PASSWORD_RECOVERY_EXPIRED")) {
+	} else if (type == u"PASSWORD_RECOVERY_EXPIRED"_q) {
 		_emailPattern = QString();
 		toPassword();
-	} else if (type == qstr("CODE_INVALID")) {
+	} else if (type == u"CODE_INVALID"_q) {
 		showError(tr::lng_signin_wrong_code());
 		_codeField->selectAll();
 		_codeField->showError();
-	} else {
-		if (Logs::DebugEnabled()) { // internal server error
-			showError(rpl::single(type + ": " + error.description()));
-		} else {
-			showError(rpl::single(Lang::Hard::ServerError()));
-		}
+	} else if (!MTP::IgnoreError(error)) {
+		showError(rpl::single(type));
 		_codeField->setFocus();
 	}
 }
@@ -311,16 +318,22 @@ void PasswordCheckWidget::toRecover() {
 			}).send();
 		}
 	} else {
-		Ui::show(Box<InformBox>(
-			tr::lng_signin_no_email_forgot(tr::now),
-			[=] { showReset(); }));
+		const auto box = Ui::show(
+			Ui::MakeInformBox(tr::lng_signin_no_email_forgot()));
+		box->boxClosing(
+		) | rpl::on_next([=] {
+			showReset();
+		}, box->lifetime());
 	}
 }
 
 void PasswordCheckWidget::toPassword() {
-	Ui::show(Box<InformBox>(
-		tr::lng_signin_cant_email_forgot(tr::now),
-		[=] { showReset(); }));
+	const auto box = Ui::show(
+		Ui::MakeInformBox(tr::lng_signin_cant_email_forgot()));
+	box->boxClosing(
+	) | rpl::on_next([=] {
+		showReset();
+	}, box->lifetime());
 }
 
 void PasswordCheckWidget::showReset() {
@@ -343,8 +356,11 @@ void PasswordCheckWidget::updateDescriptionText() {
 	auto pwdHidden = _pwdField->isHidden();
 	auto emailPattern = _emailPattern;
 	setDescriptionText(pwdHidden
-		? tr::lng_signin_recover_desc(lt_email, rpl::single(emailPattern))
-		: tr::lng_signin_desc());
+		? tr::lng_signin_recover_desc(
+			lt_email,
+			rpl::single(Ui::Text::WrapEmailPattern(emailPattern)),
+			tr::marked)
+		: tr::lng_signin_desc(tr::marked));
 }
 
 void PasswordCheckWidget::submit() {
@@ -372,19 +388,23 @@ void PasswordCheckWidget::submit() {
 				send();
 				close();
 			};
-			Ui::show(Box<ConfirmBox>(
-				tr::lng_cloud_password_passport_losing(tr::now),
-				tr::lng_continue(tr::now),
-				confirmed));
+			Ui::show(Ui::MakeConfirmBox({
+				.text = tr::lng_cloud_password_passport_losing(),
+				.confirmed = confirmed,
+				.confirmText = tr::lng_continue(),
+			}));
 		} else {
 			send();
 		}
 	} else {
 		hideError();
 
+		if (!_passwordState.mtp.request) {
+			return serverError();
+		}
 		const auto password = _pwdField->getLastText().toUtf8();
 		_passwordHash = Core::ComputeCloudPasswordHash(
-			_passwordState.request.algo,
+			_passwordState.mtp.request.algo,
 			bytes::make_span(password));
 		checkPasswordHash();
 	}

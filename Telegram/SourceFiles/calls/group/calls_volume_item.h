@@ -29,15 +29,19 @@ struct ParticipantState;
 class MenuVolumeItem final : public Ui::Menu::ItemBase {
 public:
 	MenuVolumeItem(
-		not_null<RpWidget*> parent,
+		not_null<Ui::Menu::Menu*> parent,
 		const style::Menu &st,
+		const style::MediaSlider &stSlider,
 		rpl::producer<Group::ParticipantState> participantState,
 		int startVolume,
 		int maxVolume,
-		bool muted);
+		bool muted,
+		const QMargins &padding);
 
 	not_null<QAction*> action() const override;
 	bool isEnabled() const override;
+
+	void setCanMute(bool canMute);
 
 	[[nodiscard]] rpl::producer<bool> toggleMuteRequests() const;
 	[[nodiscard]] rpl::producer<bool> toggleMuteLocallyRequests() const;
@@ -62,6 +66,7 @@ private:
 	bool _waitingForUpdateVolume = false;
 	bool _cloudMuted = false;
 	bool _localMuted = false;
+	bool _canMute = true;
 
 	QRect _itemRect;
 	QRect _speakerRect;
@@ -71,6 +76,7 @@ private:
 	const not_null<QAction*> _dummyAction;
 	const style::Menu &_st;
 	const style::CrossLineAnimation &_stCross;
+	const QMargins &_padding;
 
 	const std::unique_ptr<Ui::CrossLineAnimation> _crossLineMute;
 	Ui::Animations::Simple _crossLineAnimation;

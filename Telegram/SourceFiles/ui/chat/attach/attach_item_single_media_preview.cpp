@@ -32,16 +32,17 @@ using namespace ::Media::Streaming;
 
 ItemSingleMediaPreview::ItemSingleMediaPreview(
 	QWidget *parent,
+	const style::ComposeControls &st,
 	Fn<bool()> gifPaused,
 	not_null<HistoryItem*> item,
 	AttachControls::Type type)
-: AbstractSingleMediaPreview(parent, type)
+: AbstractSingleMediaPreview(parent, st, type)
 , _gifPaused(std::move(gifPaused))
 , _fullId(item->fullId()) {
 	const auto media = item->media();
 	Assert(media != nullptr);
 
-	Main::Session *session = nullptr;
+	auto session = (Main::Session*)nullptr;
 
 	if (const auto photo = media->photo()) {
 		_photoMedia = photo->createMediaView();
@@ -82,11 +83,9 @@ ItemSingleMediaPreview::ItemSingleMediaPreview(
 		}
 	};
 
-	rpl::single(
-		rpl::empty_value()
-	) | rpl::then(
+	rpl::single(rpl::empty) | rpl::then(
 		session->downloaderTaskFinished()
-	) | rpl::start_with_next([=] {
+	) | rpl::on_next([=] {
 		const auto computed = computeThumbInfo();
 		if (!computed.image) {
 			if (_documentMedia && !_documentMedia->owner()->hasThumbnail()) {
@@ -136,7 +135,7 @@ void ItemSingleMediaPreview::setupStreamedPreview(
 		[=] { update(); });
 	_streamed->lockPlayer();
 	_streamed->player().updates(
-	) | rpl::start_with_next_error([=](Update &&update) {
+	) | rpl::on_next_error([=](Update &&update) {
 		handleStreamingUpdate(std::move(update));
 	}, [=](Error &&error) {
 		handleStreamingError(std::move(error));
@@ -151,14 +150,15 @@ void ItemSingleMediaPreview::setupStreamedPreview(
 void ItemSingleMediaPreview::handleStreamingUpdate(Update &&update) {
 	v::match(update.data, [&](Information &update) {
 		streamingReady(std::move(update));
-	}, [&](const PreloadedVideo &update) {
-	}, [&](const UpdateVideo &update) {
+	}, [](PreloadedVideo) {
+	}, [&](UpdateVideo) {
 		this->update();
-	}, [&](const PreloadedAudio &update) {
-	}, [&](const UpdateAudio &update) {
-	}, [&](const WaitingForData &update) {
-	}, [&](MutedByOther) {
-	}, [&](Finished) {
+	}, [](PreloadedAudio) {
+	}, [](UpdateAudio) {
+	}, [](WaitingForData) {
+	}, [](SpeedEstimate) {
+	}, [](MutedByOther) {
+	}, [](Finished) {
 	});
 }
 
@@ -192,11 +192,15 @@ void ItemSingleMediaPreview::startStreamedPlayer() {
 	_streamed->play(options);
 }
 
+bool ItemSingleMediaPreview::supportsSpoilers() const {
+	return false; // We are not allowed to change existing spoiler setting.
+}
+
 bool ItemSingleMediaPreview::drawBackground() const {
 	return true; // A sticker can't be here.
 }
 
-bool ItemSingleMediaPreview::tryPaintAnimation(Painter &p) {
+bool ItemSingleMediaPreview::tryPaintAnimation(QPainter &p) {
 	checkStreamedIsStarted();
 	if (_streamed
 		&& _streamed->player().ready()
@@ -205,8 +209,8 @@ bool ItemSingleMediaPreview::tryPaintAnimation(Painter &p) {
 		const auto paused = _gifPaused();
 
 		auto request = ::Media::Streaming::FrameRequest();
-		request.outer = s * cIntRetinaFactor();
-		request.resize = s * cIntRetinaFactor();
+		request.outer = s * style::DevicePixelRatio();
+		request.resize = s * style::DevicePixelRatio();
 		p.drawImage(
 			QRect(
 				previewLeft(),

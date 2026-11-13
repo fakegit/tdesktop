@@ -34,7 +34,7 @@ struct MediaSettings {
 	friend inline constexpr auto is_flag_type(Type) { return true; };
 
 	Types types = DefaultTypes();
-	int sizeLimit = 8 * 1024 * 1024;
+	int64 sizeLimit = 8 * 1024 * 1024;
 
 	static inline Types DefaultTypes() {
 		return Type::Photo;
@@ -57,13 +57,20 @@ struct Settings {
 		PublicGroups        = 0x100,
 		PrivateChannels     = 0x200,
 		PublicChannels      = 0x400,
+		Stories             = 0x800,
+		ProfileMusic        = 0x1000,
 
 		GroupsMask          = PrivateGroups | PublicGroups,
 		ChannelsMask        = PrivateChannels | PublicChannels,
 		GroupsChannelsMask  = GroupsMask | ChannelsMask,
 		NonChannelChatsMask = PersonalChats | BotChats | PrivateGroups,
 		AnyChatsMask        = PersonalChats | BotChats | GroupsChannelsMask,
-		NonChatsMask        = PersonalInfo | Userpics | Contacts | Sessions,
+		NonChatsMask        = (PersonalInfo
+			| Userpics
+			| Contacts
+			| Stories
+			| ProfileMusic
+			| Sessions),
 		AllMask             = NonChatsMask | OtherData | AnyChatsMask,
 	};
 	using Types = base::flags<Type>;
@@ -81,16 +88,26 @@ struct Settings {
 	TimeId singlePeerFrom = 0;
 	TimeId singlePeerTill = 0;
 
+	int32 singleTopicRootId = 0;
+	uint64 singleTopicPeerId = 0;
+	QString singleTopicTitle;
+
 	TimeId availableAt = 0;
 
 	bool onlySinglePeer() const {
 		return singlePeer.type() != mtpc_inputPeerEmpty;
 	}
 
+	bool onlySingleTopic() const {
+		return onlySinglePeer() && singleTopicRootId != 0;
+	}
+
 	static inline Types DefaultTypes() {
 		return Type::PersonalInfo
 			| Type::Userpics
 			| Type::Contacts
+			| Type::Stories
+			| Type::ProfileMusic
 			| Type::PersonalChats
 			| Type::PrivateGroups;
 	}

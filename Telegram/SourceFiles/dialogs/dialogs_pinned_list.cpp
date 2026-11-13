@@ -7,10 +7,13 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "dialogs/dialogs_pinned_list.h"
 
+#include "data/data_saved_messages.h"
 #include "dialogs/dialogs_key.h"
 #include "dialogs/dialogs_entry.h"
 #include "history/history.h"
+#include "data/data_channel.h"
 #include "data/data_session.h"
+#include "data/data_forum.h"
 
 namespace Dialogs {
 
@@ -30,13 +33,13 @@ void PinnedList::setLimit(int limit) {
 	applyLimit(_limit);
 }
 
-void PinnedList::addPinned(const Key &key) {
+void PinnedList::addPinned(Key key) {
 	Expects(key.entry()->folderKnown());
 
 	addPinnedGetPosition(key);
 }
 
-int PinnedList::addPinnedGetPosition(const Key &key) {
+int PinnedList::addPinnedGetPosition(Key key) {
 	const auto already = ranges::find(_data, key);
 	if (already != end(_data)) {
 		return already - begin(_data);
@@ -48,7 +51,7 @@ int PinnedList::addPinnedGetPosition(const Key &key) {
 	return position;
 }
 
-void PinnedList::setPinned(const Key &key, bool pinned) {
+void PinnedList::setPinned(Key key, bool pinned) {
 	Expects(key.entry()->folderKnown() || _filterId != 0);
 
 	if (pinned) {
@@ -64,7 +67,10 @@ void PinnedList::setPinned(const Key &key, bool pinned) {
 		const auto index = int(it - begin(_data));
 		_data.erase(it);
 		key.entry()->cachePinnedIndex(_filterId, 0);
-		for (auto i = index, count = int(size(_data)); i != count; ++i) {
+		// cachePinnedIndex() may re-enter and erase from _data (for example
+		// while a filter is being removed), so re-check the size each
+		// iteration instead of caching it to avoid an out-of-bounds access.
+		for (auto i = index; i < int(size(_data)); ++i) {
 			_data[i].entry()->cachePinnedIndex(_filterId, i + 1);
 		}
 	}
@@ -85,6 +91,8 @@ void PinnedList::clear() {
 void PinnedList::applyList(
 		not_null<Data::Session*> owner,
 		const QVector<MTPDialogPeer> &list) {
+	Expects(this != owner->savedMessages().chatsList()->pinned());
+
 	clear();
 	for (const auto &peer : list) {
 		peer.match([&](const MTPDdialogPeer &data) {
@@ -93,7 +101,45 @@ void PinnedList::applyList(
 			}
 		}, [&](const MTPDdialogPeerFolder &data) {
 			addPinned(owner->folder(data.vfolder_id().v));
+		}, [&](const MTPDdialogPeerCommunity &data) {
+			const auto channelId = ChannelId(data.vcommunity_id().v);
+			if (const auto channel = owner->channelLoaded(channelId)) {
+				const auto history = owner->history(channel);
+				if (!history->folderKnown()) {
+					history->clearFolder();
+				}
+				addPinned(history);
+			}
 		});
+	}
+}
+
+void PinnedList::applyList(
+		not_null<Data::SavedMessages*> sublistsOwner,
+		const QVector<MTPDialogPeer> &list) {
+	Expects(this == sublistsOwner->chatsList()->pinned());
+
+	clear();
+	for (const auto &peer : list) {
+		peer.match([&](const MTPDdialogPeer &data) {
+			if (const auto peerId = peerFromMTP(data.vpeer())) {
+				const auto peer = sublistsOwner->owner().peer(peerId);
+				addPinned(sublistsOwner->sublist(peer));
+			}
+		}, [](const MTPDdialogPeerFolder &data) {
+		}, [](const MTPDdialogPeerCommunity &data) {
+		});
+	}
+}
+
+void PinnedList::applyList(
+		not_null<Data::Forum*> forum,
+		const QVector<MTPint> &list) {
+	Expects(this == forum->topicsList()->pinned());
+
+	clear();
+	for (const auto &topicId : list) {
+		addPinned(forum->topicFor(topicId.v));
 	}
 }
 
@@ -118,7 +164,7 @@ void PinnedList::applyList(const std::vector<not_null<History*>> &list) {
 	}
 }
 
-void PinnedList::reorder(const Key &key1, const Key &key2) {
+void PinnedList::reorder(Key key1, Key key2) {
 	const auto index1 = ranges::find(_data, key1) - begin(_data);
 	const auto index2 = ranges::find(_data, key2) - begin(_data);
 	Assert(index1 >= 0 && index1 < _data.size());

@@ -9,7 +9,12 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 #include "ui/rp_widget.h"
 #include "ui/chat/attach/attach_send_files_way.h"
+#include "ui/text/text.h"
 #include "base/timer.h"
+
+namespace style {
+struct ComposeControls;
+} // namespace style
 
 namespace Ui {
 
@@ -21,22 +26,40 @@ class AlbumPreview final : public RpWidget {
 public:
 	AlbumPreview(
 		QWidget *parent,
+		const style::ComposeControls &st,
 		gsl::span<Ui::PreparedFile> items,
+		const Text::MarkedContext &captionContext,
 		SendFilesWay way);
 	~AlbumPreview();
 
 	void setSendWay(SendFilesWay way);
-	std::vector<int> takeOrder();
+	void setCaption(int index, const TextWithTags &caption);
+	[[nodiscard]] int indexFromPoint(QPoint position) const;
+
+	[[nodiscard]] base::flat_set<int> collectSpoileredIndices();
+	[[nodiscard]] bool canHaveSpoiler(int index) const;
+	void toggleSpoilers(bool enabled);
+	void setSelectionMode(bool enabled);
+	void setSelected(int index, bool selected);
+	[[nodiscard]] std::vector<int> takeOrder();
 
 	[[nodiscard]] rpl::producer<int> thumbDeleted() const {
 		return _thumbDeleted.events();
 	}
-
 	[[nodiscard]] rpl::producer<int> thumbChanged() const {
 		return _thumbChanged.events();
 	}
+	[[nodiscard]] rpl::producer<int> thumbModified() const {
+		return _thumbModified.events();
+	}
+	[[nodiscard]] rpl::producer<int> thumbSelected() const {
+		return _thumbSelected.events();
+	}
+	[[nodiscard]] rpl::producer<> orderUpdated() const {
+		return _orderUpdated.events();
+	}
 
-	rpl::producer<int> thumbModified() const;
+	[[nodiscard]] QImage generatePriceTagBackground() const;
 
 protected:
 	void paintEvent(QPaintEvent *e) override;
@@ -54,8 +77,6 @@ private:
 	void updateSize();
 	void updateFileRows();
 
-	int thumbIndex(AlbumThumbnail *thumb);
-	AlbumThumbnail *thumbUnderCursor();
 	void deleteThumbByIndex(int index);
 	void changeThumbByIndex(int index);
 	void modifyThumbByIndex(int index);
@@ -64,6 +85,9 @@ private:
 		AttachButtonType type);
 
 	void switchToDrag();
+	[[nodiscard]] bool selectingByClick(
+		QMouseEvent *e,
+		not_null<AlbumThumbnail*> thumb) const;
 
 	void paintAlbum(Painter &p) const;
 	void paintPhotos(Painter &p, QRect clip) const;
@@ -79,6 +103,8 @@ private:
 	void cancelDrag();
 	void finishDrag();
 
+	const style::ComposeControls &_st;
+	const Text::MarkedContext _captionContext;
 	SendFilesWay _sendWay;
 	style::cursor _cursor = style::cur_default;
 	std::vector<int> _order;
@@ -88,10 +114,14 @@ private:
 	int _photosHeight = 0;
 	int _filesHeight = 0;
 
+	bool _hasMixedFileHeights = false;
+
 	AlbumThumbnail *_draggedThumb = nullptr;
 	AlbumThumbnail *_suggestedThumb = nullptr;
 	AlbumThumbnail *_paintedAbove = nullptr;
 	AlbumThumbnail *_pressedThumb = nullptr;
+	AlbumThumbnail *_selectPressedThumb = nullptr;
+	bool _selectionMode = false;
 	QPoint _draggedStartPosition;
 
 	base::Timer _dragTimer;
@@ -100,6 +130,8 @@ private:
 	rpl::event_stream<int> _thumbDeleted;
 	rpl::event_stream<int> _thumbChanged;
 	rpl::event_stream<int> _thumbModified;
+	rpl::event_stream<int> _thumbSelected;
+	rpl::event_stream<> _orderUpdated;
 
 	mutable Animations::Simple _thumbsHeightAnimation;
 	mutable Animations::Simple _shrinkAnimation;

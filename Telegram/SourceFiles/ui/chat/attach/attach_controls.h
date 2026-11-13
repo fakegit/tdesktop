@@ -8,7 +8,6 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #pragma once
 
 #include "ui/abstract_button.h"
-#include "ui/round_rect.h"
 #include "ui/rp_widget.h"
 
 namespace Ui {
@@ -21,18 +20,18 @@ public:
 		None,
 	};
 
-	AttachControls();
-
-	void paint(Painter &p, int x, int y);
+	void paint(QPainter &p, int x, int y);
 	void setType(Type type);
+	void setVertical(bool vertical);
 
 	[[nodiscard]] int width() const;
 	[[nodiscard]] int height() const;
 	[[nodiscard]] Type type() const;
+	[[nodiscard]] bool vertical() const;
 
 private:
-	RoundRect _rect;
 	Type _type = Type::Full;
+	bool _vertical = false;
 
 };
 

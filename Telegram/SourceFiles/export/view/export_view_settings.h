@@ -25,8 +25,8 @@ class Session;
 namespace Export {
 namespace View {
 
-constexpr auto kSizeValueCount = 90;
-int SizeLimitByIndex(int index);
+constexpr auto kSizeValueCount = 100;
+int64 SizeLimitByIndex(int index);
 
 class SettingsWidget : public Ui::RpWidget {
 public:
@@ -34,6 +34,8 @@ public:
 		QWidget *parent,
 		not_null<Main::Session*> session,
 		Settings data);
+
+	[[nodiscard]] int sizeLimitExtraHeight() const;
 
 	rpl::producer<Settings> value() const;
 	rpl::producer<Settings> changes() const;
@@ -77,11 +79,13 @@ private:
 		const QString &text,
 		Types types);
 	void addMediaOptions(not_null<Ui::VerticalLayout*> container);
-	void addMediaOption(
+	not_null<Ui::Checkbox*> addMediaOption(
 		not_null<Ui::VerticalLayout*> container,
 		const QString &text,
 		MediaType type);
-	void addSizeSlider(not_null<Ui::VerticalLayout*> container);
+	void addSizeSlider(
+		not_null<Ui::VerticalLayout*> container,
+		not_null<Ui::Checkbox*> above);
 	void addLocationLabel(
 		not_null<Ui::VerticalLayout*> container);
 	void addFormatAndLocationLabel(
@@ -111,6 +115,8 @@ private:
 
 	// Use through readData / changeData wrappers.
 	Settings _internal_data;
+
+	int _sizeLimitExtraHeight = 0;
 
 	struct Wrap {
 		Wrap(rpl::producer<> value = nullptr)

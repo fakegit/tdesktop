@@ -10,6 +10,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "ui/text/text.h"
 
 constexpr auto FullSelection = TextSelection { 0xFFFF, 0xFFFF };
+constexpr auto kMaxGroupSelectionItems = 0x0F;
 
 [[nodiscard]] bool IsSubGroupSelection(TextSelection selection);
 
@@ -17,10 +18,8 @@ constexpr auto FullSelection = TextSelection { 0xFFFF, 0xFFFF };
 		TextSelection selection,
 		int index);
 
-[[nodiscard]] TextSelection AddGroupItemSelection(
-		TextSelection selection,
-		int index);
+[[nodiscard]] int FirstGroupItemIndex(TextSelection selection);
 
-[[nodiscard]] TextSelection RemoveGroupItemSelection(
+[[nodiscard]] TextSelection AddGroupItemSelection(
 		TextSelection selection,
 		int index);

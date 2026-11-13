@@ -7,25 +7,32 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "data/data_document_resolver.h"
 
-#include "facades.h"
 #include "base/platform/base_platform_info.h"
-#include "boxes/confirm_box.h"
+#include "boxes/abstract_box.h" // Ui::show().
+#include "chat_helpers/ttl_media_layer_widget.h"
 #include "core/application.h"
+#include "core/click_handler_types.h"
 #include "core/core_settings.h"
 #include "core/mime_type.h"
 #include "data/data_document.h"
 #include "data/data_document_media.h"
 #include "data/data_file_click_handler.h"
-#include "data/data_file_origin.h"
 #include "data/data_session.h"
 #include "history/view/media/history_view_gif.h"
 #include "history/history.h"
 #include "history/history_item.h"
+#include "iv/iv_instance.h"
+#include "lang/lang_keys.h"
 #include "media/player/media_player_instance.h"
 #include "platform/platform_file_utilities.h"
+#include "ui/boxes/confirm_box.h"
 #include "ui/chat/chat_theme.h"
 #include "ui/text/text_utilities.h"
+#include "ui/widgets/checkbox.h"
+#include "ui/wrap/slide_wrap.h"
 #include "window/window_session_controller.h"
+
+#include "styles/style_layers.h"
 
 #include <QtCore/QBuffer>
 #include <QtCore/QMimeType>
@@ -34,27 +41,73 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 namespace Data {
 namespace {
 
+void ConfirmDontWarnBox(
+		not_null<Ui::GenericBox*> box,
+		rpl::producer<TextWithEntities> &&text,
+		rpl::producer<QString> &&check,
+		rpl::producer<QString> &&confirm,
+		Fn<void(bool)> callback) {
+	if (!check) {
+		Ui::ConfirmBox(box, {
+			.text = std::move(text),
+			.confirmed = [=] {
+				box->closeBox();
+				callback(false);
+			},
+			.confirmText = std::move(confirm),
+		});
+		return;
+	}
+	auto checkbox = object_ptr<Ui::Checkbox>(
+		box.get(),
+		std::move(check),
+		false,
+		st::defaultBoxCheckbox);
+	const auto weak = base::make_weak(checkbox.data());
+	auto confirmed = crl::guard(weak, [=, callback = std::move(callback)] {
+		const auto checked = weak->checked();
+		box->closeBox();
+		callback(checked);
+	});
+	Ui::ConfirmBox(box, {
+		.text = std::move(text),
+		.confirmed = std::move(confirmed),
+		.confirmText = std::move(confirm),
+	});
+	auto padding = st::boxPadding;
+	padding.setTop(padding.bottom());
+	box->addRow(std::move(checkbox), std::move(padding));
+	box->addRow(object_ptr<Ui::SlideWrap<Ui::FlatLabel>>(
+		box,
+		object_ptr<Ui::FlatLabel>(
+			box,
+			tr::lng_launch_dont_ask_settings(),
+			st::boxLabel)
+	))->toggleOn(weak->checkedValue());
+}
+
+} // namespace
+
 void LaunchWithWarning(
 		// not_null<Window::Controller*> controller,
 		const QString &name,
 		HistoryItem *item) {
-	const auto isExecutable = Data::IsExecutableName(name);
-	const auto isIpReveal = Data::IsIpRevealingName(name);
+	const auto type = Core::DetectLaunchType(name);
+	const auto nameType = type.nameType;
+	const auto extension = type.extension;
+
 	auto &app = Core::App();
-	const auto warn = [&] {
-		if (item && item->history()->peer->isVerified()) {
-			return false;
-		}
-		return (isExecutable && app.settings().exeLaunchWarning())
-			|| (isIpReveal && app.settings().ipRevealWarning());
-	}();
-	const auto extension = '.' + Data::FileExtension(name);
-	if (Platform::IsWindows() && extension == u"."_q) {
+	auto &settings = app.settings();
+	const auto isIpReveal = type.ipRevealing && settings.ipRevealWarning();
+	const auto warn = LauncherWouldWarn(settings, type, item);
+	if (extension.isEmpty()) {
 		// If you launch a file without extension, like "test", in case
 		// there is an executable file with the same name in this folder,
 		// like "test.bat", the executable file will be launched.
 		//
 		// Now we always force an Open With dialog box for such files.
+		//
+		// Let's force it for all platforms for files without extension.
 		crl::on_main([=] {
 			Platform::File::UnsafeShowOpenWith(name);
 		});
@@ -63,115 +116,94 @@ void LaunchWithWarning(
 		File::Launch(name);
 		return;
 	}
-	const auto callback = [=, &app](bool checked) {
+	const auto callback = [=, &app, &settings](bool checked) {
 		if (checked) {
-			if (isExecutable) {
-				app.settings().setExeLaunchWarning(false);
-			} else if (isIpReveal) {
-				app.settings().setIpRevealWarning(false);
+			if (isIpReveal) {
+				settings.setIpRevealWarning(false);
+			} else {
+				auto copy = settings.noWarningExtensions();
+				copy.emplace(extension);
+				settings.setNoWarningExtensions(std::move(copy));
 			}
 			app.saveSettingsDelayed();
 		}
 		File::Launch(name);
 	};
-	auto text = isExecutable
-		? tr::lng_launch_exe_warning(
-			lt_extension,
-			rpl::single(Ui::Text::Bold(extension)),
-			Ui::Text::WithEntities)
-		: tr::lng_launch_svg_warning(Ui::Text::WithEntities);
-	Ui::show(Box<ConfirmDontWarnBox>(
+	auto text = isIpReveal
+		? tr::lng_launch_svg_warning(tr::marked)
+		: ((nameType == Core::NameType::Executable)
+			? tr::lng_launch_exe_warning
+			: tr::lng_launch_other_warning)(
+				lt_extension,
+				rpl::single(tr::bold('.' + extension)),
+				tr::marked);
+	const auto canRemember = isIpReveal
+		|| (!type.byContent && !extension.contains(' '));
+	auto check = !canRemember
+		? rpl::producer<QString>()
+		: isIpReveal
+		? tr::lng_launch_exe_dont_ask()
+		: tr::lng_launch_dont_ask();
+	auto confirm = ((nameType == Core::NameType::Executable)
+		? tr::lng_launch_exe_sure
+		: tr::lng_launch_other_sure)();
+	Ui::show(Box(
+		ConfirmDontWarnBox,
 		std::move(text),
-		tr::lng_launch_exe_dont_ask(tr::now),
-		(isExecutable ? tr::lng_launch_exe_sure : tr::lng_continue)(),
+		std::move(check),
+		std::move(confirm),
 		callback));
 }
 
-} // namespace
-
-QString FileExtension(const QString &filepath) {
-	const auto reversed = ranges::views::reverse(filepath);
-	const auto last = ranges::find_first_of(reversed, ".\\/");
-	if (last == reversed.end() || *last != '.') {
-		return QString();
+ImageOpenCheck CheckImageOpenInApp(
+		not_null<DocumentData*> document,
+		const std::shared_ptr<DocumentMedia> &media) {
+	auto result = ImageOpenCheck();
+	if (document->size >= Images::kReadBytesLimit) {
+		result.sizeOverLimit = true;
+		return result;
 	}
-	return QString(last.base(), last - reversed.begin());
+	const auto &location = document->location(true);
+	const auto mime = u"image/"_q;
+	if (!location.isEmpty() && location.accessEnable()) {
+		result.accessGuard.emplace(gsl::finally(Fn<void()>(
+			[location = Core::FileLocation(location)] {
+				location.accessDisable();
+			})));
+		const auto path = location.name();
+		result.source = ImageOpenSource::Location;
+		result.mime = Core::MimeTypeForFile(QFileInfo(path)).name();
+		if (result.mime.startsWith(mime)) {
+			result.readable = QImageReader(path).canRead();
+			result.openInApp = result.readable;
+		}
+		if (!result.openInApp) {
+			result.accessGuard.reset();
+		}
+	} else if (document->mimeString().startsWith(mime)
+		&& !media->bytes().isEmpty()) {
+		auto bytes = media->bytes();
+		auto buffer = QBuffer(&bytes);
+		result.source = ImageOpenSource::Bytes;
+		result.mime = document->mimeString();
+		result.readable = QImageReader(&buffer).canRead();
+		result.openInApp = result.readable;
+	}
+	return result;
 }
 
-#if 0
-bool IsValidMediaFile(const QString &filepath) {
-	static const auto kExtensions = [] {
-		const auto list = qsl("\
-16svx 2sf 3g2 3gp 8svx aac aaf aif aifc aiff amr amv ape asf ast au aup \
-avchd avi brstm bwf cam cdda cust dat divx drc dsh dsf dts dtshd dtsma \
-dvr-ms dwd evo f4a f4b f4p f4v fla flac flr flv gif gifv gsf gsm gym iff \
-ifo it jam la ly m1v m2p m2ts m2v m4a m4p m4v mcf mid mk3d mka mks mkv mng \
-mov mp1 mp2 mp3 mp4 minipsf mod mpc mpe mpeg mpg mpv mscz mt2 mus mxf mxl \
-niff nsf nsv off ofr ofs ogg ogv opus ots pac ps psf psf2 psflib ptb qsf \
-qt ra raw rka rm rmj rmvb roq s3m shn sib sid smi smp sol spc spx ssf svi \
-swa swf tak ts tta txm usf vgm vob voc vox vqf wav webm wma wmv wrap wtv \
-wv xm xml ym yuv").split(' ');
-		return base::flat_set<QString>(list.begin(), list.end());
-	}();
-
-	return ranges::binary_search(
-		kExtensions,
-		FileExtension(filepath).toLower());
-}
-#endif
-
-bool IsExecutableName(const QString &filepath) {
-	static const auto kExtensions = [] {
-		const auto joined =
-#ifdef Q_OS_MAC
-			qsl("\
-applescript action app bin command csh osx workflow terminal url caction \
-mpkg pkg scpt scptd xhtm webarchive");
-#elif defined Q_OS_UNIX // Q_OS_MAC
-			qsl("bin csh deb desktop ksh out pet pkg pup rpm run sh shar \
-slp zsh");
-#else // Q_OS_MAC || Q_OS_UNIX
-			qsl("\
-ad ade adp app application appref-ms asp asx bas bat bin cab cdxml cer cfg \
-chi chm cmd cnt com cpl crt csh der diagcab dll drv eml exe fon fxp gadget \
-grp hlp hpj hta htt inf ini ins inx isp isu its jar jnlp job js jse key ksh \
-lnk local lua mad maf mag mam manifest maq mar mas mat mau mav maw mcf mda \
-mdb mde mdt mdw mdz mht mhtml mjs mmc mof msc msg msh msh1 msh2 msh1xml \
-msh2xml mshxml msi msp mst ops osd paf pcd phar php php3 php4 php5 php7 phps \
-php-s pht phtml pif pl plg pm pod prf prg ps1 ps2 ps1xml ps2xml psc1 psc2 \
-psd1 psm1 pssc pst py py3 pyc pyd pyi pyo pyw pywz pyz rb reg rgs scf scr \
-sct search-ms settingcontent-ms sh shb shs slk sys t tmp u3p url vb vbe vbp \
-vbs vbscript vdx vsmacros vsd vsdm vsdx vss vssm vssx vst vstm vstx vsw vsx \
-vtx website ws wsc wsf wsh xbap xll xnk xs");
-#endif // !Q_OS_MAC && !Q_OS_UNIX
-		const auto list = joined.split(' ');
-		return base::flat_set<QString>(list.begin(), list.end());
-	}();
-
-	return ranges::binary_search(
-		kExtensions,
-		FileExtension(filepath).toLower());
-}
-
-bool IsIpRevealingName(const QString &filepath) {
-	static const auto kExtensions = [] {
-		const auto joined = u"htm html svg"_q;
-		const auto list = joined.split(' ');
-		return base::flat_set<QString>(list.begin(), list.end());
-	}();
-	static const auto kMimeTypes = [] {
-		const auto joined = u"text/html image/svg+xml"_q;
-		const auto list = joined.split(' ');
-		return base::flat_set<QString>(list.begin(), list.end());
-	}();
-
-	return ranges::binary_search(
-		kExtensions,
-		FileExtension(filepath).toLower()
-	) || ranges::binary_search(
-		kMimeTypes,
-		QMimeDatabase().mimeTypeForFile(QFileInfo(filepath)).name()
-	);
+bool LauncherWouldWarn(
+		const Core::Settings &settings,
+		const Core::LaunchType &type,
+		HistoryItem *item) {
+	if (item && item->history()->peer->isVerified()) {
+		return false;
+	}
+	return (type.ipRevealing && settings.ipRevealWarning())
+		|| ((type.nameType == Core::NameType::Executable
+			|| type.nameType == Core::NameType::Unknown)
+			&& (type.byContent
+				|| !settings.noWarningExtensions().contains(type.extension)));
 }
 
 base::binary_guard ReadBackgroundImageAsync(
@@ -188,7 +220,11 @@ base::binary_guard ReadBackgroundImageAsync(
 		guard = result.make_guard(),
 		callback = std::move(done)
 	]() mutable {
-		auto image = Ui::ReadBackgroundImage(path, bytes, gzipSvg);
+		auto image = Ui::ReadBackgroundImage(path, bytes, gzipSvg).image;
+		if (image.isNull()) {
+			image = QImage(1, 1, QImage::Format_ARGB32_Premultiplied);
+			image.fill(Qt::black);
+		}
 		if (postprocess) {
 			image = postprocess(std::move(image));
 		}
@@ -205,49 +241,25 @@ base::binary_guard ReadBackgroundImageAsync(
 void ResolveDocument(
 		Window::SessionController *controller,
 		not_null<DocumentData*> document,
-		HistoryItem *item) {
-	if (!document->date) {
+		HistoryItem *item,
+		MsgId topicRootId,
+		PeerId monoforumPeerId,
+		bool showDrawButton) {
+	if (document->isNull()) {
 		return;
 	}
 	const auto msgId = item ? item->fullId() : FullMsgId();
 
 	const auto showDocument = [&] {
-		if (cUseExternalVideoPlayer()
-			&& document->isVideoFile()
-			&& !document->filepath().isEmpty()) {
-			File::Launch(document->location(false).fname);
-		} else if (controller) {
-			controller->openDocument(document, msgId, true);
+		if (controller) {
+			controller->openDocument(
+				document,
+				true,
+				{ msgId, topicRootId, monoforumPeerId, showDrawButton });
 		}
 	};
 
 	const auto media = document->createMediaView();
-	const auto openImageInApp = [&] {
-		if (document->size >= Images::kReadBytesLimit) {
-			return false;
-		}
-		const auto &location = document->location(true);
-		if (!location.isEmpty() && location.accessEnable()) {
-			const auto guard = gsl::finally([&] {
-				location.accessDisable();
-			});
-			const auto path = location.name();
-			if (Core::MimeTypeForFile(path).name().startsWith("image/")
-				&& QImageReader(path).canRead()) {
-				showDocument();
-				return true;
-			}
-		} else if (document->mimeString().startsWith("image/")
-			&& !media->bytes().isEmpty()) {
-			auto bytes = media->bytes();
-			auto buffer = QBuffer(&bytes);
-			if (QImageReader(&buffer).canRead()) {
-				showDocument();
-				return true;
-			}
-		}
-		return false;
-	};
 	const auto &location = document->location(true);
 	if (document->isTheme() && media->loaded(true)) {
 		showDocument();
@@ -256,25 +268,50 @@ void ResolveDocument(
 		if (document->isAudioFile()
 			|| document->isVoiceMessage()
 			|| document->isVideoMessage()) {
-			::Media::Player::instance()->playPause({ document, msgId });
-		} else if (item
-			&& document->isAnimation()
-			&& HistoryView::Gif::CanPlayInline(document)) {
-			document->owner().requestAnimationPlayInline(item);
+			::Media::Player::instance()->playPause(
+				{ document, msgId },
+				::Media::Player::PlaylistContext{
+					topicRootId,
+					monoforumPeerId,
+				});
+			if (controller
+				&& item
+				&& item->media()
+				&& item->media()->ttlSeconds()) {
+				ChatHelpers::ShowTTLMediaLayerWidget(controller, item);
+			}
 		} else {
 			showDocument();
 		}
 	} else {
 		document->saveFromDataSilent();
-		if (!openImageInApp()) {
-			if (!document->filepath(true).isEmpty()) {
-				LaunchWithWarning(location.name(), item);
-			} else if (document->status == FileReady
-				|| document->status == FileDownloadFailed) {
-				DocumentSaveClickHandler::Save(
-					item ? item->fullId() : Data::FileOrigin(),
-					document);
+		const auto image = CheckImageOpenInApp(
+			document,
+			media);
+		if (image.openInApp) {
+			showDocument();
+			return;
+		}
+		const auto path = document->filepath(true);
+		if (!path.isEmpty()) {
+			auto context = QVariant();
+			if (item) {
+				auto clickHandlerContext = ClickHandlerContext();
+				clickHandlerContext.itemId = item->fullId();
+				if (controller) {
+					clickHandlerContext.sessionWindow = controller;
+					clickHandlerContext.show = controller->uiShow();
+				}
+				context = QVariant::fromValue(clickHandlerContext);
 			}
+			if (!Core::App().iv().showMarkdown(path, context)) {
+				LaunchWithWarning(path, item);
+			}
+		} else if (document->status == FileReady
+			|| document->status == FileDownloadFailed) {
+			DocumentSaveClickHandler::Save(
+				item ? item->fullId() : Data::FileOrigin(),
+				document);
 		}
 	}
 }

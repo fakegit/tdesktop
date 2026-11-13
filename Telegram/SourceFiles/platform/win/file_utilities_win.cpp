@@ -19,6 +19,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include <QtWidgets/QFileDialog>
 #include <QtGui/QDesktopServices>
 #include <QtCore/QSettings>
+#include <QtCore/QStandardPaths>
 
 #include <Shlwapi.h>
 #include <Windowsx.h>
@@ -116,7 +117,31 @@ HBITMAP IconToBitmap(LPWSTR icon, int iconindex) {
 	return (HBITMAP)CopyImage(result, IMAGE_BITMAP, 0, 0, LR_DEFAULTSIZE | LR_CREATEDIBSECTION);
 }
 
+bool ShouldSaveZoneInformation() {
+	// Check if the "Do not preserve zone information in file attachments" policy is enabled.
+	const auto keyName = L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\Attachments";
+	const auto valueName = L"SaveZoneInformation";
+	auto key = HKEY();
+	auto result = RegOpenKeyEx(HKEY_CURRENT_USER, keyName, 0, KEY_READ, &key);
+	if (result != ERROR_SUCCESS) {
+		// If the registry key cannot be opened, assume the default behavior:
+		// Windows preserves zone information for downloaded files.
+		return true;
+	}
+
+	DWORD value = 0, type = 0, size = sizeof(value);
+	result = RegQueryValueEx(key, valueName, 0, &type, (LPBYTE)&value, &size);
+	RegCloseKey(key);
+
+	if (result != ERROR_SUCCESS || type != REG_DWORD) {
+		return true;
+	}
+
+	return (value != 1);
+}
 } // namespace
+
+namespace Unfused {
 
 void UnsafeOpenEmailLink(const QString &email) {
 	auto url = QUrl(qstr("mailto:") + email);
@@ -142,7 +167,7 @@ void UnsafeOpenEmailLink(const QString &email) {
 	}
 }
 
-bool UnsafeShowOpenWithDropdown(const QString &filepath, QPoint menuPosition) {
+bool UnsafeShowOpenWithDropdown(const QString &filepath) {
 	if (!Dlls::SHAssocEnumHandlers || !Dlls::SHCreateItemFromParsingName) {
 		return false;
 	}
@@ -157,13 +182,13 @@ bool UnsafeShowOpenWithDropdown(const QString &filepath, QPoint menuPosition) {
 
 	auto result = false;
 	std::vector<OpenWithApp> handlers;
-	IShellItem* pItem = nullptr;
+	auto pItem = (IShellItem*)nullptr;
 	if (SUCCEEDED(Dlls::SHCreateItemFromParsingName(wstringPath.c_str(), nullptr, IID_PPV_ARGS(&pItem)))) {
-		IEnumAssocHandlers *assocHandlers = nullptr;
+		auto assocHandlers = (IEnumAssocHandlers*)nullptr;
 		if (SUCCEEDED(pItem->BindToHandler(nullptr, BHID_EnumAssocHandlers, IID_PPV_ARGS(&assocHandlers)))) {
 			HRESULT hr = S_FALSE;
 			do {
-				IAssocHandler *handler = nullptr;
+				auto handler = (IAssocHandler*)nullptr;
 				ULONG ulFetched = 0;
 				hr = assocHandlers->Next(1, &handler, &ulFetched);
 				if (FAILED(hr) || hr == S_FALSE || !ulFetched) break;
@@ -230,7 +255,9 @@ bool UnsafeShowOpenWithDropdown(const QString &filepath, QPoint menuPosition) {
 			menuInfo.dwTypeData = nameArr;
 			InsertMenuItem(menu, GetMenuItemCount(menu), TRUE, &menuInfo);
 
-			int sel = TrackPopupMenu(menu, TPM_LEFTALIGN | TPM_TOPALIGN | TPM_LEFTBUTTON | TPM_RETURNCMD, menuPosition.x(), menuPosition.y(), 0, parentHWND, 0);
+			POINT position;
+			GetCursorPos(&position);
+			int sel = TrackPopupMenu(menu, TPM_LEFTALIGN | TPM_TOPALIGN | TPM_LEFTBUTTON | TPM_RETURNCMD, position.x, position.y, 0, parentHWND, 0);
 			DestroyMenu(menu);
 
 			if (sel > 0) {
@@ -273,7 +300,14 @@ void UnsafeLaunch(const QString &filepath) {
 	ShellExecute(0, L"open", wstringPath.c_str(), 0, 0, SW_SHOWNORMAL);
 }
 
+} // namespace Unfused
+
 void PostprocessDownloaded(const QString &filepath) {
+	// Mark file saved to the NTFS file system as originating from the Internet security zone
+	// unless this feature is disabled by Group Policy.
+	if (!ShouldSaveZoneInformation()) {
+		return;
+	}
 	auto wstringZoneFile = QDir::toNativeSeparators(filepath).toStdWString() + L":Zone.Identifier";
 	auto f = CreateFile(wstringZoneFile.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, 0, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0);
 	if (f == INVALID_HANDLE_VALUE) { // :(
@@ -372,7 +406,9 @@ bool Get(
 		dialog.setFileMode(QFileDialog::AnyFile);
 		dialog.setAcceptMode(QFileDialog::AcceptSave);
 	}
+#if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
 	dialog.show();
+#endif // Qt < 6.0.0
 
 	auto realLastPath = [=] {
 		// If we're given some non empty path containing a folder - use it.

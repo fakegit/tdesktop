@@ -10,16 +10,13 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "platform/platform_specific.h"
 #include "platform/mac/specific_mac_p.h"
 
-namespace Data {
-class LocationPoint;
-} // namespace Data
-
 namespace Platform {
-
-[[nodiscard]] bool IsDarkMenuBar();
 
 inline bool AutostartSupported() {
 	return false;
+}
+
+inline void AutostartRequestStateFromSystem(Fn<void(bool)> callback) {
 }
 
 inline bool TrayIconSupported() {
@@ -30,12 +27,36 @@ inline bool SkipTaskbarSupported() {
 	return false;
 }
 
+[[nodiscard]] bool HasTouchBar();
+
+void ActivateThisProcess();
+
+inline uint64 ActivationWindowId(not_null<QWidget*> window) {
+	return 1;
+}
+
+inline void ActivateOtherProcess(uint64 processId, uint64 windowId) {
+}
+
+inline bool WaitForProcessExit(uint64 processId, crl::time timeout) {
+	return true;
+}
+
+inline bool LocalSocketPeerAllowed(qintptr) {
+	return true;
+}
+
+inline QString ApplicationIconName() {
+	return {};
+}
+
+inline QString ExecutablePathForShortcuts() {
+	return cExeDir() + cExeName();
+}
+
 namespace ThirdParty {
 
 inline void start() {
-}
-
-inline void finish() {
 }
 
 } // namespace ThirdParty
@@ -48,25 +69,11 @@ inline void psCheckLocalSocket(const QString &serverName) {
 	}
 }
 
-void psActivateProcess(uint64 pid = 0);
 QString psAppDataPath();
-void psAutoStart(bool start, bool silent = false);
 void psSendToMenu(bool send, bool silent = false);
 
 int psCleanup();
 int psFixPrevious();
 
-void psNewVersion();
-
 void psDownloadPathEnableAccess();
 QByteArray psDownloadPathBookmark(const QString &path);
-QByteArray psPathBookmark(const QString &path);
-
-QString strNotificationAboutThemeChange();
-QString strNotificationAboutScreenLocked();
-QString strNotificationAboutScreenUnlocked();
-QString strStyleOfInterface();
-QString strTitleWrapClass();
-QString strTitleClass();
-
-bool psLaunchMaps(const Data::LocationPoint &point);

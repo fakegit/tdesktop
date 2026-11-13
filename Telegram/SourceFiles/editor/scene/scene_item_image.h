@@ -14,13 +14,14 @@ namespace Editor {
 class ItemImage : public ItemBase {
 public:
 	ItemImage(
-		const QPixmap &&pixmap,
+		QPixmap &&pixmap,
 		ItemBase::Data data);
 	void paint(
 		QPainter *p,
 		const QStyleOptionGraphicsItem *option,
 		QWidget *widget) override;
 protected:
+	[[nodiscard]] QRectF visibleRect() const override;
 	void performFlip() override;
 	std::shared_ptr<ItemBase> duplicate(ItemBase::Data data) const override;
 private:

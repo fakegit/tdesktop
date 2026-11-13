@@ -28,7 +28,7 @@ DoneHandler ConcurrentSender::HandlerMaker::MakeDone(
 		not_null<ConcurrentSender*> sender,
 		Fn<void(FnMut<void()>)> runner) {
 	return [
-		weak = base::make_weak(sender.get()),
+		weak = base::make_weak(sender),
 		runner = std::move(runner)
 	](const Response &response) mutable {
 		runner([=]() mutable {
@@ -47,7 +47,7 @@ FailHandler ConcurrentSender::HandlerMaker::MakeFail(
 		Fn<void(FnMut<void()>)> runner,
 		FailSkipPolicy skipPolicy) {
 	return [
-		weak = base::make_weak(sender.get()),
+		weak = base::make_weak(sender),
 		runner = std::move(runner),
 		skipPolicy
 	](const Error &error, const Response &response) mutable {
@@ -76,7 +76,7 @@ auto ConcurrentSender::with_instance(Method &&method)
 		weak = _weak,
 		method = std::forward<Method>(method)
 	]() mutable {
-		if (const auto instance = weak.data()) {
+		if (const auto instance = weak.get()) {
 			std::move(method)(instance);
 		}
 	});
@@ -136,7 +136,7 @@ mtpRequestId ConcurrentSender::RequestBuilder::send() {
 }
 
 ConcurrentSender::ConcurrentSender(
-	QPointer<Instance> weak,
+	base::weak_qptr<Instance> weak,
 	Fn<void(FnMut<void()>)> runner)
 : _weak(weak)
 , _runner(runner) {

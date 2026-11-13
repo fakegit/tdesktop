@@ -7,16 +7,45 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #pragma once
 
+#include "data/data_drafts.h"
+
 class History;
+class PhotoData;
+
+namespace Data {
+class Thread;
+} // namespace Data
 
 namespace Api {
 
+inline constexpr auto kScheduledUntilOnlineTimestamp = TimeId(0x7FFFFFFE);
+
+[[nodiscard]] MTPSuggestedPost SuggestToMTP(SuggestOptions suggest);
+
 struct SendOptions {
+	uint64 price = 0;
+	PeerData *sendAs = nullptr;
 	TimeId scheduled = 0;
+	TimeId scheduleRepeatPeriod = 0;
+	BusinessShortcutId shortcutId = 0;
+	EffectId effectId = 0;
+	QByteArray stakeSeedHash;
+	int64 stakeNanoTon = 0;
+	int starsApproved = 0;
 	bool silent = false;
 	bool handleSupportSwitch = false;
-	bool removeWebPageId = false;
+	bool invertCaption = false;
+	bool hideViaBot = false;
+	bool mediaSpoiler = false;
+	bool welcomeTemplate = false;
+	crl::time ttlSeconds = 0;
+	SuggestOptions suggest;
+
+	friend inline bool operator==(
+		const SendOptions &,
+		const SendOptions &) = default;
 };
+[[nodiscard]] SendOptions DefaultSendWhenOnlineOptions();
 
 enum class SendType {
 	Normal,
@@ -25,24 +54,50 @@ enum class SendType {
 };
 
 struct SendAction {
-	explicit SendAction(not_null<History*> history) : history(history) {
-	}
+	explicit SendAction(
+		not_null<Data::Thread*> thread,
+		SendOptions options = SendOptions());
 
 	not_null<History*> history;
 	SendOptions options;
-	MsgId replyTo = 0;
+	FullReplyTo replyTo;
 	bool clearDraft = true;
 	bool generateLocal = true;
 	MsgId replaceMediaOf = 0;
+
+	[[nodiscard]] MTPInputReplyTo mtpReplyTo() const;
+
+	friend inline bool operator==(
+		const SendAction &,
+		const SendAction &) = default;
 };
 
 struct MessageToSend {
-	explicit MessageToSend(not_null<History*> history) : action(history) {
+	explicit MessageToSend(SendAction action) : action(action) {
 	}
 
 	SendAction action;
 	TextWithTags textWithTags;
-	WebPageId webPageId = 0;
+	Data::WebPageDraft webPage;
+};
+
+struct RemoteFileInfo {
+	MTPInputFile file;
+	std::optional<MTPInputFile> thumb;
+	std::optional<MTPInputPhoto> videoCover;
+	std::vector<MTPInputDocument> attachedStickers;
+	bool forceFile = false;
+
+};
+
+struct VideoCoverEdit {
+	PhotoData *photo = nullptr;
+	bool cleared = false;
+	Fn<void(Fn<void(PhotoData*)> done)> refresh;
+
+	[[nodiscard]] explicit operator bool() const {
+		return (photo != nullptr) || cleared;
+	}
 };
 
 } // namespace Api

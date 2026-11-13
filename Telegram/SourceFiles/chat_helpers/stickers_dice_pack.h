@@ -9,6 +9,10 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 class DocumentData;
 
+namespace Data {
+struct DiceGameOptions;
+} // namespace Data
+
 namespace Main {
 class Session;
 } // namespace Main
@@ -26,7 +30,6 @@ private:
 	void load();
 	void applySet(const MTPDmessages_stickerSet &data);
 	void tryGenerateLocalZero();
-	void generateLocal(int index, const QString &name);
 
 	const not_null<Main::Session*> _session;
 	QString _emoji;
@@ -44,6 +47,7 @@ public:
 	static const QString kSlotString;
 	static const QString kFballString;
 	static const QString kBballString;
+	static const QString kPartyPopper;
 
 	[[nodiscard]] static bool IsSlot(const QString &emoji) {
 		return (emoji == kSlotString);
@@ -51,10 +55,16 @@ public:
 
 	[[nodiscard]] DocumentData *lookup(const QString &emoji, int value);
 
+	void resolveGameOptions(Fn<void(const Data::DiceGameOptions &)> done);
+	void apply(const MTPDupdateEmojiGameInfo &update);
+
 private:
 	const not_null<Main::Session*> _session;
 
 	base::flat_map<QString, std::unique_ptr<DicePack>> _packs;
+
+	mtpRequestId _resolveGameOptionsRequestId = 0;
+	Fn<void(const Data::DiceGameOptions &)> _resolveGameOptionsCallback;
 
 };
 

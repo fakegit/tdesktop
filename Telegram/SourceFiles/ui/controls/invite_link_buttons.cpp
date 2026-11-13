@@ -12,7 +12,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "ui/wrap/padding_wrap.h"
 #include "ui/wrap/slide_wrap.h"
 #include "lang/lang_keys.h"
-#include "styles/style_chat.h"
+#include "styles/style_chat_helpers.h"
 #include "styles/style_info.h"
 
 namespace Ui {
@@ -42,17 +42,15 @@ void AddCopyShareLinkButtons(
 		wrap,
 		tr::lng_group_invite_copy(),
 		st::inviteLinkCopy);
-	copy->setTextTransform(RoundButton::TextTransform::NoTransform);
 	copy->setClickedCallback(copyLink);
 	const auto share = CreateChild<RoundButton>(
 		wrap,
 		tr::lng_group_invite_share(),
 		st::inviteLinkShare);
-	share->setTextTransform(RoundButton::TextTransform::NoTransform);
 	share->setClickedCallback(shareLink);
 
 	wrap->widthValue(
-	) | rpl::start_with_next([=](int width) {
+	) | rpl::on_next([=](int width) {
 		const auto buttonWidth = (width - st::inviteLinkButtonsSkip) / 2;
 		copy->setFullWidth(buttonWidth);
 		share->setFullWidth(buttonWidth);
@@ -71,7 +69,6 @@ void AddReactivateLinkButton(
 			tr::lng_group_invite_reactivate(),
 			st::inviteLinkReactivate),
 		st::inviteLinkButtonsPadding);
-	button->setTextTransform(RoundButton::TextTransform::NoTransform);
 	button->setClickedCallback(editLink);
 }
 
@@ -84,7 +81,6 @@ void AddDeleteLinkButton(
 			tr::lng_group_invite_delete(),
 			st::inviteLinkDelete),
 		st::inviteLinkButtonsPadding);
-	button->setTextTransform(RoundButton::TextTransform::NoTransform);
 	button->setClickedCallback(deleteLink);
 }
 
@@ -109,7 +105,7 @@ not_null<AbstractButton*> AddJoinedCountButton(
 	const auto state = result->lifetime().make_state<State>();
 	std::move(
 		content
-	) | rpl::start_with_next([=](JoinedCountContent &&content) {
+	) | rpl::on_next([=](JoinedCountContent &&content) {
 		state->content = std::move(content);
 		wrap->toggle(state->content.count > 0, anim::type::instant);
 		if (state->content.count <= 0) {
@@ -118,6 +114,9 @@ not_null<AbstractButton*> AddJoinedCountButton(
 		result->setAttribute(
 			Qt::WA_TransparentForMouseEvents,
 			!state->content.count);
+		if (!state->content.count) {
+			result->clearState();
+		}
 		const auto &st = st::inviteLinkUserpics;
 		const auto imageWidth = !state->content.userpics.isNull()
 			? state->content.userpics.width() / style::DevicePixelRatio()
@@ -140,7 +139,7 @@ not_null<AbstractButton*> AddJoinedCountButton(
 	}, result->lifetime());
 
 	result->paintRequest(
-	) | rpl::start_with_next([=] {
+	) | rpl::on_next([=] {
 		auto p = QPainter(result);
 		if (!state->content.userpics.isNull()) {
 			p.drawImage(0, 0, state->content.userpics);
@@ -158,7 +157,7 @@ not_null<AbstractButton*> AddJoinedCountButton(
 	}, result->lifetime());
 
 	wrap->widthValue(
-	) | rpl::start_with_next([=](int width) {
+	) | rpl::on_next([=](int width) {
 		result->move((width - result->width()) / 2, 0);
 	}, wrap->lifetime());
 

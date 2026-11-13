@@ -14,16 +14,22 @@ namespace Export {
 namespace Data {
 struct File;
 struct Chat;
+struct Document;
 struct FileLocation;
 struct PersonalInfo;
 struct UserpicsInfo;
 struct UserpicsSlice;
+struct StoriesInfo;
+struct StoriesSlice;
+struct ProfileMusicInfo;
+struct ProfileMusicSlice;
 struct ContactsList;
 struct SessionsList;
 struct DialogsInfo;
 struct DialogInfo;
 struct MessagesSlice;
 struct Message;
+struct Story;
 struct FileOrigin;
 } // namespace Data
 
@@ -36,13 +42,17 @@ struct Settings;
 
 class ApiWrap {
 public:
-	ApiWrap(QPointer<MTP::Instance> weak, Fn<void(FnMut<void()>)> runner);
+	ApiWrap(
+		base::weak_qptr<MTP::Instance> weak,
+		Fn<void(FnMut<void()>)> runner);
 
 	rpl::producer<MTP::Error> errors() const;
 	rpl::producer<Output::Result> ioErrors() const;
 
 	struct StartInfo {
 		int userpicsCount = 0;
+		int storiesCount = 0;
+		int profileMusicCount = 0;
 		int dialogsCount = 0;
 	};
 	void startExport(
@@ -64,13 +74,25 @@ public:
 		uint64 randomId = 0;
 		QString path;
 		int itemIndex = 0;
-		int ready = 0;
-		int total = 0;
+		int64 ready = 0;
+		int64 total = 0;
 	};
 	void requestUserpics(
 		FnMut<bool(Data::UserpicsInfo&&)> start,
 		Fn<bool(DownloadProgress)> progress,
 		Fn<bool(Data::UserpicsSlice&&)> slice,
+		FnMut<void()> finish);
+
+	void requestStories(
+		FnMut<bool(Data::StoriesInfo&&)> start,
+		Fn<bool(DownloadProgress)> progress,
+		Fn<bool(Data::StoriesSlice&&)> slice,
+		FnMut<void()> finish);
+
+	void requestProfileMusic(
+		FnMut<bool(Data::ProfileMusicInfo&&)> start,
+		Fn<bool(DownloadProgress)> progress,
+		Fn<bool(Data::ProfileMusicSlice&&)> slice,
 		FnMut<void()> finish);
 
 	void requestContacts(FnMut<void(Data::ContactsList&&)> done);
@@ -80,6 +102,15 @@ public:
 	void requestMessages(
 		const Data::DialogInfo &info,
 		FnMut<bool(const Data::DialogInfo &)> start,
+		Fn<bool(DownloadProgress)> progress,
+		Fn<bool(Data::MessagesSlice&&)> slice,
+		FnMut<void()> done);
+
+	void requestTopicMessages(
+		PeerId peerId,
+		MTPInputPeer inputPeer,
+		int32 topicRootId,
+		FnMut<bool(int count)> start,
 		Fn<bool(DownloadProgress)> progress,
 		Fn<bool(Data::MessagesSlice&&)> slice,
 		FnMut<void()> done);
@@ -95,17 +126,25 @@ private:
 	struct StartProcess;
 	struct ContactsProcess;
 	struct UserpicsProcess;
+	struct StoriesProcess;
+	struct ProfileMusicProcess;
 	struct OtherDataProcess;
 	struct FileProcess;
 	struct FileProgress;
+	struct FilePolicy;
+	struct MessageFileWork;
 	struct ChatsProcess;
 	struct LeftChannelsProcess;
 	struct DialogsProcess;
+	struct AbstractMessagesProcess;
 	struct ChatProcess;
+	struct TopicProcess;
 
 	void startMainSession(FnMut<void()> done);
 	void sendNextStartRequest();
 	void requestUserpicsCount();
+	void requestStoriesCount();
+	void requestProfileMusicCount();
 	void requestSplitRanges();
 	void requestDialogsCount();
 	void requestLeftChannelsCount();
@@ -121,6 +160,26 @@ private:
 	void finishUserpicsSlice();
 	void finishUserpics();
 
+	void handleStoriesSlice(const MTPstories_Stories &result);
+	void loadStoriesFiles(Data::StoriesSlice &&slice);
+	void loadNextStory();
+	bool loadStoryProgress(FileProgress value);
+	void loadStoryDone(const QString &relativePath);
+	bool loadStoryThumbProgress(FileProgress value);
+	void loadStoryThumbDone(const QString &relativePath);
+	void finishStoriesSlice();
+	void finishStories();
+
+	void handleProfileMusicSlice(const MTPusers_SavedMusic &result);
+	void loadProfileMusicFiles(Data::ProfileMusicSlice &&slice);
+	void loadNextProfileMusic();
+	bool loadProfileMusicProgress(FileProgress value);
+	void loadProfileMusicDone(const QString &relativePath);
+	bool loadProfileMusicThumbProgress(FileProgress value);
+	void loadProfileMusicThumbDone(const QString &relativePath);
+	void finishProfileMusicSlice();
+	void finishProfileMusic();
+
 	void otherDataDone(const QString &relativePath);
 
 	bool useOnlyLastSplit() const;
@@ -130,6 +189,9 @@ private:
 	void finishDialogsList();
 	void requestSinglePeerDialog();
 	mtpRequestId requestSinglePeerMigrated(const Data::DialogInfo &info);
+	void requestSinglePeerMigratedFromHistory(
+		const MTPInputPeer &peer,
+		ChannelId channelId);
 	void appendSinglePeerDialogs(Data::DialogsInfo &&info);
 
 	void requestLeftChannelsIfNeeded();
@@ -147,23 +209,61 @@ private:
 		int splitIndex);
 
 	void requestMessagesCount(int localSplitIndex);
+	void requestMessagesCountFromDate(int localSplitIndex, int count);
 	void checkFirstMessageDate(int localSplitIndex, int count);
 	void messagesCountLoaded(int localSplitIndex, int count);
 	void requestMessagesSlice();
 	void requestChatMessages(
 		int splitIndex,
 		int offsetId,
+		int offsetDate,
 		int addOffset,
 		int limit,
 		FnMut<void(MTPmessages_Messages&&)> done);
-	void loadMessagesFiles(Data::MessagesSlice &&slice);
+	void startMessagesSlice(Data::MessagesSlice &&slice);
+	void resumeMessagesSlice();
+	void hydrateMessageDone(
+		bool topic,
+		int index,
+		int32 rawId,
+		const MTPmessages_Messages &result);
+	void requestTopicMessagesSlice();
+	void requestTopicReplies(
+		int offsetId,
+		int addOffset,
+		int limit,
+		FnMut<void(MTPmessages_Messages&&)> done);
+	void collectMessagesCustomEmoji(const Data::MessagesSlice &slice);
+	void resolveCustomEmoji();
+	void buildMessageFileWork(
+		AbstractMessagesProcess &process,
+		Data::Message &message);
 	void loadNextMessageFile();
-	bool loadMessageFileProgress(FileProgress value);
-	void loadMessageFileDone(const QString &relativePath);
-	bool loadMessageThumbProgress(FileProgress value);
-	void loadMessageThumbDone(const QString &relativePath);
+	[[nodiscard]] std::optional<QByteArray> getCustomEmoji(
+		Data::Message &message,
+		QByteArray &data);
+	bool messageCustomEmojiReady(Data::Message &message);
+	bool loadMessageFileProgress(int index, FileProgress value);
+	void loadMessageFileDone(
+		int index,
+		Data::File *file,
+		const QString &relativePath);
+	bool loadMessageEmojiProgress(FileProgress progress);
 	void finishMessagesSlice();
 	void finishMessages();
+
+	void loadTopicMessagesFiles(Data::MessagesSlice &&slice);
+	void resolveTopicCustomEmoji();
+	void loadNextTopicMessageFile();
+	bool loadTopicMessageFileProgress(int index, FileProgress value);
+	void loadTopicMessageFileDone(
+		int index,
+		Data::File *file,
+		const QString &relativePath);
+	bool loadTopicEmojiProgress(FileProgress progress);
+	void loadCustomEmojiDone(uint64 id, const QString &relativePath);
+	void finishTopicMessagesSlice();
+	void finishTopicMessages();
 
 	[[nodiscard]] Data::Message *currentFileMessage() const;
 	[[nodiscard]] Data::FileOrigin currentFileMessageOrigin() const;
@@ -173,7 +273,14 @@ private:
 		const Data::FileOrigin &origin,
 		Fn<bool(FileProgress)> progress,
 		FnMut<void(QString)> done,
-		Data::Message *message = nullptr);
+		const FilePolicy &policy);
+	bool processFileLoad(
+		Data::File &file,
+		const Data::FileOrigin &origin,
+		Fn<bool(FileProgress)> progress,
+		FnMut<void(QString)> done,
+		Data::Message *message = nullptr,
+		Data::Story *story = nullptr);
 	std::unique_ptr<FileProcess> prepareFileProcess(
 		const Data::File &file,
 		const Data::FileOrigin &origin) const;
@@ -186,12 +293,29 @@ private:
 		Fn<bool(FileProgress)> progress,
 		FnMut<void(QString)> done);
 	void loadFilePart();
-	void filePartDone(int offset, const MTPupload_File &result);
+	void filePartDone(int64 offset, const MTPupload_File &result);
 	void filePartUnavailable();
-	void filePartRefreshReference(int offset);
-	void filePartExtractReference(
-		int offset,
+	[[nodiscard]] QString filePartMediaFolder() const;
+	void filePartRetryReference(
+		int64 offset,
+		Data::FileLocation location);
+	void filePartRefreshReference(int64 offset);
+	void filePartExtractCustomEmojiReference(
+		int64 offset,
+		uint64 customEmojiId,
+		const QString &folder,
+		const MTPVector<MTPDocument> &result);
+	void filePartExtractRichReference(
+		int64 offset,
+		const Data::FileOrigin &origin,
+		const QString &folder,
 		const MTPmessages_Messages &result);
+	void filePartExtractReference(
+		int64 offset,
+		const MTPmessages_Messages &result);
+	void filePartExtractReference(
+		int64 offset,
+		const MTPstories_Stories &result);
 
 	template <typename Request>
 	class RequestBuilder;
@@ -204,7 +328,7 @@ private:
 
 	[[nodiscard]] auto fileRequest(
 		const Data::FileLocation &location,
-		int offset);
+		int64 offset);
 
 	void error(const MTP::Error &error);
 	void error(const QString &text);
@@ -222,11 +346,16 @@ private:
 	std::unique_ptr<LoadedFileCache> _fileCache;
 	std::unique_ptr<ContactsProcess> _contactsProcess;
 	std::unique_ptr<UserpicsProcess> _userpicsProcess;
+	std::unique_ptr<StoriesProcess> _storiesProcess;
+	std::unique_ptr<ProfileMusicProcess> _profileMusicProcess;
 	std::unique_ptr<OtherDataProcess> _otherDataProcess;
 	std::unique_ptr<FileProcess> _fileProcess;
 	std::unique_ptr<LeftChannelsProcess> _leftChannelsProcess;
 	std::unique_ptr<DialogsProcess> _dialogsProcess;
 	std::unique_ptr<ChatProcess> _chatProcess;
+	std::unique_ptr<TopicProcess> _topicProcess;
+	base::flat_set<uint64> _unresolvedCustomEmoji;
+	base::flat_map<uint64, Data::Document> _resolvedCustomEmoji;
 	QVector<MTPMessageRange> _splits;
 
 	rpl::event_stream<MTP::Error> _errors;

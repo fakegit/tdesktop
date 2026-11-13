@@ -35,6 +35,7 @@ struct EditContactScheme {
 	QString newHeader;
 	rpl::producer<QString> newPlaceholder;
 	QString aboutNew;
+	Qt::InputMethodHints inputHints;
 	Fn<bool(const QString &value)> validate;
 	Fn<QString(const QString &value)> format;
 	Fn<QString(const QString &value)> postprocess;
@@ -78,6 +79,7 @@ private:
 object_ptr<Ui::BoxContent> VerifyPhoneBox(
 	const QString &phone,
 	int codeLength,
+	const QString &openUrl,
 	Fn<void(QString code)> submit,
 	rpl::producer<QString> call,
 	rpl::producer<QString> error);

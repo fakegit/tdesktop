@@ -7,19 +7,19 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #pragma once
 
-#include "logs.h"
 #include "base/basic_types.h"
 #include "base/flags.h"
 #include "base/algorithm.h"
-#include "base/assertion.h"
 #include "base/bytes.h"
 
 #include <crl/crl_time.h>
 #include <QtCore/QReadWriteLock>
 #include <QtCore/QRegularExpression>
+#include <QtCore/QMimeData>
 #include <QtNetwork/QNetworkProxy>
 #include <cmath>
 #include <set>
+#include <filesystem>
 
 #define qsl(s) QStringLiteral(s)
 
@@ -28,6 +28,16 @@ namespace base {
 template <typename Value, typename From, typename Till>
 inline bool in_range(Value &&value, From &&from, Till &&till) {
 	return (value >= from) && (value < till);
+}
+
+inline bool CanReadDirectory(const QString &path) {
+#ifndef Q_OS_MAC // directory_iterator since 10.15
+	std::error_code error;
+	std::filesystem::directory_iterator(path.toStdString(), error);
+	return !error;
+#else
+	Unexpected("Not implemented.");
+#endif
 }
 
 } // namespace base
@@ -109,84 +119,9 @@ inline std::array<char, 32> hashMd5Hex(const void *data, int size) {
 	return result;
 }
 
-// good random (using openssl implementation)
-void memset_rand(void *data, uint32 len);
-
 QString translitRusEng(const QString &rus);
 QString rusKeyboardLayoutSwitch(const QString &from);
 
 inline int rowscount(int fullCount, int countPerRow) {
 	return (fullCount + countPerRow - 1) / countPerRow;
 }
-inline int floorclamp(int value, int step, int lowest, int highest) {
-	return std::clamp(value / step, lowest, highest);
-}
-inline int floorclamp(float64 value, int step, int lowest, int highest) {
-	return std::clamp(
-		static_cast<int>(std::floor(value / step)),
-		lowest,
-		highest);
-}
-inline int ceilclamp(int value, int step, int lowest, int highest) {
-	return std::clamp((value + step - 1) / step, lowest, highest);
-}
-inline int ceilclamp(float64 value, int32 step, int32 lowest, int32 highest) {
-	return std::clamp(
-		static_cast<int>(std::ceil(value / step)),
-		lowest,
-		highest);
-}
-
-static int32 FullArcLength = 360 * 16;
-static int32 QuarterArcLength = (FullArcLength / 4);
-static int32 MinArcLength = (FullArcLength / 360);
-static int32 AlmostFullArcLength = (FullArcLength - MinArcLength);
-
-// This pointer is used for global non-POD variables that are allocated
-// on demand by createIfNull(lambda) and are never automatically freed.
-template <typename T>
-class NeverFreedPointer {
-public:
-	NeverFreedPointer() = default;
-	NeverFreedPointer(const NeverFreedPointer<T> &other) = delete;
-	NeverFreedPointer &operator=(const NeverFreedPointer<T> &other) = delete;
-
-	template <typename... Args>
-	void createIfNull(Args&&... args) {
-		if (isNull()) {
-			reset(new T(std::forward<Args>(args)...));
-		}
-	};
-
-	T *data() const {
-		return _p;
-	}
-	T *release() {
-		return base::take(_p);
-	}
-	void reset(T *p = nullptr) {
-		delete _p;
-		_p = p;
-	}
-	bool isNull() const {
-		return data() == nullptr;
-	}
-
-	void clear() {
-		reset();
-	}
-	T *operator->() const {
-		return data();
-	}
-	T &operator*() const {
-		Assert(!isNull());
-		return *data();
-	}
-	explicit operator bool() const {
-		return !isNull();
-	}
-
-private:
-	T *_p;
-
-};

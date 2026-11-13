@@ -7,25 +7,45 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "ui/chat/attach/attach_abstract_single_file_preview.h"
 
-#include "ui/text/text_options.h"
-#include "ui/widgets/buttons.h"
 #include "ui/image/image_prepare.h"
-#include "base/timer_rpl.h"
-#include "styles/style_chat.h"
+#include "ui/painter.h"
+#include "ui/text/text_options.h"
+#include "ui/ui_utility.h"
+#include "ui/widgets/buttons.h"
 #include "styles/style_boxes.h"
+#include "styles/style_chat.h"
+#include "styles/style_chat_helpers.h"
+#include "styles/style_chat_style.h"
 
 namespace Ui {
 
 AbstractSingleFilePreview::AbstractSingleFilePreview(
 	QWidget *parent,
-	AttachControls::Type type)
+	const style::ComposeControls &st,
+	AttachControls::Type type,
+	const Text::MarkedContext &captionContext)
 : AbstractSinglePreview(parent)
+, _st(st)
 , _type(type)
-, _editMedia(this, st::sendBoxAlbumGroupButtonFile)
-, _deleteMedia(this, st::sendBoxAlbumGroupButtonFile) {
+, _captionContext(captionContext)
+, _editMedia(this, _st.files.buttonFile)
+, _deleteMedia(this, _st.files.buttonFile)
+, _selectCheck(_st.files.selectCheck, [=] { update(); }) {
+	const auto repaint = _captionContext.repaint;
+	_captionContext.repaint = [=] {
+		if (repaint) {
+			repaint();
+		}
+		const auto rect = captionRect();
+		if (rect.isEmpty()) {
+			update();
+		} else {
+			update(rect);
+		}
+	};
 
-	_editMedia->setIconOverride(&st::sendBoxAlbumGroupEditButtonIconFile);
-	_deleteMedia->setIconOverride(&st::sendBoxAlbumGroupDeleteButtonIconFile);
+	_editMedia->setIconOverride(&_st.files.buttonFileEdit);
+	_deleteMedia->setIconOverride(&_st.files.buttonFileDelete);
 
 	if (type == AttachControls::Type::Full) {
 		_deleteMedia->show();
@@ -37,14 +57,21 @@ AbstractSingleFilePreview::AbstractSingleFilePreview(
 		_deleteMedia->hide();
 		_editMedia->hide();
 	}
+	setMouseTracking(true);
 }
 
 AbstractSingleFilePreview::~AbstractSingleFilePreview() = default;
 
 rpl::producer<> AbstractSingleFilePreview::editRequests() const {
-	return _editMedia->clicks() | rpl::map([] {
-		return base::timer_once(st::historyAttach.ripple.hideDuration);
-	}) | rpl::flatten_latest();
+	return _editMedia->clicks() | rpl::to_empty;
+}
+
+rpl::producer<> AbstractSingleFilePreview::renameRequests() const {
+	return _renameRequests.events();
+}
+
+rpl::producer<> AbstractSingleFilePreview::selectRequests() const {
+	return _selectRequests.events();
 }
 
 rpl::producer<> AbstractSingleFilePreview::deleteRequests() const {
@@ -53,6 +80,58 @@ rpl::producer<> AbstractSingleFilePreview::deleteRequests() const {
 
 rpl::producer<> AbstractSingleFilePreview::modifyRequests() const {
 	return rpl::never<>();
+}
+
+void AbstractSingleFilePreview::setRenameEnabled(bool enabled) {
+	if (_renameEnabled == enabled) {
+		return;
+	}
+	_renameEnabled = enabled;
+	if (!_renameEnabled) {
+		_namePressed = false;
+		applyCursor(style::cur_default);
+	}
+}
+
+void AbstractSingleFilePreview::setSelectable(bool selectable) {
+	_selectable = selectable && (_type == AttachControls::Type::Full);
+}
+
+void AbstractSingleFilePreview::setSelectionMode(bool enabled) {
+	_selectionMode = enabled;
+}
+
+void AbstractSingleFilePreview::setSelected(
+		bool selected,
+		anim::type animated) {
+	_selectCheck.setChecked(selected, animated);
+}
+
+bool AbstractSingleFilePreview::selected() const {
+	return _selectCheck.checked();
+}
+
+void AbstractSingleFilePreview::setDisplayName(const QString &displayName) {
+	_data.name = displayName;
+	updateTextWidthFor(_data);
+	updateDataGeometry();
+	update();
+}
+
+void AbstractSingleFilePreview::setCaption(const TextWithTags &caption) {
+	auto marked = TextWithEntities{
+		caption.text,
+		TextUtilities::ConvertTextTagsToEntities(caption.tags),
+	};
+	marked = TextUtilities::SingleLine(marked);
+	_data.caption.setMarkedText(
+		st::defaultTextStyle,
+		marked,
+		kMarkupTextOptions,
+		_captionContext);
+	updateTextWidthFor(_data);
+	updateDataGeometry();
+	update();
 }
 
 void AbstractSingleFilePreview::prepareThumbFor(
@@ -69,19 +148,11 @@ void AbstractSingleFilePreview::prepareThumbFor(
 	if (originalWidth > originalHeight) {
 		thumbWidth = (originalWidth * st.thumbSize) / originalHeight;
 	}
-	auto options = Images::Option::Smooth
-		| Images::Option::RoundedSmall
-		| Images::Option::RoundedTopLeft
-		| Images::Option::RoundedTopRight
-		| Images::Option::RoundedBottomLeft
-		| Images::Option::RoundedBottomRight;
-	data.fileThumb = PixmapFromImage(Images::prepare(
+	const auto options = Images::Option::RoundSmall;
+	data.fileThumb = PixmapFromImage(Images::Prepare(
 		preview,
 		thumbWidth * style::DevicePixelRatio(),
-		0,
-		options,
-		st.thumbSize,
-		st.thumbSize));
+		{ .options = options, .outer = { st.thumbSize, st.thumbSize } }));
 }
 
 void AbstractSingleFilePreview::paintEvent(QPaintEvent *e) {
@@ -93,7 +164,7 @@ void AbstractSingleFilePreview::paintEvent(QPaintEvent *e) {
 	const auto &st = !isThumbedLayout(_data)
 		? st::attachPreviewLayout
 		: st::attachPreviewThumbLayout;
-	const auto nameleft = st.thumbSize + st.padding.right();
+	const auto nameleft = st.thumbSize + st.thumbSkip;
 	const auto nametop = st.nameTop;
 	const auto statustop = st.statusTop;
 	const auto x = (width() - w) / 2, y = 0;
@@ -106,26 +177,33 @@ void AbstractSingleFilePreview::paintEvent(QPaintEvent *e) {
 		if (_data.fileIsAudio && !_data.fileThumb.isNull()) {
 			p.drawPixmap(inner.topLeft(), _data.fileThumb);
 		} else {
-			p.setBrush(st::msgFileInBg);
+			p.setBrush(_st.files.iconBg);
 			PainterHighQualityEnabler hq(p);
 			p.drawEllipse(inner);
 		}
-
-		auto &icon = _data.fileIsAudio
+		const auto &icon = _data.fileIsAudio
 			? (_data.fileThumb.isNull()
-				? st::historyFileInPlay
+				? _st.files.iconPlay
 				: st::historyFileThumbPlay)
 			: _data.fileIsImage
-			? st::historyFileInImage
-			: st::historyFileInDocument;
+			? _st.files.iconImage
+			: _st.files.iconDocument;
 		icon.paintInCenter(p, inner);
 	} else {
 		QRect rthumb(
 			style::rtlrect(x, y, st.thumbSize, st.thumbSize, width()));
 		p.drawPixmap(rthumb.topLeft(), _data.fileThumb);
 	}
+	const auto checkSize = _st.files.selectCheck.size;
+	const auto check = style::rtlrect(
+		x + st.thumbSize - checkSize,
+		y + st.thumbSize - checkSize,
+		checkSize,
+		checkSize,
+		width());
+	_selectCheck.paint(p, check.x(), check.y(), width());
 	p.setFont(st::semiboldFont);
-	p.setPen(st::historyFileNameInFg);
+	p.setPen(_st.files.nameFg);
 	p.drawTextLeft(
 		x + nameleft,
 		y + nametop, width(),
@@ -133,13 +211,30 @@ void AbstractSingleFilePreview::paintEvent(QPaintEvent *e) {
 		_data.nameWidth);
 
 	p.setFont(st::normalFont);
-	p.setPen(st::mediaInFg);
+	p.setPen(_st.files.statusFg);
 	p.drawTextLeft(
 		x + nameleft,
 		y + statustop,
 		width(),
 		_data.statusText,
 		_data.statusWidth);
+	if (!_data.caption.isEmpty()) {
+		p.setPen(_st.files.nameFg);
+		const auto captionTop = y
+			+ st.thumbSize
+			+ st::attachPreviewCaptionTopOffset;
+		_data.caption.draw(p, {
+			.position = {
+				x,
+				captionTop,
+			},
+			.outerWidth = width(),
+			.availableWidth = _data.captionAvailableWidth,
+			.align = style::al_left,
+			.elisionLines = 1,
+			.elisionBreakEverywhere = true,
+		});
+	}
 }
 
 void AbstractSingleFilePreview::resizeEvent(QResizeEvent *e) {
@@ -156,7 +251,7 @@ void AbstractSingleFilePreview::resizeEvent(QResizeEvent *e) {
 	_editMedia->moveToRight(right, top);
 }
 
-bool AbstractSingleFilePreview::isThumbedLayout(Data &data) const {
+bool AbstractSingleFilePreview::isThumbedLayout(const Data &data) const {
 	return (!data.fileThumb.isNull() && !data.fileIsAudio);
 }
 
@@ -171,9 +266,13 @@ void AbstractSingleFilePreview::updateTextWidthFor(Data &data) {
 		: 0;
 	const auto availableFileWidth = st::sendMediaPreviewSize
 		- st.thumbSize
-		- st.padding.right()
+		- st.thumbSkip
 		// Right buttons.
-		- st::sendBoxAlbumGroupButtonFile.width * buttonsCount
+		- _st.files.buttonFile.width * buttonsCount
+		- st::sendBoxAlbumGroupEditInternalSkip * buttonsCount
+		- st::sendBoxAlbumGroupSkipRight;
+	const auto availableCaptionWidth = st::sendMediaPreviewSize
+		- _st.files.buttonFile.width * buttonsCount
 		- st::sendBoxAlbumGroupEditInternalSkip * buttonsCount
 		- st::sendBoxAlbumGroupSkipRight;
 	data.nameWidth = st::semiboldFont->width(data.name);
@@ -185,17 +284,107 @@ void AbstractSingleFilePreview::updateTextWidthFor(Data &data) {
 		data.nameWidth = st::semiboldFont->width(data.name);
 	}
 	data.statusWidth = st::normalFont->width(data.statusText);
+	data.captionAvailableWidth = availableCaptionWidth;
 }
 
-void AbstractSingleFilePreview::setData(const Data &data) {
-	_data = data;
-
-	updateTextWidthFor(_data);
-
+void AbstractSingleFilePreview::updateDataGeometry() {
 	const auto &st = !isThumbedLayout(_data)
 		? st::attachPreviewLayout
 		: st::attachPreviewThumbLayout;
-	resize(width(), st.thumbSize);
+	const auto height = st.thumbSize + (_data.caption.isEmpty()
+		? 0
+		: (st::attachPreviewCaptionTopOffset + _data.caption.lineHeight()));
+	resize(width(), height);
+}
+
+QRect AbstractSingleFilePreview::captionRect() const {
+	if (_data.caption.isEmpty()) {
+		return {};
+	}
+	const auto w = width()
+		- st::boxPhotoPadding.left()
+		- st::boxPhotoPadding.right();
+	const auto &st = !isThumbedLayout(_data)
+		? st::attachPreviewLayout
+		: st::attachPreviewThumbLayout;
+	const auto x = (width() - w) / 2;
+	const auto captionLineHeight = _data.caption.lineHeight();
+	const auto top = st.thumbSize
+		+ st::attachPreviewCaptionTopOffset;
+	return QRect(
+		x,
+		top,
+		_data.captionAvailableWidth,
+		captionLineHeight) + st::attachPreviewCaptionRepaintMargin;
+}
+
+void AbstractSingleFilePreview::setData(Data data) {
+	_data = std::move(data);
+	updateTextWidthFor(_data);
+	updateDataGeometry();
+}
+
+void AbstractSingleFilePreview::mousePressEvent(QMouseEvent *e) {
+	if (e->button() != Qt::LeftButton) {
+		return;
+	} else if (selectingByClick(e->modifiers())) {
+		_selectPressed = true;
+	} else if (isOverName(e->pos())) {
+		_namePressed = true;
+	}
+}
+
+void AbstractSingleFilePreview::mouseMoveEvent(QMouseEvent *e) {
+	applyCursor(isOverName(e->pos())
+		? style::cur_pointer
+		: style::cur_default);
+}
+
+void AbstractSingleFilePreview::mouseReleaseEvent(QMouseEvent *e) {
+	const auto selectPressed = base::take(_selectPressed);
+	const auto namePressed = base::take(_namePressed);
+	if (e->button() != Qt::LeftButton) {
+		return;
+	} else if (selectPressed && rect().contains(e->pos())) {
+		_selectRequests.fire({});
+	} else if (namePressed && isOverName(e->pos())) {
+		_renameRequests.fire({});
+	}
+}
+
+QRect AbstractSingleFilePreview::nameRect() const {
+	const auto w = width()
+		- st::boxPhotoPadding.left()
+		- st::boxPhotoPadding.right();
+	const auto &st = !isThumbedLayout(_data)
+		? st::attachPreviewLayout
+		: st::attachPreviewThumbLayout;
+	const auto nameleft = st.thumbSize + st.thumbSkip;
+	const auto nametop = st.nameTop;
+	const auto x = (width() - w) / 2, y = 0;
+	return style::rtlrect(
+		x + nameleft,
+		y + nametop,
+		_data.nameWidth,
+		st::semiboldFont->height,
+		width());
+}
+
+bool AbstractSingleFilePreview::isOverName(QPoint point) const {
+	return _renameEnabled && !_selectionMode && nameRect().contains(point);
+}
+
+bool AbstractSingleFilePreview::selectingByClick(
+		Qt::KeyboardModifiers modifiers) const {
+	return _selectable
+		&& (_selectionMode || modifiers.testFlag(Qt::ControlModifier));
+}
+
+void AbstractSingleFilePreview::applyCursor(style::cursor cursor) {
+	if (_cursor != cursor) {
+		_cursor = cursor;
+		setCursor(_cursor);
+	}
 }
 
 } // namespace Ui

@@ -7,7 +7,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "mtproto/details/mtproto_serialized_request.h"
 
-#include "base/openssl_help.h"
+#include "base/random.h"
 
 namespace MTP::details {
 namespace {
@@ -30,7 +30,7 @@ uint32 CountPaddingPrimesCount(
 	}
 
 	// Some more random padding.
-	return result + ((openssl::RandomValue<uchar>() & 0x0F) << 2);
+	return result + ((base::RandomValue<uchar>() & 0x0F) << 2);
 }
 
 } // namespace
@@ -89,13 +89,6 @@ void SerializedRequest::setSeqNo(uint32 seqNo) {
 	Expects(_data->size() > kMessageBodyPosition);
 
 	(*_data)[kSeqNoPosition] = mtpPrime(seqNo);
-}
-
-uint32 SerializedRequest::getSeqNo() const {
-	Expects(_data != nullptr);
-	Expects(_data->size() > kMessageBodyPosition);
-
-	return uint32((*_data)[kSeqNoPosition]);
 }
 
 void SerializedRequest::addPadding(bool forAuthKeyInner) {

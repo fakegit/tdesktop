@@ -7,47 +7,26 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #pragma once
 
-#include "boxes/abstract_box.h"
-#include "base/timer.h"
-#include "mtproto/sender.h"
 #include "data/stickers/data_stickers_set.h"
-#include "ui/effects/animations.h"
-#include "ui/special_fields.h"
-
-class ConfirmBox;
-
-namespace style {
-struct RippleAnimation;
-} // namespace style
+#include "mtproto/sender.h"
+#include "ui/layers/box_content.h"
 
 namespace Ui {
-class PlainShadow;
-class RippleAnimation;
 class SettingsSlider;
 class SlideAnimation;
-class CrossButton;
-class BoxContentDivider;
 } // namespace Ui
 
-namespace Window {
-class SessionController;
-} // namespace Window
+namespace ChatHelpers {
+class Show;
+} // namespace ChatHelpers
 
 namespace Main {
 class Session;
 } // namespace Main
 
 namespace Data {
-class DocumentMedia;
+enum class StickersType : uchar;
 } // namespace Data
-
-namespace Lottie {
-class SinglePlayer;
-} // namespace Lottie
-
-namespace Stickers {
-class Set;
-} // namespace Stickers
 
 class StickersBox final : public Ui::BoxContent {
 public:
@@ -61,17 +40,22 @@ public:
 
 	StickersBox(
 		QWidget*,
-		not_null<Window::SessionController*> controller,
+		std::shared_ptr<ChatHelpers::Show> show,
 		Section section,
 		bool masks = false);
 	StickersBox(
 		QWidget*,
-		not_null<Window::SessionController*> controller,
-		not_null<ChannelData*> megagroup);
+		std::shared_ptr<ChatHelpers::Show> show,
+		not_null<ChannelData*> megagroup,
+		bool isEmoji);
 	StickersBox(
 		QWidget*,
-		not_null<Window::SessionController*> controller,
-		const MTPVector<MTPStickerSetCovered> &attachedSets);
+		std::shared_ptr<ChatHelpers::Show> show,
+		const QVector<MTPStickerSetCovered> &attachedSets);
+	StickersBox(
+		QWidget*,
+		std::shared_ptr<ChatHelpers::Show> show,
+		const std::vector<StickerSetIdentifier> &emojiSets);
 	~StickersBox();
 
 	[[nodiscard]] Main::Session &session() const;
@@ -91,7 +75,7 @@ private:
 		Tab() = default;
 
 		template <typename ...Args>
-		Tab(int index, Args&&... args);
+		Tab(int index, Args &&...args);
 
 		object_ptr<Inner> takeWidget();
 		void returnWidget(object_ptr<Inner> widget);
@@ -100,7 +84,7 @@ private:
 		[[nodiscard]] int index() const;
 
 		void saveScrollTop();
-		int getScrollTop() const {
+		[[nodiscard]] int scrollTop() const {
 			return _scrollTop;
 		}
 
@@ -118,12 +102,12 @@ private:
 	void updateTabsGeometry();
 	void switchTab();
 	void installSet(uint64 setId);
-	int getTopSkip() const;
+	[[nodiscard]] int topSkip() const;
 	void saveChanges();
 
-	QPixmap grabContentCache();
+	[[nodiscard]] QPixmap grabContentCache();
 
-	void installDone(const MTPmessages_StickerSetInstallResult &result);
+	void installDone(const MTPmessages_StickerSetInstallResult &result) const;
 	void installFail(const MTP::Error &error, uint64 setId);
 
 	void preloadArchivedSets();
@@ -134,22 +118,25 @@ private:
 		uint64 offsetId);
 	void showAttachedStickers();
 
-	const Data::StickersSetsOrder &archivedSetsOrder() const;
-	Data::StickersSetsOrder &archivedSetsOrderRef();
+	[[nodiscard]] const Data::StickersSetsOrder &archivedSetsOrder() const;
+	[[nodiscard]] Data::StickersSetsOrder &archivedSetsOrderRef() const;
 
-	std::array<Inner*, 5> widgets() const;
+	[[nodiscard]] std::array<Inner*, 5> widgets() const;
 
-	const not_null<Window::SessionController*> _controller;
+	const std::shared_ptr<ChatHelpers::Show> _show;
+	const not_null<Main::Session*> _session;
 	MTP::Sender _api;
 
 	object_ptr<Ui::SettingsSlider> _tabs = { nullptr };
 	QList<Section> _tabIndices;
+	bool _ignoreTabActivation = false;
 
 	class CounterWidget;
 	object_ptr<CounterWidget> _unreadBadge = { nullptr };
 
 	Section _section;
 	const bool _isMasks;
+	const bool _isEmoji;
 
 	Tab _installed;
 	Tab _masks;
@@ -158,12 +145,13 @@ private:
 	Tab _attached;
 	Tab *_tab = nullptr;
 
-	const MTPVector<MTPStickerSetCovered> _attachedSets;
+	const Data::StickersType _attachedType = {};
+	const QVector<MTPStickerSetCovered> _attachedSets;
+	const std::vector<StickerSetIdentifier> _emojiSets;
 
 	ChannelData *_megagroupSet = nullptr;
 
 	std::unique_ptr<Ui::SlideAnimation> _slideAnimation;
-	object_ptr<Ui::PlainShadow> _titleShadow = { nullptr };
 
 	mtpRequestId _archivedRequestId = 0;
 	bool _archivedLoaded = false;

@@ -8,40 +8,109 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "history/history_drag_area.h"
 
 #include "base/event_filter.h"
-#include "boxes/confirm_box.h"
+#include "ui/boxes/confirm_box.h"
 #include "boxes/sticker_set_box.h"
 #include "inline_bots/inline_bot_result.h"
 #include "inline_bots/inline_bot_layout_item.h"
-#include "dialogs/dialogs_layout.h"
+#include "dialogs/ui/dialogs_layout.h"
 #include "history/history_widget.h"
 #include "storage/localstorage.h"
 #include "lang/lang_keys.h"
 #include "ui/widgets/shadow.h"
+#include "ui/painter.h"
 #include "ui/ui_utility.h"
 #include "ui/cached_round_corners.h"
 #include "mainwindow.h"
 #include "apiwrap.h"
 #include "mainwidget.h"
 #include "storage/storage_media_prepare.h"
+#include "core/application.h"
+#include "core/mime_type.h"
+#include "core/local_url_handlers.h"
 #include "styles/style_chat_helpers.h"
 #include "styles/style_layers.h"
+#include "styles/style_window.h"
+
+#include <QtGui/QGuiApplication>
 
 namespace {
 
 constexpr auto kDragAreaEvents = {
 	QEvent::DragEnter,
+	QEvent::DragMove,
 	QEvent::DragLeave,
 	QEvent::Drop,
 	QEvent::MouseButtonRelease,
 	QEvent::Leave,
 };
 
-inline auto InnerRect(not_null<Ui::RpWidget*> widget) {
-	return QRect(
-		st::dragPadding.left(),
-		st::dragPadding.top(),
-		widget->width() - st::dragPadding.left() - st::dragPadding.right(),
-		widget->height() - st::dragPadding.top() - st::dragPadding.bottom());
+[[nodiscard]] Storage::MimeDataState ArchiveDragState(
+		Storage::MimeDataState state,
+		Qt::KeyboardModifiers modifiers,
+		bool archiveOnly) {
+	using DragState = Storage::MimeDataState;
+	if (archiveOnly) {
+		if (state == DragState::Folder) {
+			return DragState::FolderArchiveOnly;
+		} else if (state == DragState::FilesArchive) {
+			return DragState::FilesArchiveOnly;
+		}
+	}
+	if (!modifiers) {
+		return (state == DragState::FilesArchive)
+			? DragState::Files
+			: state;
+	}
+	return (state == DragState::PhotoFiles)
+		? DragState::PhotoFilesArchive
+		: (state == DragState::MediaFiles)
+		? DragState::MediaFilesArchive
+		: state;
+}
+
+[[nodiscard]] bool IsPromotedToArchive(Storage::MimeDataState state) {
+	using DragState = Storage::MimeDataState;
+	return (state == DragState::FilesArchive)
+		|| (state == DragState::FilesArchiveOnly)
+		|| (state == DragState::PhotoFilesArchive)
+		|| (state == DragState::MediaFilesArchive);
+}
+
+[[nodiscard]] bool PhotoAreaSendsMedia(Storage::MimeDataState state) {
+	using DragState = Storage::MimeDataState;
+	return (state == DragState::PhotoFiles)
+		|| (state == DragState::MediaFiles)
+		|| (state == DragState::Image)
+		|| (state == DragState::Media);
+}
+
+[[nodiscard]] QString DetectProxyLink(const QMimeData *data) {
+	if (!data) {
+		return QString();
+	}
+	const auto check = [](const QString &text) -> QString {
+		const auto local = Core::TryConvertUrlToLocal(text.trimmed());
+		const auto proxy = [&](const QString &prefix) {
+			return local.startsWith(prefix, Qt::CaseInsensitive)
+				&& (local.size() > prefix.size());
+		};
+		return (proxy(u"tg://proxy?"_q)
+			|| proxy(u"tg://socks?"_q)
+			|| proxy(u"tg://webproxy?"_q))
+			? local
+			: QString();
+	};
+	for (const auto &url : Core::ReadMimeUrls(data)) {
+		if (auto result = check(url.toString()); !result.isEmpty()) {
+			return result;
+		}
+	}
+	if (const auto text = Core::ReadMimeText(data); !text.isEmpty()) {
+		if (auto result = check(text); !result.isEmpty()) {
+			return result;
+		}
+	}
+	return QString();
 }
 
 } // namespace
@@ -52,6 +121,7 @@ DragArea::Areas DragArea::SetupDragAreaToContainer(
 		Fn<void(bool)> &&setAcceptDropsField,
 		Fn<void()> &&updateControlsGeometry,
 		DragArea::CallbackComputeState &&computeState,
+		Fn<bool()> &&archiveOnly,
 		bool hideSubtext) {
 
 	using DragState = Storage::MimeDataState;
@@ -59,18 +129,22 @@ DragArea::Areas DragArea::SetupDragAreaToContainer(
 	auto &lifetime = container->lifetime();
 	container->setAcceptDrops(true);
 
-	const auto attachDragDocument =
-		Ui::CreateChild<DragArea>(container.get());
+	const auto attachDragDocument
+		= Ui::CreateChild<DragArea>(container.get());
 	const auto attachDragPhoto = Ui::CreateChild<DragArea>(container.get());
 
 	attachDragDocument->hide();
 	attachDragPhoto->hide();
 
+	attachDragDocument->setIcon(&st::dragIconFiles);
+
 	attachDragDocument->raise();
 	attachDragPhoto->raise();
 
-	const auto attachDragState =
-		lifetime.make_state<DragState>(DragState::None);
+	const auto attachDragState
+		= lifetime.make_state<DragState>(DragState::None);
+	const auto attachDragBaseState
+		= lifetime.make_state<DragState>(DragState::None);
 
 	const auto width = [=] {
 		return container->width();
@@ -89,9 +163,32 @@ DragArea::Areas DragArea::SetupDragAreaToContainer(
 	const auto moveToTop = [=](not_null<DragArea*> w) {
 		w->move(st::dragMargin.left(), st::dragMargin.top());
 	};
+	const auto documentHeight = [=](int full) {
+		const auto smaller = full / 3;
+		const auto mediaPreferred
+			= Core::App().settings().sendFilesWay().sendImagesAsPhotos();
+		const auto &smallerIcon = mediaPreferred
+			? st::dragIconFiles
+			: st::dragIconMedia;
+		if (!PhotoAreaSendsMedia(*attachDragBaseState)
+			|| (smaller < DragArea::MinimalHeight()
+				+ smallerIcon.height()
+				+ st::dragIconSkip)) {
+			return full / 2;
+		}
+		return mediaPreferred ? smaller : (full - smaller);
+	};
+	// Relayouting the container can synthesize a mouse move, and Qt
+	// re-dispatches Enter/Leave for it before qt_last_mouse_receiver is
+	// updated, so the container gets the same Leave again. That comes back
+	// here and keeps firing while the areas play their hide animation,
+	// until the recursion overflows the stack.
+	const auto updatingGeometry = lifetime.make_state<bool>(false);
 	const auto updateAttachGeometry = crl::guard(container, [=] {
-		if (updateControlsGeometry) {
+		if (updateControlsGeometry && !*updatingGeometry) {
+			*updatingGeometry = true;
 			updateControlsGeometry();
+			*updatingGeometry = false;
 		}
 
 		switch (*attachDragState) {
@@ -100,20 +197,29 @@ DragArea::Areas DragArea::SetupDragAreaToContainer(
 			moveToTop(attachDragDocument);
 		break;
 		case DragState::PhotoFiles:
+		case DragState::PhotoFilesArchive:
+		case DragState::MediaFiles:
+		case DragState::MediaFilesArchive:
+		case DragState::Folder:
+		case DragState::FilesArchive: {
+			const auto full = height() - verticalMargins;
 			attachDragDocument->resize(
 				width() - horizontalMargins,
-				(height() - verticalMargins) / 2);
+				documentHeight(full));
 			moveToTop(attachDragDocument);
 			attachDragPhoto->resize(
 				attachDragDocument->width(),
-				attachDragDocument->height());
+				full - attachDragDocument->height());
 			attachDragPhoto->move(
 				st::dragMargin.left(),
 				height()
 					- attachDragPhoto->height()
 					- st::dragMargin.bottom());
-		break;
+		} break;
+		case DragState::FilesArchiveOnly:
+		case DragState::FolderArchiveOnly:
 		case DragState::Image:
+		case DragState::Media:
 			resizeToFull(attachDragPhoto);
 			moveToTop(attachDragPhoto);
 		break;
@@ -125,6 +231,11 @@ DragArea::Areas DragArea::SetupDragAreaToContainer(
 			setAcceptDropsField(*attachDragState == DragState::None);
 		}
 		updateAttachGeometry();
+		if (*attachDragState != DragState::None) {
+			attachDragPhoto->setIcon(PhotoAreaSendsMedia(*attachDragState)
+				? &st::dragIconMedia
+				: &st::dragIconArchive);
+		}
 
 		switch (*attachDragState) {
 		case DragState::None:
@@ -140,6 +251,35 @@ DragArea::Areas DragArea::SetupDragAreaToContainer(
 			attachDragDocument->otherEnter();
 			attachDragPhoto->hideFast();
 		break;
+		case DragState::Folder:
+			attachDragDocument->setText(
+				tr::lng_drag_folder_here(tr::now),
+				hideSubtext
+					? QString()
+					: tr::lng_drag_to_send_folder_files(tr::now));
+			attachDragPhoto->setText(
+				tr::lng_drag_folder_here(tr::now),
+				hideSubtext
+					? QString()
+					: tr::lng_drag_to_send_folder(tr::now));
+			attachDragDocument->otherEnter();
+			attachDragPhoto->otherEnter();
+		break;
+		case DragState::FilesArchive:
+		case DragState::MediaFilesArchive:
+			attachDragDocument->setText(
+				tr::lng_drag_files_here(tr::now),
+				hideSubtext
+					? QString()
+					: tr::lng_drag_to_send_files(tr::now));
+			attachDragPhoto->setText(
+				tr::lng_drag_files_here(tr::now),
+				hideSubtext
+					? QString()
+					: tr::lng_drag_to_send_files_archive(tr::now));
+			attachDragDocument->otherEnter();
+			attachDragPhoto->otherEnter();
+		break;
 		case DragState::PhotoFiles:
 			attachDragDocument->setText(
 				tr::lng_drag_images_here(tr::now),
@@ -154,9 +294,64 @@ DragArea::Areas DragArea::SetupDragAreaToContainer(
 			attachDragDocument->otherEnter();
 			attachDragPhoto->otherEnter();
 		break;
+		case DragState::PhotoFilesArchive:
+			attachDragDocument->setText(
+				tr::lng_drag_images_here(tr::now),
+				hideSubtext
+					? QString()
+					: tr::lng_drag_to_send_no_compression(tr::now));
+			attachDragPhoto->setText(
+				tr::lng_drag_files_here(tr::now),
+				hideSubtext
+					? QString()
+					: tr::lng_drag_to_send_files_archive(tr::now));
+			attachDragDocument->otherEnter();
+			attachDragPhoto->otherEnter();
+		break;
+		case DragState::MediaFiles:
+			attachDragDocument->setText(
+				tr::lng_drag_files_here(tr::now),
+				hideSubtext
+					? QString()
+					: tr::lng_drag_to_send_files(tr::now));
+			attachDragPhoto->setText(
+				tr::lng_drag_media_here(tr::now),
+				hideSubtext
+					? QString()
+					: tr::lng_drag_to_send_media(tr::now));
+			attachDragDocument->otherEnter();
+			attachDragPhoto->otherEnter();
+		break;
+		case DragState::FilesArchiveOnly:
+			attachDragPhoto->setText(
+				tr::lng_drag_files_here(tr::now),
+				hideSubtext
+					? QString()
+					: tr::lng_drag_to_send_files_archive(tr::now));
+			attachDragDocument->hideFast();
+			attachDragPhoto->otherEnter();
+		break;
+		case DragState::FolderArchiveOnly:
+			attachDragPhoto->setText(
+				tr::lng_drag_folder_here(tr::now),
+				hideSubtext
+					? QString()
+					: tr::lng_drag_to_send_folder(tr::now));
+			attachDragDocument->hideFast();
+			attachDragPhoto->otherEnter();
+		break;
 		case DragState::Image:
 			attachDragPhoto->setText(
 				tr::lng_drag_images_here(tr::now),
+				hideSubtext
+					? QString()
+					: tr::lng_drag_to_send_quick(tr::now));
+			attachDragDocument->hideFast();
+			attachDragPhoto->otherEnter();
+		break;
+		case DragState::Media:
+			attachDragPhoto->setText(
+				tr::lng_drag_media_here(tr::now),
 				hideSubtext
 					? QString()
 					: tr::lng_drag_to_send_quick(tr::now));
@@ -167,13 +362,29 @@ DragArea::Areas DragArea::SetupDragAreaToContainer(
 	};
 
 	container->sizeValue(
-	) | rpl::start_with_next(updateAttachGeometry, lifetime);
+	) | rpl::on_next(updateAttachGeometry, lifetime);
 
 	const auto resetDragStateIfNeeded = [=] {
 		if (*attachDragState != DragState::None
 			|| !attachDragPhoto->isHidden()
 			|| !attachDragDocument->isHidden()) {
 			*attachDragState = DragState::None;
+			*attachDragBaseState = DragState::None;
+			updateDragAreas();
+		}
+	};
+
+	const auto resolveDragState = [=](DragState state) {
+		return ArchiveDragState(
+			state,
+			QGuiApplication::queryKeyboardModifiers(),
+			archiveOnly && archiveOnly());
+	};
+
+	const auto applyDragModifiers = [=] {
+		const auto resolved = resolveDragState(*attachDragBaseState);
+		if (*attachDragState != resolved) {
+			*attachDragState = resolved;
 			updateDragAreas();
 		}
 	};
@@ -183,9 +394,10 @@ DragArea::Areas DragArea::SetupDragAreaToContainer(
 			return;
 		}
 
-		*attachDragState = computeState
+		*attachDragBaseState = computeState
 			? computeState(e->mimeData())
 			: Storage::ComputeMimeDataState(e->mimeData());
+		*attachDragState = resolveDragState(*attachDragBaseState);
 		updateDragAreas();
 
 		if (*attachDragState != DragState::None) {
@@ -199,19 +411,28 @@ DragArea::Areas DragArea::SetupDragAreaToContainer(
 	};
 
 	const auto dropEvent = [=](QDropEvent *e) {
+		// Dropped callback is called later, so save the mode.
+		attachDragPhoto->_archiveDropped = IsPromotedToArchive(
+			*attachDragState);
+
 		// Hide fast to avoid visual bugs in resizable boxes.
 		attachDragDocument->hideFast();
 		attachDragPhoto->hideFast();
 
 		*attachDragState = DragState::None;
+		*attachDragBaseState = DragState::None;
 		updateDragAreas();
-		e->acceptProposedAction();
+		e->setDropAction(Qt::CopyAction);
+		e->accept();
 	};
 
 	const auto processDragEvents = [=](not_null<QEvent*> event) {
 		switch (event->type()) {
 		case QEvent::DragEnter:
 			dragEnterEvent(static_cast<QDragEnterEvent*>(event.get()));
+			return true;
+		case QEvent::DragMove:
+			applyDragModifiers();
 			return true;
 		case QEvent::DragLeave:
 			dragLeaveEvent(static_cast<QDragLeaveEvent*>(event.get()));
@@ -226,7 +447,7 @@ DragArea::Areas DragArea::SetupDragAreaToContainer(
 	container->events(
 	) | rpl::filter([=](not_null<QEvent*> event) {
 		return ranges::contains(kDragAreaEvents, event->type());
-	}) | rpl::start_with_next([=](not_null<QEvent*> event) {
+	}) | rpl::on_next([=](not_null<QEvent*> event) {
 		const auto type = event->type();
 
 		if (processDragEvents(event)) {
@@ -252,6 +473,106 @@ DragArea::Areas DragArea::SetupDragAreaToContainer(
 	};
 }
 
+void DragArea::SetupProxyDropArea(
+		not_null<Ui::RpWidget*> container,
+		Fn<void(const QString &localUrl)> connectProxy) {
+	auto &lifetime = container->lifetime();
+	container->setAcceptDrops(true);
+
+	const auto area = Ui::CreateChild<DragArea>(container.get());
+	area->hide();
+	area->raise();
+	area->setText(
+		tr::lng_drag_proxy_here(tr::now),
+		tr::lng_drag_proxy_about(tr::now));
+
+	const auto updateGeometry = [=] {
+		const auto margin = st::dragMargin;
+		const auto width = st::windowMinWidth
+			- margin.left()
+			- margin.right();
+		area->setGeometry(
+			(container->width() - width) / 2,
+			margin.top(),
+			width,
+			container->height() / 3 - margin.top());
+	};
+	container->sizeValue(
+	) | rpl::on_next([=](QSize) {
+		updateGeometry();
+	}, lifetime);
+
+	const auto reset = [=] {
+		if (!area->isHidden()) {
+			area->otherLeave();
+		}
+	};
+
+	const auto dragEnterEvent = [=](QDragEnterEvent *e) {
+		if (Core::App().passcodeLocked()
+			|| DetectProxyLink(e->mimeData()).isEmpty()) {
+			reset();
+			return;
+		}
+		updateGeometry();
+		area->raise();
+		area->otherEnter();
+		e->setDropAction(Qt::IgnoreAction);
+		e->accept();
+	};
+
+	const auto dropEvent = [=](QDropEvent *e) {
+		area->hideFast();
+		e->setDropAction(Qt::IgnoreAction);
+		e->accept();
+	};
+
+	const auto processDragEvents = [=](not_null<QEvent*> event) {
+		switch (event->type()) {
+		case QEvent::DragEnter:
+			dragEnterEvent(static_cast<QDragEnterEvent*>(event.get()));
+			return true;
+		case QEvent::DragLeave:
+			reset();
+			return true;
+		case QEvent::Drop:
+			dropEvent(static_cast<QDropEvent*>(event.get()));
+			return true;
+		}
+		return false;
+	};
+
+	container->events(
+	) | rpl::filter([=](not_null<QEvent*> event) {
+		return ranges::contains(kDragAreaEvents, event->type());
+	}) | rpl::on_next([=](not_null<QEvent*> event) {
+		const auto type = event->type();
+		if (processDragEvents(event)) {
+			return;
+		} else if (type == QEvent::Leave
+			|| type == QEvent::MouseButtonRelease) {
+			reset();
+		}
+	}, lifetime);
+
+	base::install_event_filter(area, [=](not_null<QEvent*> event) {
+		processDragEvents(event);
+		return base::EventFilterResult::Continue;
+	});
+
+	area->setDroppedCallback([=](const QMimeData *data) {
+		if (const auto local = DetectProxyLink(data); !local.isEmpty()) {
+			connectProxy(local);
+		}
+	});
+}
+
+int DragArea::MinimalHeight() {
+	return st::dragHeight + 2 * std::max(
+		st::dragPadding.top(),
+		st::dragSubfont->height + st::dragPadding.bottom());
+}
+
 DragArea::DragArea(QWidget *parent) : Ui::RpWidget(parent) {
 	setMouseTracking(true);
 	setAcceptDrops(true);
@@ -262,7 +583,7 @@ bool DragArea::overlaps(const QRect &globalRect) {
 		return false;
 	}
 
-	const auto inner = InnerRect(this);
+	const auto inner = rect() - st::dragPadding;
 	const auto testRect = QRect(
 		mapFromGlobal(globalRect.topLeft()),
 		globalRect.size());
@@ -278,11 +599,11 @@ void DragArea::mouseMoveEvent(QMouseEvent *e) {
 		return;
 	}
 
-	setIn(InnerRect(this).contains(e->pos()));
+	setIn((rect() - st::dragPadding).contains(e->pos()));
 }
 
 void DragArea::dragMoveEvent(QDragMoveEvent *e) {
-	setIn(InnerRect(this).contains(e->pos()));
+	setIn((rect() - st::dragPadding).contains(e->pos()));
 	e->setDropAction(_in ? Qt::CopyAction : Qt::IgnoreAction);
 	e->accept();
 }
@@ -304,6 +625,11 @@ void DragArea::setText(const QString &text, const QString &subtext) {
 	update();
 }
 
+void DragArea::setIcon(const style::icon *icon) {
+	_icon = icon;
+	update();
+}
+
 void DragArea::paintEvent(QPaintEvent *e) {
 	Painter p(this);
 
@@ -312,7 +638,7 @@ void DragArea::paintEvent(QPaintEvent *e) {
 		return;
 	}
 	p.setOpacity(opacity);
-	const auto inner = InnerRect(this);
+	const auto inner = rect() - st::dragPadding;
 
 	if (!_cache.isNull()) {
 		p.drawPixmapLeft(
@@ -326,15 +652,31 @@ void DragArea::paintEvent(QPaintEvent *e) {
 	Ui::Shadow::paint(p, inner, width(), st::boxRoundShadow);
 	Ui::FillRoundRect(p, inner, st::boxBg, Ui::BoxCorners);
 
-	p.setPen(anim::pen(
+	const auto color = anim::color(
 		st::dragColor,
 		st::dragDropColor,
-		_a_in.value(_in ? 1. : 0.)));
+		_a_in.value(_in ? 1. : 0.));
+	p.setPen(color);
+
+	const auto icon = (_icon
+		&& (height() >= MinimalHeight() + _icon->height() + st::dragIconSkip))
+		? _icon
+		: nullptr;
+	const auto shift = icon ? ((icon->height() + st::dragIconSkip) / 2) : 0;
+	const auto textTop = (height() - st::dragHeight) / 2 + shift;
+	if (icon) {
+		icon->paint(
+			p,
+			(width() - icon->width()) / 2,
+			textTop - st::dragIconSkip - icon->height(),
+			width(),
+			color);
+	}
 
 	p.setFont(st::dragFont);
 	const auto rText = QRect(
 		0,
-		(height() - st::dragHeight) / 2,
+		textTop,
 		width(),
 		st::dragFont->height);
 	p.drawText(rText, _text, QTextOption(style::al_top));
@@ -342,7 +684,7 @@ void DragArea::paintEvent(QPaintEvent *e) {
 	p.setFont(st::dragSubfont);
 	const auto rSubtext = QRect(
 		0,
-		(height() + st::dragHeight) / 2 - st::dragSubfont->height,
+		textTop + st::dragHeight - st::dragSubfont->height,
 		width(),
 		st::dragSubfont->height * 2);
 	p.drawText(rSubtext, _subtext, QTextOption(style::al_top));
@@ -358,8 +700,11 @@ void DragArea::dragLeaveEvent(QDragLeaveEvent *e) {
 }
 
 void DragArea::dropEvent(QDropEvent *e) {
-	if (e->isAccepted() && _droppedCallback) {
-		_droppedCallback(e->mimeData());
+	const auto &callback = (_archiveDropped && _archiveDroppedCallback)
+		? _archiveDroppedCallback
+		: _droppedCallback;
+	if (e->isAccepted() && callback) {
+		callback(e->mimeData());
 	}
 }
 
@@ -383,7 +728,7 @@ void DragArea::hideStart() {
 	if (_cache.isNull()) {
 		_cache = Ui::GrabWidget(
 			this,
-			InnerRect(this).marginsAdded(st::boxRoundShadow.extend));
+			rect() - st::dragPadding + st::boxRoundShadow.extend);
 	}
 	_hiding = true;
 	setIn(false);
@@ -408,7 +753,7 @@ void DragArea::showStart() {
 	if (_cache.isNull()) {
 		_cache = Ui::GrabWidget(
 			this,
-			InnerRect(this).marginsAdded(st::boxRoundShadow.extend));
+			rect() - st::dragPadding + st::boxRoundShadow.extend);
 	}
 	show();
 	_a_opacity.start(

@@ -9,23 +9,25 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 #include "mainwindow.h"
 #include "mainwidget.h"
+#include "calls/calls_instance.h"
 #include "core/sandbox.h"
 #include "core/application.h"
 #include "core/core_settings.h"
+#include "core/version.h"
 #include "core/crash_reports.h"
+#include "menu/menu_dock.h"
 #include "storage/localstorage.h"
 #include "media/audio/media_audio.h"
-#include "media/player/media_player_instance.h"
 #include "window/window_controller.h"
 #include "base/platform/mac/base_utilities_mac.h"
 #include "base/platform/base_platform_info.h"
-#include "lang/lang_keys.h"
 #include "base/timer.h"
 #include "styles/style_window.h"
 #include "platform/platform_specific.h"
 
 #include <QtGui/QWindow>
 #include <QtWidgets/QApplication>
+#include <QtWidgets/QMenu>
 #if __has_include(<QtCore/QOperatingSystemVersion>)
 #include <QtCore/QOperatingSystemVersion>
 #endif // __has_include(<QtCore/QOperatingSystemVersion>)
@@ -41,46 +43,15 @@ namespace {
 
 constexpr auto kIgnoreActivationTimeoutMs = 500;
 
-NSMenuItem *CreateMenuItem(
-		QString title,
-		rpl::lifetime &lifetime,
-		Fn<void()> callback,
-		bool enabled = true) {
-	id block = [^{
-		Core::Sandbox::Instance().customEnterFromEventLoop(callback);
-	} copy];
-
-	NSMenuItem *item = [[NSMenuItem alloc]
-		initWithTitle:Q2NSString(title)
-		action:@selector(invoke)
-		keyEquivalent:@""];
-	[item setTarget:block];
-	[item setEnabled:enabled];
-
-	lifetime.add([=] {
-		[block release];
+void SetupDockMenu() {
+	static const auto DockMenu = std::make_unique<QMenu>();
+	QObject::connect(DockMenu.get(), &QMenu::aboutToShow, [] {
+		Menu::RefreshDockMenu(DockMenu.get());
 	});
-	return [item autorelease];
+	DockMenu->setAsDockMenu();
 }
 
 } // namespace
-
-@interface RpMenu : NSMenu {
-}
-
-- (rpl::lifetime &) lifetime;
-
-@end // @interface Menu
-
-@implementation RpMenu {
-	rpl::lifetime _lifetime;
-}
-
-- (rpl::lifetime &) lifetime {
-	return _lifetime;
-}
-
-@end // @implementation Menu
 
 @interface qVisualize : NSObject {
 }
@@ -133,10 +104,9 @@ NSMenuItem *CreateMenuItem(
 - (void) applicationDidBecomeActive:(NSNotification *)aNotification;
 - (void) applicationDidResignActive:(NSNotification *)aNotification;
 - (void) receiveWakeNote:(NSNotification*)note;
+- (void) receiveSleepNote:(NSNotification*)note;
 
 - (void) ignoreApplicationActivationRightNow;
-
-- (NSMenu *) applicationDockMenu:(NSApplication *)sender;
 
 @end // @interface ApplicationDelegate
 
@@ -147,29 +117,38 @@ ApplicationDelegate *_sharedDelegate = nil;
 	base::Timer _ignoreActivationStop;
 }
 
-- (BOOL) applicationShouldHandleReopen:(NSApplication *)theApplication hasVisibleWindows:(BOOL)flag {
-	if (const auto window = Core::App().activeWindow()) {
-		if (window->widget()->isHidden()) {
-			window->widget()->showFromTray();
-		}
-	}
-	return YES;
-}
-
-- (void) applicationDidFinishLaunching:(NSNotification *)aNotification {
+- (instancetype) init {
 	_ignoreActivation = false;
 	_ignoreActivationStop.setCallback([self] {
 		_ignoreActivation = false;
 	});
+	return [super init];
+}
+
+- (BOOL) applicationShouldHandleReopen:(NSApplication *)theApplication hasVisibleWindows:(BOOL)flag {
+	Core::Sandbox::Instance().customEnterFromEventLoop([&] {
+		if (Core::IsAppLaunched()) {
+			if (const auto window = Core::App().activeWindow()) {
+				if (window->widget()->isHidden()) {
+					window->widget()->showFromTray();
+				}
+			}
+		}
+	});
+	return YES;
 }
 
 - (void) applicationDidBecomeActive:(NSNotification *)aNotification {
 	Core::Sandbox::Instance().customEnterFromEventLoop([&] {
 		if (Core::IsAppLaunched() && !_ignoreActivation) {
 			Core::App().handleAppActivated();
-			if (auto window = Core::App().activeWindow()) {
+			if (const auto window = Core::App().activeWindow()) {
 				if (window->widget()->isHidden()) {
-					window->widget()->showFromTray();
+					if (Core::App().calls().hasVisiblePanel()) {
+						Core::App().calls().activateCurrentCall();
+					} else {
+						window->widget()->showFromTray();
+					}
 				}
 			}
 		}
@@ -184,13 +163,25 @@ ApplicationDelegate *_sharedDelegate = nil;
 		return;
 	}
 	Core::Sandbox::Instance().customEnterFromEventLoop([&] {
+		Core::App().notifySystemSleep();
 		Core::App().checkLocalTime();
 
 		LOG(("Audio Info: "
 			"-receiveWakeNote: received, scheduling detach from audio device"));
 		Media::Audio::ScheduleDetachFromDeviceSafe();
 
+#if QT_VERSION < QT_VERSION_CHECK(6, 5, 0)
 		Core::App().settings().setSystemDarkMode(Platform::IsDarkMode());
+#endif // Qt < 6.5.0
+	});
+}
+
+- (void) receiveSleepNote:(NSNotification*)aNotification {
+	if (!Core::IsAppLaunched()) {
+		return;
+	}
+	Core::Sandbox::Instance().customEnterFromEventLoop([&] {
+		Core::App().notifySystemSleep();
 	});
 }
 
@@ -199,50 +190,52 @@ ApplicationDelegate *_sharedDelegate = nil;
 	_ignoreActivationStop.callOnce(kIgnoreActivationTimeoutMs);
 }
 
-- (NSMenu *) applicationDockMenu:(NSApplication *)sender {
-	if (!Core::IsAppLaunched()) {
-		return nil;
-	}
-	RpMenu* dockMenu = [[[RpMenu alloc] initWithTitle: @""] autorelease];
-	[dockMenu setAutoenablesItems:false];
+@end // @implementation ApplicationDelegate
 
-	auto notifyCallback = [] {
-		auto &settings = Core::App().settings();
-		settings.setDesktopNotify(!settings.desktopNotify());
-	};
-	[dockMenu addItem:CreateMenuItem(
-		Core::App().settings().desktopNotify()
-			? tr::lng_disable_notifications_from_tray(tr::now)
-			: tr::lng_enable_notifications_from_tray(tr::now),
-		[dockMenu lifetime],
-		std::move(notifyCallback))];
-
-	using namespace Media::Player;
-	const auto state = instance()->getState(instance()->getActiveType());
-	if (!IsStoppedOrStopping(state.state)) {
-		[dockMenu addItem:[NSMenuItem separatorItem]];
-		[dockMenu addItem:CreateMenuItem(
-			tr::lng_mac_menu_player_previous(tr::now),
-			[dockMenu lifetime],
-			[] { instance()->previous(); },
-			instance()->previousAvailable(instance()->getActiveType()))];
-		[dockMenu addItem:CreateMenuItem(
-			IsPausedOrPausing(state.state)
-				? tr::lng_mac_menu_player_resume(tr::now)
-				: tr::lng_mac_menu_player_pause(tr::now),
-			[dockMenu lifetime],
-			[] { instance()->playPause(); })];
-		[dockMenu addItem:CreateMenuItem(
-			tr::lng_mac_menu_player_next(tr::now),
-			[dockMenu lifetime],
-			[] { instance()->next(); },
-			instance()->nextAvailable(instance()->getActiveType()))];
-	}
-
-	return dockMenu;
+// Never NSApp's delegate: setDelegate: drops the old one's NSApp observers.
+@interface ApplicationHiddenObserver : NSObject {
 }
 
-@end // @implementation ApplicationDelegate
+- (void) receiveHideNote:(NSNotification*)note;
+- (void) receiveUnhideNote:(NSNotification*)note;
+
+- (rpl::producer<bool>) hiddenChanges;
+
+@end // @interface ApplicationHiddenObserver
+
+namespace {
+
+ApplicationHiddenObserver *_hiddenObserver = nil;
+
+} // namespace
+
+@implementation ApplicationHiddenObserver {
+	rpl::event_stream<bool> _hiddenChanges;
+}
+
+- (void) receiveHideNote:(NSNotification*)aNotification {
+	if (!Core::IsAppLaunched()) {
+		return;
+	}
+	Core::Sandbox::Instance().customEnterFromEventLoop([&] {
+		_hiddenChanges.fire(true);
+	});
+}
+
+- (void) receiveUnhideNote:(NSNotification*)aNotification {
+	if (!Core::IsAppLaunched()) {
+		return;
+	}
+	Core::Sandbox::Instance().customEnterFromEventLoop([&] {
+		_hiddenChanges.fire(false);
+	});
+}
+
+- (rpl::producer<bool>) hiddenChanges {
+	return _hiddenChanges.events();
+}
+
+@end // @implementation ApplicationHiddenObserver
 
 namespace Platform {
 
@@ -250,10 +243,21 @@ void SetApplicationIcon(const QIcon &icon) {
 	NSImage *image = nil;
 	if (!icon.isNull()) {
 		auto pixmap = icon.pixmap(1024, 1024);
-		pixmap.setDevicePixelRatio(cRetinaFactor());
+		pixmap.setDevicePixelRatio(style::DevicePixelRatio());
 		image = Q2NSImage(pixmap.toImage());
 	}
 	[[NSApplication sharedApplication] setApplicationIconImage:image];
+}
+
+rpl::producer<bool> ApplicationHiddenValue() {
+	if (!_hiddenObserver) {
+		return rpl::single(false);
+	}
+	return rpl::single(
+		bool([NSApp isHidden])
+	) | rpl::then(
+		[_hiddenObserver hiddenChanges]
+	) | rpl::distinct_until_changed();
 }
 
 } // namespace Platform
@@ -261,7 +265,10 @@ void SetApplicationIcon(const QIcon &icon) {
 void objc_debugShowAlert(const QString &str) {
 	@autoreleasepool {
 
-	[[NSAlert alertWithMessageText:@"Debug Message" defaultButton:@"OK" alternateButton:nil otherButton:nil informativeTextWithFormat:@"%@", Q2NSString(str)] runModal];
+	NSAlert *alert = [[NSAlert alloc] init];
+	alert.messageText = @"Debug Message";
+	alert.informativeText = Q2NSString(str);
+	[alert runModal];
 
 	}
 }
@@ -275,7 +282,6 @@ void objc_outputDebugString(const QString &str) {
 }
 
 void objc_start() {
-#if QT_VERSION >= QT_VERSION_CHECK(5, 9, 0)
 	// Patch: Fix macOS regression. On 10.14.4, it crashes on GPU switches.
 	// See https://bugreports.qt.io/browse/QTCREATORBUG-22215
 	const auto version = QOperatingSystemVersion::current();
@@ -284,13 +290,28 @@ void objc_start() {
 		&& version.microVersion() == 4) {
 		qputenv("QT_MAC_PRO_WEBENGINE_WORKAROUND", "1");
 	}
-#endif // Qt 5.9.0
 
 	_sharedDelegate = [[ApplicationDelegate alloc] init];
 	[[NSApplication sharedApplication] setDelegate:_sharedDelegate];
-	[[[NSWorkspace sharedWorkspace] notificationCenter] addObserver: _sharedDelegate
-														   selector: @selector(receiveWakeNote:)
-															   name: NSWorkspaceDidWakeNotification object: NULL];
+	[[[NSWorkspace sharedWorkspace] notificationCenter]
+		addObserver: _sharedDelegate
+		selector: @selector(receiveWakeNote:)
+		name: NSWorkspaceDidWakeNotification object: NULL];
+	[[[NSWorkspace sharedWorkspace] notificationCenter]
+		addObserver: _sharedDelegate
+		selector: @selector(receiveSleepNote:)
+		name: NSWorkspaceWillSleepNotification object: NULL];
+	_hiddenObserver = [[ApplicationHiddenObserver alloc] init];
+	[[NSNotificationCenter defaultCenter]
+		addObserver: _hiddenObserver
+		selector: @selector(receiveHideNote:)
+		name: NSApplicationDidHideNotification object: NSApp];
+	[[NSNotificationCenter defaultCenter]
+		addObserver: _hiddenObserver
+		selector: @selector(receiveUnhideNote:)
+		name: NSApplicationDidUnhideNotification object: NSApp];
+
+	crl::on_main([=] { SetupDockMenu(); });
 }
 
 void objc_ignoreApplicationActivationRightNow() {
@@ -304,6 +325,16 @@ namespace {
 }
 
 void objc_finish() {
+	if (_hiddenObserver) {
+		[[NSNotificationCenter defaultCenter]
+			removeObserver: _hiddenObserver
+			name: NSApplicationDidHideNotification object: NSApp];
+		[[NSNotificationCenter defaultCenter]
+			removeObserver: _hiddenObserver
+			name: NSApplicationDidUnhideNotification object: NSApp];
+		[_hiddenObserver release];
+		_hiddenObserver = nil;
+	}
 	[_sharedDelegate release];
 	_sharedDelegate = nil;
 	if (_downloadPathUrl) {

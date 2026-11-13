@@ -9,15 +9,24 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 #include "dialogs/dialogs_key.h"
 #include "dialogs/dialogs_indexed_list.h"
+#include "base/options.h"
+#include "base/unixtime.h"
 #include "data/data_changes.h"
 #include "data/data_session.h"
 #include "data/data_folder.h"
+#include "data/data_forum_topic.h"
 #include "data/data_chat_filters.h"
+#include "data/data_saved_sublist.h"
+#include "core/application.h"
+#include "core/core_settings.h"
 #include "mainwidget.h"
 #include "main/main_session.h"
 #include "main/main_session_settings.h"
-#include "history/history_item.h"
+#include "ui/text/format_values.h"
+#include "ui/text/text_options.h"
+#include "ui/ui_utility.h"
 #include "history/history.h"
+#include "history/history_item.h"
 #include "styles/style_dialogs.h" // st::dialogsTextWidthMin
 
 namespace Dialogs {
@@ -40,13 +49,66 @@ uint64 PinnedDialogPos(int pinnedIndex) {
 	return 0xFFFFFFFF000000FFULL - pinnedIndex;
 }
 
+uint64 UnreadOnTopDialogPos(uint64 sortKeyByDate) {
+	return sortKeyByDate | 0x8000000000000000ULL;
+}
+
+base::options::toggle OptionUnreadOnTop({
+	.id = kOptionDialogsUnreadOnTop,
+	.name = "Keep unmuted unread chats on top",
+	.description = "Sort chats with new unmuted messages right below the "
+		"pinned ones and keep them there until you read them.",
+});
+
 } // namespace
 
-Entry::Entry(not_null<Data::Session*> owner, Type type)
-: lastItemTextCache(st::dialogsTextWidthMin)
-, _owner(owner)
-, _isFolder(type == Type::Folder) {
+const char kOptionDialogsUnreadOnTop[] = "dialogs-unread-on-top";
+
+BadgesState BadgesForUnread(
+		const UnreadState &state,
+		CountInBadge count,
+		IncludeInBadge include) {
+	const auto countMessages = (count == CountInBadge::Messages)
+		|| ((count == CountInBadge::Default)
+			&& Core::App().settings().countUnreadMessages());
+	const auto counterFull = state.marks
+		+ (countMessages ? state.messages : state.chats);
+	const auto counterMuted = state.marksMuted
+		+ (countMessages ? state.messagesMuted : state.chatsMuted);
+	const auto unreadMuted = (counterFull <= counterMuted);
+
+	const auto includeMuted = (include == IncludeInBadge::All)
+		|| (include == IncludeInBadge::UnmutedOrAll && unreadMuted)
+		|| ((include == IncludeInBadge::Default)
+			&& Core::App().settings().includeMutedCounter());
+
+	const auto marks = state.marks - (includeMuted ? 0 : state.marksMuted);
+	const auto counter = counterFull - (includeMuted ? 0 : counterMuted);
+	const auto mark = (counter == 1) && (marks == 1);
+	return {
+		.unreadCounter = mark ? 0 : counter,
+		.unread = (counter > 0),
+		.unreadMuted = includeMuted && (counter <= counterMuted),
+		.mention = (state.mentions > 0),
+		.reaction = (state.reactions > 0),
+		.reactionMuted = (state.reactions <= state.reactionsMuted),
+		.poll = (state.polls > 0),
+		.pollMuted = (state.polls <= state.pollsMuted),
+	};
 }
+
+Entry::Entry(not_null<Data::Session*> owner, Type type)
+: _owner(owner)
+, _flags((type == Type::History)
+	? (Flag::IsThread | Flag::IsHistory)
+	: (type == Type::ForumTopic)
+	? (Flag::IsThread | Flag::IsForumTopic)
+	: (type == Type::SavedSublist)
+	? (Flag::IsThread | Flag::IsSavedSublist)
+	: Flag(0)) {
+}
+
+Entry::~Entry() = default;
 
 Data::Session &Entry::owner() const {
 	return *_owner;
@@ -57,15 +119,67 @@ Main::Session &Entry::session() const {
 }
 
 History *Entry::asHistory() {
-	return _isFolder ? nullptr : static_cast<History*>(this);
+	return (_flags & Flag::IsHistory)
+		? static_cast<History*>(this)
+		: nullptr;
+}
+
+Data::Forum *Entry::asForum() {
+	return (_flags & Flag::IsHistory)
+		? static_cast<History*>(this)->peer->forum()
+		: nullptr;
 }
 
 Data::Folder *Entry::asFolder() {
-	return _isFolder ? static_cast<Data::Folder*>(this) : nullptr;
+	return (_flags & Flag::IsThread)
+		? nullptr
+		: static_cast<Data::Folder*>(this);
 }
 
-void Entry::pinnedIndexChanged(int was, int now) {
-	if (session().supportMode()) {
+Data::Thread *Entry::asThread() {
+	return (_flags & Flag::IsThread)
+		? static_cast<Data::Thread*>(this)
+		: nullptr;
+}
+
+Data::ForumTopic *Entry::asTopic() {
+	return (_flags & Flag::IsForumTopic)
+		? static_cast<Data::ForumTopic*>(this)
+		: nullptr;
+}
+
+Data::SavedSublist *Entry::asSublist() {
+	return (_flags & Flag::IsSavedSublist)
+		? static_cast<Data::SavedSublist*>(this)
+		: nullptr;
+}
+
+const History *Entry::asHistory() const {
+	return const_cast<Entry*>(this)->asHistory();
+}
+
+const Data::Forum *Entry::asForum() const {
+	return const_cast<Entry*>(this)->asForum();
+}
+
+const Data::Folder *Entry::asFolder() const {
+	return const_cast<Entry*>(this)->asFolder();
+}
+
+const Data::Thread *Entry::asThread() const {
+	return const_cast<Entry*>(this)->asThread();
+}
+
+const Data::ForumTopic *Entry::asTopic() const {
+	return const_cast<Entry*>(this)->asTopic();
+}
+
+const Data::SavedSublist *Entry::asSublist() const {
+	return const_cast<Entry*>(this)->asSublist();
+}
+
+void Entry::pinnedIndexChanged(FilterId filterId, int was, int now) {
+	if (!filterId && session().supportMode()) {
 		// Force reorder in support mode.
 		_sortKeyInChatList = 0;
 	}
@@ -84,31 +198,12 @@ void Entry::cachePinnedIndex(FilterId filterId, int index) {
 	}
 	if (!index) {
 		_pinnedIndex.erase(i);
-		pinnedIndexChanged(was, index);
+	} else if (!was) {
+		_pinnedIndex.emplace(filterId, index);
 	} else {
-		if (!was) {
-			_pinnedIndex.emplace(filterId, index);
-		} else {
-			i->second = index;
-		}
-		pinnedIndexChanged(was, index);
+		i->second = index;
 	}
-}
-
-void Entry::cacheTopPromoted(bool promoted) {
-	if (_isTopPromoted == promoted) {
-		return;
-	}
-	_isTopPromoted = promoted;
-	updateChatListSortPosition();
-	updateChatListEntry();
-	if (!_isTopPromoted) {
-		updateChatListExistence();
-	}
-}
-
-bool Entry::isTopPromoted() const {
-	return _isTopPromoted;
+	pinnedIndexChanged(filterId, was, index);
 }
 
 bool Entry::needUpdateInChatList() const {
@@ -122,7 +217,11 @@ void Entry::updateChatListSortPosition() {
 		updateChatListEntry();
 		return;
 	}
-	_sortKeyByDate = DialogPosFromDate(adjustedChatListTimeId());
+	const auto sortKeyByDate = DialogPosFromDate(adjustedChatListTimeId());
+	_sortKeyByDate = (owner().dialogsUnreadOnTop()
+		&& hasUnreadUnmutedForSort())
+		? UnreadOnTopDialogPos(sortKeyByDate)
+		: sortKeyByDate;
 	const auto fixedIndex = fixedOnTopIndex();
 	_sortKeyInChatList = fixedIndex
 		? FixedOnTopDialogPos(fixedIndex)
@@ -151,7 +250,22 @@ uint64 Entry::computeSortPosition(FilterId filterId) const {
 	return index ? PinnedDialogPos(index) : _sortKeyByDate;
 }
 
+bool Entry::hasUnreadUnmutedForSort() const {
+	const auto state = chatListUnreadState();
+	return (state.messages > state.messagesMuted)
+		|| (state.marks > state.marksMuted)
+		|| (state.reactions > state.reactionsMuted)
+		|| (state.mentions > 0);
+}
+
 void Entry::updateChatListExistence() {
+	if (const auto history = asHistory()) {
+		if (history->peer->asMonoforum()) {
+			if (!folderKnown()) {
+				history->clearFolder();
+			}
+		}
+	}
 	setChatListExistence(shouldBeInChatList());
 }
 
@@ -160,11 +274,97 @@ void Entry::notifyUnreadStateChange(const UnreadState &wasState) {
 	Expects(inChatList());
 
 	const auto nowState = chatListUnreadState();
-	owner().chatsList(folder())->unreadStateChanged(wasState, nowState);
+	owner().chatsListFor(this)->unreadStateChanged(wasState, nowState);
 	auto &filters = owner().chatsFilters();
 	for (const auto &[filterId, links] : _chatListLinks) {
-		filters.chatsList(filterId)->unreadStateChanged(wasState, nowState);
+		if (filterId) {
+			filters.chatsList(filterId)->unreadStateChanged(
+				wasState,
+				nowState);
+		}
 	}
+	if (const auto history = asHistory()) {
+		session().changes().historyUpdated(
+			history,
+			Data::HistoryUpdate::Flag::UnreadView);
+		const auto isForFilters = [](UnreadState state) {
+			return state.messages || state.marks || state.mentions;
+		};
+		if (isForFilters(wasState) != isForFilters(nowState)) {
+			const auto wasTags = _tagColors.size();
+			owner().chatsFilters().refreshHistory(history);
+
+			// Hack for History::fakeUnreadWhileOpened().
+			if (!isForFilters(nowState)
+				&& (wasTags > 0)
+				&& (wasTags == _tagColors.size())) {
+				auto updateRequested = false;
+				for (const auto &filter : filters.list()) {
+					if (!(filter.flags() & Data::ChatFilter::Flag::NoRead)
+						|| !_chatListLinks.contains(filter.id())
+						|| filter.contains(history, true)) {
+						continue;
+					}
+					const auto wasTagsCount = _tagColors.size();
+					setColorIndexForFilterId(filter.id(), std::nullopt);
+					updateRequested |= (wasTagsCount != _tagColors.size());
+				}
+				if (updateRequested) {
+					updateChatListEntryHeight();
+					session().changes().peerUpdated(
+						history->peer,
+						Data::PeerUpdate::Flag::Name);
+				}
+			}
+		}
+	} else if (const auto sublist = asSublist()) {
+		session().changes().sublistUpdated(
+			sublist,
+			Data::SublistUpdate::Flag::UnreadView);
+	}
+	if (owner().dialogsUnreadOnTop()) {
+		updateChatListSortPosition();
+	}
+	updateChatListEntryPostponed();
+}
+
+const Ui::Text::String &Entry::chatListNameText() const {
+	const auto version = chatListNameVersion();
+	if (_chatListNameVersion < version) {
+		_chatListNameVersion = version;
+		_chatListNameText.setText(
+			st::semiboldTextStyle,
+			chatListName(),
+			Ui::NameTextOptions());
+	}
+	return _chatListNameText;
+}
+
+DateText ResolveDateText(
+		DateTextCache &cache,
+		TimeId date,
+		crl::time now) {
+	static crl::time LastNow = 0;
+	static int LastTodaySerial = 0;
+	if (!now || LastNow != now) {
+		LastNow = now;
+		LastTodaySerial = int(QDate::currentDate().toJulianDay());
+	}
+	if (cache.messageTimeId != date
+		|| cache.todaySerial != LastTodaySerial) {
+		const auto qdt = base::unixtime::parse(date);
+		cache.text = Ui::FormatDialogsDate(qdt);
+		cache.width = st::dialogsDateFont->width(cache.text);
+		cache.messageTimeId = date;
+		cache.todaySerial = LastTodaySerial;
+	}
+	return { cache.text, cache.width };
+}
+
+DateText Entry::chatListTimestampText(
+		TimeId date,
+		crl::time now) const {
+	return ResolveDateText(_chatListDateCache, date, now);
 }
 
 void Entry::setChatListExistence(bool exists) {
@@ -193,12 +393,6 @@ const RowsByLetter *Entry::chatListLinks(FilterId filterId) const {
 	return (i != end(_chatListLinks)) ? &i->second : nullptr;
 }
 
-not_null<Row*> Entry::mainChatListLink(FilterId filterId) const {
-	const auto links = chatListLinks(filterId);
-	Assert(links != nullptr);
-	return links->main;
-}
-
 Row *Entry::maybeMainChatListLink(FilterId filterId) const {
 	const auto links = chatListLinks(filterId);
 	return links ? links->main.get() : nullptr;
@@ -209,27 +403,48 @@ PositionChange Entry::adjustByPosInChatList(
 		not_null<MainList*> list) {
 	const auto links = chatListLinks(filterId);
 	Assert(links != nullptr);
-	const auto from = links->main->pos();
+	const auto from = links->main->top();
 	list->indexed()->adjustByDate(*links);
-	const auto to = links->main->pos();
-	return { from, to };
+	const auto to = links->main->top();
+	return { .from = from, .to = to, .height = links->main->height() };
 }
 
 void Entry::setChatListTimeId(TimeId date) {
-	_timeId = date;
+	const auto was = std::exchange(_timeId, date);
 	updateChatListSortPosition();
 	if (const auto folder = this->folder()) {
 		folder->updateChatListSortPosition();
 	}
+	if (was != date) {
+		if (const auto history = asHistory()) {
+			history->communityChatsListDateChanged(was);
+		}
+	}
 }
 
-int Entry::posInChatList(FilterId filterId) const {
-	return mainChatListLink(filterId)->pos();
+void Entry::setColorIndexForFilterId(
+		FilterId filterId,
+		std::optional<uint8> colorIndex) {
+	if (!filterId) {
+		return;
+	}
+	if (colorIndex) {
+		_tagColors[filterId] = *colorIndex;
+	} else {
+		_tagColors.remove(filterId);
+	}
 }
 
 not_null<Row*> Entry::addToChatList(
 		FilterId filterId,
 		not_null<MainList*> list) {
+	if (filterId) {
+		const auto &list = owner().chatsFilters().list();
+		const auto it = ranges::find(list, filterId, &Data::ChatFilter::id);
+		if (it != end(list)) {
+			setColorIndexForFilterId(filterId, it->colorIndex());
+		}
+	}
 	if (const auto main = maybeMainChatListLink(filterId)) {
 		return main;
 	}
@@ -243,7 +458,14 @@ void Entry::removeFromChatList(
 		FilterId filterId,
 		not_null<MainList*> list) {
 	if (isPinnedDialog(filterId)) {
-		owner().setChatPinned(this, filterId, false);
+		list->pinned()->setPinned(this, false);
+		owner().notifyPinnedDialogsOrderUpdated();
+	}
+	if (filterId) {
+		const auto it = _tagColors.find(filterId);
+		if (it != end(_tagColors)) {
+			_tagColors.erase(it);
+		}
 	}
 
 	const auto i = _chatListLinks.find(filterId);
@@ -272,7 +494,38 @@ void Entry::addChatListEntryByLetter(
 }
 
 void Entry::updateChatListEntry() {
+	_flags &= ~Flag::UpdatePostponed;
 	session().changes().entryUpdated(this, Data::EntryUpdate::Flag::Repaint);
+}
+
+void Entry::updateChatListEntryPostponed() {
+	if (_flags & Flag::UpdatePostponed) {
+		return;
+	}
+	_flags |= Flag::UpdatePostponed;
+	Ui::PostponeCall(this, [=] {
+		if (_flags & Flag::UpdatePostponed) {
+			updateChatListEntry();
+		}
+	});
+}
+
+void Entry::updateChatListEntryHeight() {
+	session().changes().entryUpdated(this, Data::EntryUpdate::Flag::Height);
+}
+
+bool Entry::hasChatsFilterTags(FilterId exclude) const {
+	if (!owner().chatsFilters().tagsEnabled()) {
+		return false;
+	}
+	if (exclude) {
+		if (_tagColors.size() == 1) {
+			if (_tagColors.begin()->first == exclude) {
+				return false;
+			}
+		}
+	}
+	return !_tagColors.empty();
 }
 
 } // namespace Dialogs

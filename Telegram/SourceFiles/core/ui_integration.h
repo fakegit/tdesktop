@@ -19,7 +19,7 @@ class ElementDelegate;
 
 namespace Core {
 
-struct MarkedTextContext {
+struct TextContextDetails {
 	enum class HashtagMentionType : uchar {
 		Telegram,
 		Twitter,
@@ -30,6 +30,14 @@ struct MarkedTextContext {
 	HashtagMentionType type = HashtagMentionType::Telegram;
 };
 
+struct TextContextArgs {
+	not_null<Main::Session*> session;
+	TextContextDetails details;
+	Fn<void()> repaint;
+	int customEmojiLoopLimit = 0;
+};
+[[nodiscard]] Ui::Text::MarkedContext TextContext(TextContextArgs &&args);
+
 class UiIntegration final : public Ui::Integration {
 public:
 	void postponeCall(FnMut<void()> &&callable) override;
@@ -37,23 +45,25 @@ public:
 	void unregisterLeaveSubscription(not_null<QWidget*> widget) override;
 
 	QString emojiCacheFolder() override;
+	QString fontsCacheFolder() override;
 	QString openglCheckFilePath() override;
 	QString angleBackendFilePath() override;
 
 	void textActionsUpdated() override;
 	void activationFromTopPanel() override;
+	void touchCounterIncrement() override;
+	int touchCounterNow() override;
 
 	bool screenIsLocked() override;
-	QString timeFormat() override;
 
 	std::shared_ptr<ClickHandler> createLinkHandler(
 		const EntityLinkData &data,
-		const std::any &context) override;
+		const Ui::Text::MarkedContext &context) override;
 	bool handleUrlClick(
 		const QString &url,
 		const QVariant &context) override;
+	bool copyPreOnClick(const QVariant &context) override;
 	rpl::producer<> forcePopupMenuHideRequests() override;
-	QString convertTagToMimeTag(const QString &tagId) override;
 	const Ui::Emoji::One *defaultEmojiVariant(
 		const Ui::Emoji::One *emoji) override;
 
@@ -69,7 +79,29 @@ public:
 	QString phraseFormattingItalic() override;
 	QString phraseFormattingUnderline() override;
 	QString phraseFormattingStrikeOut() override;
+	QString phraseFormattingBlockquote() override;
 	QString phraseFormattingMonospace() override;
+	QString phraseFormattingSpoiler() override;
+	QString phraseFormattingDate() override;
+	QString phraseButtonOk() override;
+	QString phraseButtonClose() override;
+	QString phraseButtonCancel() override;
+	QString phrasePanelCloseWarning() override;
+	QString phrasePanelCloseUnsaved() override;
+	QString phrasePanelCloseAnyway() override;
+	QString phraseBotSharePhone() override;
+	QString phraseBotSharePhoneTitle() override;
+	QString phraseBotSharePhoneConfirm() override;
+	QString phraseBotAllowWrite() override;
+	QString phraseBotAllowWriteTitle() override;
+	QString phraseBotAllowWriteConfirm() override;
+	QString phraseQuoteHeaderCopy() override;
+	QString phraseMinimize() override;
+	QString phraseMaximize() override;
+	QString phraseRestore() override;
+
+private:
+	int _touchCounter = 0;
 
 };
 

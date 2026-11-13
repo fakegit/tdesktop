@@ -103,11 +103,6 @@ bool CanRequireSelfie(Value::Type type) {
 		|| (scope == Scope::Type::Identity);
 }
 
-bool CanRequireScans(Value::Type type) {
-	const auto scope = ScopeTypeForValueType(type);
-	return (scope == Scope::Type::Address);
-}
-
 bool CanRequireTranslation(Value::Type type) {
 	const auto scope = ScopeTypeForValueType(type);
 	return (scope == Scope::Type::Address)
@@ -377,7 +372,8 @@ QString ComputeScopeRowReadyString(const Scope &scope) {
 		const auto scheme = GetDocumentScheme(
 			scope.type,
 			document ? base::make_optional(document->type) : std::nullopt,
-			scope.details ? scope.details->nativeNames : false);
+			scope.details ? scope.details->nativeNames : false,
+			nullptr);
 		using ValueClass = EditDocumentScheme::ValueClass;
 		const auto skipAdditional = [&] {
 			if (!fields) {

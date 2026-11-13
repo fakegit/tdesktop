@@ -17,13 +17,13 @@ class SendActionPainter;
 
 namespace Data {
 
+class Thread;
+
 class SendActionManager final {
 public:
 	struct AnimationUpdate {
-		not_null<History*> history;
-		int left = 0;
-		int width = 0;
-		int height = 0;
+		not_null<Thread*> thread;
+		QRect rect;
 		bool textUpdated = false;
 	};
 	explicit SendActionManager();

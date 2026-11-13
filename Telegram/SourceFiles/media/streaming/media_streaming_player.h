@@ -48,7 +48,8 @@ public:
 	[[nodiscard]] bool ready() const;
 
 	[[nodiscard]] float64 speed() const;
-	void setSpeed(float64 speed); // 0.5 <= speed <= 2.
+	void setSpeed(float64 speed);
+	void setVolume(float64 volume);
 	void setWaitForMarkAsShown(bool wait);
 
 	[[nodiscard]] bool playing() const;
@@ -60,11 +61,14 @@ public:
 	[[nodiscard]] rpl::producer<Update, Error> updates() const;
 	[[nodiscard]] rpl::producer<bool> fullInCache() const;
 
+	[[nodiscard]] int64 fileSize() const;
 	[[nodiscard]] QSize videoSize() const;
 	[[nodiscard]] QImage frame(
 		const FrameRequest &request,
 		const Instance *instance = nullptr) const;
-
+	[[nodiscard]] FrameWithInfo frameWithInfo(
+		const FrameRequest &request,
+		const Instance *instance = nullptr) const;
 	[[nodiscard]] FrameWithInfo frameWithInfo(
 		const Instance *instance = nullptr) const; // !requireARGB32
 
@@ -97,6 +101,7 @@ private:
 	not_null<FileDelegate*> delegate();
 
 	// FileDelegate methods are called only from the File thread.
+	Mode fileOpenMode() override;
 	bool fileReady(int headerSize, Stream &&video, Stream &&audio) override;
 	void fileError(Error error) override;
 	void fileWaitingForData() override;
@@ -171,8 +176,8 @@ private:
 	// Immutable while File is active.
 	base::has_weak_ptr _sessionGuard;
 
-	// Immutable while File is active except '.speed'.
-	// '.speed' is changed from the main thread.
+	// Immutable while File is active except '.speed' and '.volume'.
+	// '.speed' and '.volume' are changed from the main thread.
 	PlaybackOptions _options;
 
 	// Belongs to the File thread while File is active.

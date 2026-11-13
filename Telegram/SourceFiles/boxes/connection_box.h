@@ -9,11 +9,12 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 #include "base/timer.h"
 #include "base/object_ptr.h"
-#include "core/core_settings.h"
+#include "core/core_settings_proxy.h"
 #include "mtproto/connection_abstract.h"
 #include "mtproto/mtproto_proxy_data.h"
 
 namespace Ui {
+class Show;
 class BoxContent;
 class InputField;
 class PortInput;
@@ -29,6 +30,10 @@ namespace Main {
 class Account;
 } // namespace Main
 
+namespace Window {
+class SessionController;
+} // namespace Window
+
 class ProxiesBoxController {
 public:
 	using ProxyData = MTP::ProxyData;
@@ -37,19 +42,28 @@ public:
 	explicit ProxiesBoxController(not_null<Main::Account*> account);
 
 	static void ShowApplyConfirmation(
+		Window::SessionController *controller,
 		Type type,
 		const QMap<QString, QString> &fields);
 
+	[[nodiscard]] static ProxyData ProxyFromLink(const QString &link);
+
 	static object_ptr<Ui::BoxContent> CreateOwningBox(
-		not_null<Main::Account*> account);
-	object_ptr<Ui::BoxContent> create();
+		not_null<Main::Account*> account,
+		const QString &highlightId = QString());
+	static void Show(
+		not_null<Window::SessionController*> controller,
+		const QString &highlightId = QString());
+	object_ptr<Ui::BoxContent> create(const QString &highlightId = QString());
 
 	enum class ItemState {
 		Connecting,
 		Online,
 		Checking,
+		NotTested,
 		Available,
-		Unavailable
+		Unavailable,
+		WaitingForBrowser,
 	};
 	struct ItemView {
 		int id = 0;
@@ -60,23 +74,35 @@ public:
 		bool selected = false;
 		bool deleted = false;
 		bool supportsShare = false;
-		bool supportsCalls = false;
+		bool web = false;
+		bool canOpenBrowser = false;
 		ItemState state = ItemState::Checking;
 
 	};
 
 	void deleteItem(int id);
+	void deleteItems();
+	void deleteItems(const base::flat_set<int> &ids);
 	void restoreItem(int id);
-	void shareItem(int id);
+	void shareItem(int id, bool qr);
+	void shareItems();
+	void shareItems(const base::flat_set<int> &ids);
 	void applyItem(int id);
+	void openBrowser(int id);
 	object_ptr<Ui::BoxContent> editItemBox(int id);
 	object_ptr<Ui::BoxContent> addNewItemBox();
 	bool setProxySettings(ProxyData::Settings value);
-	void setProxyForCalls(bool enabled);
+	void setProxyRotationEnabled(bool enabled);
+	void setProxyRotationTimeout(int value);
 	void setTryIPv6(bool enabled);
 	rpl::producer<ProxyData::Settings> proxySettingsValue() const;
 
+	[[nodiscard]] bool contains(const ProxyData &proxy) const;
+	void addNewItem(const ProxyData &proxy);
+
 	rpl::producer<ItemView> views() const;
+
+	rpl::producer<bool> listShareableChanges() const;
 
 	~ProxiesBoxController();
 
@@ -97,10 +123,9 @@ private:
 	std::vector<Item>::iterator findByProxy(const ProxyData &proxy);
 	void setDeleted(int id, bool deleted);
 	void updateView(const Item &item);
-	void share(const ProxyData &proxy);
+	void share(const ProxyData &proxy, bool qr = false);
 	void saveDelayed();
 	void refreshChecker(Item &item);
-	void setupChecker(int id, const Checker &checker);
 
 	void replaceItemWith(
 		std::vector<Item>::iterator which,
@@ -108,7 +133,6 @@ private:
 	void replaceItemValue(
 		std::vector<Item>::iterator which,
 		const ProxyData &proxy);
-	void addNewItem(const ProxyData &proxy);
 
 	const not_null<Main::Account*> _account;
 	Core::SettingsProxy &_settings;
@@ -117,6 +141,7 @@ private:
 	rpl::event_stream<ItemView> _views;
 	base::Timer _saveTimer;
 	rpl::event_stream<ProxyData::Settings> _proxySettingsChanges;
+	std::shared_ptr<Ui::Show> _show;
 
 	ProxyData _lastSelectedProxy;
 	bool _lastSelectedProxyUsed = false;

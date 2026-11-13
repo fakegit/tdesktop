@@ -7,118 +7,128 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "platform/linux/file_utilities_linux.h"
 
-#ifndef DESKTOP_APP_DISABLE_DBUS_INTEGRATION
-#include "platform/linux/linux_xdp_file_dialog.h"
-#include "platform/linux/linux_xdp_open_with_dialog.h"
-#endif // !DESKTOP_APP_DISABLE_DBUS_INTEGRATION
+#include "base/platform/base_platform_info.h"
+#include "base/platform/linux/base_linux_xdp_utilities.h"
+#include "base/platform/linux/base_linux_xdg_activation_token.h"
+#include "base/random.h"
 
-#include <QtCore/QProcess>
-#include <QtGui/QDesktopServices>
-
-#ifndef DESKTOP_APP_DISABLE_DBUS_INTEGRATION
-#include <glibmm.h>
-#include <giomm.h>
-#endif // !DESKTOP_APP_DISABLE_DBUS_INTEGRATION
+#include <fcntl.h>
+#include <xdpopenuri/xdpopenuri.hpp>
+#include <xdprequest/xdprequest.hpp>
 
 namespace Platform {
 namespace File {
+namespace {
 
-void UnsafeOpenUrl(const QString &url) {
-#ifndef DESKTOP_APP_DISABLE_DBUS_INTEGRATION
-	try {
-		if (Gio::AppInfo::launch_default_for_uri(url.toStdString())) {
-			return;
-		}
-	} catch (const Glib::Error &e) {
-		LOG(("App Error: %1").arg(QString::fromStdString(e.what())));
-	}
-#endif // !DESKTOP_APP_DISABLE_DBUS_INTEGRATION
+using namespace gi::repository;
+using base::Platform::XdgActivationToken;
 
-	if (QDesktopServices::openUrl(url)) {
-		return;
-	}
+} // namespace
 
-	QProcess::startDetached(qsl("xdg-open"), { url });
-}
-
-void UnsafeOpenEmailLink(const QString &email) {
-	UnsafeOpenUrl(qstr("mailto:") + email);
-}
+namespace Unfused {
 
 bool UnsafeShowOpenWith(const QString &filepath) {
-#ifndef DESKTOP_APP_DISABLE_DBUS_INTEGRATION
-	if (internal::ShowXDPOpenWithDialog(filepath)) {
-		return true;
-	}
-#endif // !DESKTOP_APP_DISABLE_DBUS_INTEGRATION
+	auto proxy = XdpOpenURI::OpenURIProxy::new_for_bus_sync(
+		Gio::BusType::SESSION_,
+		Gio::DBusProxyFlags::NONE_,
+		base::Platform::XDP::kService,
+		base::Platform::XDP::kObjectPath,
+		nullptr);
 
-	return false;
+	if (!proxy) {
+		return false;
+	}
+
+	auto interface = XdpOpenURI::OpenURI(proxy);
+	if (interface.get_version() < 3) {
+		return false;
+	}
+
+	const auto fd = open(
+		QFile::encodeName(filepath).constData(),
+		O_RDONLY | O_CLOEXEC);
+
+	if (fd == -1) {
+		return false;
+	}
+
+	const auto handleToken = "tdesktop"
+		+ std::to_string(base::RandomValue<uint>());
+
+	std::string uniqueName = proxy.get_connection().get_unique_name();
+	uniqueName.erase(0, 1);
+	uniqueName.replace(uniqueName.find('.'), 1, 1, '_');
+
+	auto request = XdpRequest::Request(
+		XdpRequest::RequestProxy::new_sync(
+			proxy.get_connection(),
+			Gio::DBusProxyFlags::NONE_,
+			base::Platform::XDP::kService,
+			base::Platform::XDP::kObjectPath
+				+ std::string("/request/")
+				+ uniqueName
+				+ '/'
+				+ handleToken,
+			nullptr,
+			nullptr));
+
+	if (!request) {
+		close(fd);
+		return false;
+	}
+
+	auto loop = GLib::MainLoop::new_();
+	auto response = guint(2);
+
+	const auto signalId = request.signal_response().connect([&response, loop](
+			XdpRequest::Request,
+			guint code,
+			GLib::Variant) mutable {
+		response = code;
+		loop.quit();
+	});
+
+	const auto signalGuard = gsl::finally([&] {
+		request.disconnect(signalId);
+	});
+
+	auto result = interface.call_open_file_sync(
+		base::Platform::XDP::ParentWindowID(),
+		GLib::Variant::new_handle(0),
+		GLib::Variant::new_array({
+			GLib::Variant::new_dict_entry(
+				GLib::Variant::new_string("handle_token"),
+				GLib::Variant::new_variant(
+					GLib::Variant::new_string(handleToken))),
+			GLib::Variant::new_dict_entry(
+				GLib::Variant::new_string("activation_token"),
+				GLib::Variant::new_variant(
+					GLib::Variant::new_string(
+						XdgActivationToken().toStdString()))),
+			GLib::Variant::new_dict_entry(
+				GLib::Variant::new_string("ask"),
+				GLib::Variant::new_variant(
+					GLib::Variant::new_boolean(true))),
+		}),
+		Gio::UnixFDList::new_from_array(&fd, 1),
+		nullptr);
+
+	if (!result) {
+		return false;
+	}
+
+	QWidget window;
+	window.setAttribute(Qt::WA_DontShowOnScreen);
+	window.setWindowModality(Qt::ApplicationModal);
+	window.show();
+	loop.run();
+
+	// WHY: OpenURI Response 0 (success) and 1 (user cancelled) both mean a
+	// chooser was shown, so don't fall back; any other Response code means
+	// none appeared and the caller falls back to the launch warning policy.
+	return (response == 0) || (response == 1);
 }
 
-void UnsafeLaunch(const QString &filepath) {
-#ifndef DESKTOP_APP_DISABLE_DBUS_INTEGRATION
-	try {
-		if (Gio::AppInfo::launch_default_for_uri(
-			Glib::filename_to_uri(filepath.toStdString()))) {
-			return;
-		}
-	} catch (const Glib::Error &e) {
-		LOG(("App Error: %1").arg(QString::fromStdString(e.what())));
-	}
-
-	if (UnsafeShowOpenWith(filepath)) {
-		return;
-	}
-#endif // !DESKTOP_APP_DISABLE_DBUS_INTEGRATION
-
-	const auto qUrlPath = QUrl::fromLocalFile(filepath);
-	if (QDesktopServices::openUrl(qUrlPath)) {
-		return;
-	}
-
-	QProcess::startDetached(qsl("xdg-open"), { qUrlPath.toEncoded() });
-}
-
+} // namespace Unfused
 } // namespace File
-
-namespace FileDialog {
-
-bool Get(
-		QPointer<QWidget> parent,
-		QStringList &files,
-		QByteArray &remoteContent,
-		const QString &caption,
-		const QString &filter,
-		::FileDialog::internal::Type type,
-		QString startFile) {
-	if (parent) {
-		parent = parent->window();
-	}
-#ifndef DESKTOP_APP_DISABLE_DBUS_INTEGRATION
-	{
-		const auto result = XDP::Get(
-			parent,
-			files,
-			remoteContent,
-			caption,
-			filter,
-			type,
-			startFile);
-
-		if (result.has_value()) {
-			return *result;
-		}
-	}
-#endif // !DESKTOP_APP_DISABLE_DBUS_INTEGRATION
-	return ::FileDialog::internal::GetDefault(
-		parent,
-		files,
-		remoteContent,
-		caption,
-		filter,
-		type,
-		startFile);
-}
-
-} // namespace FileDialog
 } // namespace Platform

@@ -8,9 +8,8 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "dialogs/dialogs_list.h"
 
 #include "dialogs/dialogs_entry.h"
-#include "dialogs/dialogs_layout.h"
+#include "dialogs/ui/dialogs_layout.h"
 #include "data/data_session.h"
-#include "mainwidget.h"
 
 namespace Dialogs {
 
@@ -21,7 +20,7 @@ List::List(SortMode sortMode, FilterId filterId)
 
 List::const_iterator List::cfind(Row *value) const {
 	return value
-		? (cbegin() + value->pos())
+		? (cbegin() + value->index())
 		: cend();
 }
 
@@ -31,8 +30,9 @@ not_null<Row*> List::addToEnd(Key key) {
 	}
 	const auto result = _rowByKey.emplace(
 		key,
-		std::make_unique<Row>(key, _rows.size())
+		std::make_unique<Row>(key, _rows.size(), height())
 	).first->second.get();
+	result->recountHeight(_narrowRatio, _filterId);
 	_rows.emplace_back(result);
 	if (_sortMode == SortMode::Date) {
 		adjustByDate(result);
@@ -60,10 +60,10 @@ not_null<Row*> List::addByName(Key key) {
 }
 
 void List::adjustByName(not_null<Row*> row) {
-	Expects(row->pos() >= 0 && row->pos() < _rows.size());
+	Expects(row->index() >= 0 && row->index() < _rows.size());
 
 	const auto &key = row->entry()->chatListNameSortKey();
-	const auto index = row->pos();
+	const auto index = row->index();
 	const auto i = _rows.begin() + index;
 	const auto before = std::find_if(i + 1, _rows.end(), [&](Row *row) {
 		return row->entry()->chatListNameSortKey().compare(key) >= 0;
@@ -83,24 +83,119 @@ void List::adjustByName(not_null<Row*> row) {
 
 void List::adjustByDate(not_null<Row*> row) {
 	Expects(_sortMode == SortMode::Date);
+	Expects(row->index() >= 0 && row->index() < _rows.size());
 
-	const auto key = row->sortKey(_filterId);
-	const auto index = row->pos();
-	const auto i = _rows.begin() + index;
-	const auto before = std::find_if(i + 1, _rows.end(), [&](Row *row) {
-		return (row->sortKey(_filterId) <= key);
-	});
-	if (before != i + 1) {
-		rotate(i, i + 1, before);
-	} else {
-		const auto from = std::make_reverse_iterator(i);
-		const auto after = std::find_if(from, _rows.rend(), [&](Row *row) {
-			return (row->sortKey(_filterId) >= key);
-		}).base();
-		if (after != i) {
-			rotate(after, i, i + 1);
+	if (_frozen) {
+		const auto canAdjustWhileFrozen = _pendingAdjust.empty()
+			&& (row->entry()->fixedOnTopIndex()
+				|| row->entry()->isPinnedDialog(_filterId));
+		if (!canAdjustWhileFrozen) {
+			_pendingAdjust.emplace(row);
+			return;
 		}
 	}
+
+	const auto key = row->sortKey(_filterId);
+	const auto index = row->index();
+	const auto i = _rows.begin() + index;
+	if (i + 1 != _rows.end() && (*(i + 1))->sortKey(_filterId) > key) {
+		const auto before = std::lower_bound(
+			i + 2,
+			_rows.end(),
+			key,
+			[&](not_null<Row*> row, uint64 key) {
+				return (row->sortKey(_filterId) > key);
+			});
+		rotate(i, i + 1, before);
+	} else if (i != _rows.begin() && (*(i - 1))->sortKey(_filterId) < key) {
+		const auto after = std::lower_bound(
+			_rows.begin(),
+			i - 1,
+			key,
+			[&](not_null<Row*> row, uint64 key) {
+				return (row->sortKey(_filterId) >= key);
+			});
+		rotate(after, i, i + 1);
+	}
+}
+
+void List::freeze() {
+	_frozen = true;
+}
+
+void List::unfreeze() {
+	_frozen = false;
+	auto pending = base::take(_pendingAdjust);
+	if (pending.empty()) {
+		return;
+	} else if (pending.size() == 1) {
+		adjustByDate(*pending.begin());
+		return;
+	}
+	for (const auto &row : pending) {
+		adjustByDate(row);
+	}
+	if (!sortedByDate()) {
+		sortByDate();
+	}
+}
+
+bool List::sortedByDate() const {
+	Expects(_sortMode == SortMode::Date);
+
+	for (auto i = 1, count = int(_rows.size()); i != count; ++i) {
+		if (_rows[i - 1]->sortKey(_filterId) < _rows[i]->sortKey(_filterId)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+void List::sortByDate() {
+	Expects(_sortMode == SortMode::Date);
+
+	ranges::stable_sort(_rows, [&](Row *a, Row *b) {
+		return a->sortKey(_filterId) > b->sortKey(_filterId);
+	});
+	auto top = 0;
+	for (auto i = 0, count = int(_rows.size()); i != count; ++i) {
+		const auto row = _rows[i];
+		row->_index = i;
+		row->_top = top;
+		top += row->height();
+	}
+}
+
+bool List::updateHeight(Key key, float64 narrowRatio) {
+	const auto i = _rowByKey.find(key);
+	if (i == _rowByKey.cend()) {
+		return false;
+	}
+	const auto row = i->second.get();
+	const auto index = row->index();
+	auto top = row->top();
+	const auto was = row->height();
+	row->recountHeight(narrowRatio, _filterId);
+	if (row->height() == was) {
+		return false;
+	}
+	for (auto i = _rows.begin() + index, e = _rows.end(); i != e; ++i) {
+		(*i)->_top = top;
+		top += (*i)->height();
+	}
+	return true;
+}
+
+bool List::updateHeights(float64 narrowRatio) {
+	_narrowRatio = narrowRatio;
+	auto was = height();
+	auto top = 0;
+	for (const auto &row : _rows) {
+		row->_top = top;
+		row->recountHeight(narrowRatio, _filterId);
+		top += row->height();
+	}
+	return (height() != was);
 }
 
 bool List::moveToTop(Key key) {
@@ -108,7 +203,7 @@ bool List::moveToTop(Key key) {
 	if (i == _rowByKey.cend()) {
 		return false;
 	}
-	const auto index = i->second->pos();
+	const auto index = i->second->index();
 	const auto begin = _rows.begin();
 	rotate(begin, begin + index, begin + index + 1);
 	return true;
@@ -118,31 +213,57 @@ void List::rotate(
 		std::vector<not_null<Row*>>::iterator first,
 		std::vector<not_null<Row*>>::iterator middle,
 		std::vector<not_null<Row*>>::iterator last) {
+	auto top = (*first)->top();
 	std::rotate(first, middle, last);
 
 	auto count = (last - first);
 	auto index = (first - _rows.begin());
 	while (count--) {
-		(*first++)->_pos = index++;
+		const auto row = *first++;
+		row->_index = index++;
+		row->_top = top;
+		top += row->height();
 	}
 }
 
-bool List::del(Key key, Row *replacedBy) {
+bool List::remove(Key key, Row *replacedBy) {
 	auto i = _rowByKey.find(key);
 	if (i == _rowByKey.cend()) {
 		return false;
 	}
 
 	const auto row = i->second.get();
+	_pendingAdjust.remove(row);
 	row->entry()->owner().dialogsRowReplaced({ row, replacedBy });
 
-	const auto index = row->pos();
+	auto top = row->top();
+	const auto index = row->index();
 	_rows.erase(_rows.begin() + index);
 	for (auto i = index, count = int(_rows.size()); i != count; ++i) {
-		_rows[i]->_pos = i;
+		const auto row = _rows[i];
+		row->_index = i;
+		row->_top = top;
+		top += row->height();
 	}
 	_rowByKey.erase(i);
 	return true;
+}
+
+Row *List::rowAtY(int y) const {
+	const auto i = findByY(y);
+	if (i == cend()) {
+		return nullptr;
+	}
+	const auto row = *i;
+	const auto top = row->top();
+	const auto bottom = top + row->height();
+	return (top <= y && bottom > y) ? row.get() : nullptr;
+}
+
+List::iterator List::findByY(int y) const {
+	return ranges::lower_bound(_rows, y, ranges::less(), [](const Row *row) {
+		return row->top() + row->height() - 1;
+	});
 }
 
 } // namespace Dialogs

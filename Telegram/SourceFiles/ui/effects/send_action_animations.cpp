@@ -8,7 +8,9 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "ui/effects/send_action_animations.h"
 
 #include "api/api_send_progress.h"
+#include "base/never_freed_pointer.h"
 #include "ui/effects/animation_value.h"
+#include "ui/painter.h"
 #include "styles/style_widgets.h"
 #include "styles/style_dialogs.h"
 
@@ -18,6 +20,7 @@ namespace {
 constexpr int kTypingDotsCount = 3;
 constexpr int kRecordArcsCount = 4;
 constexpr int kUploadArrowsCount = 3;
+constexpr auto kRoundPeriod = 800;
 constexpr auto kSpeakingDuration = 3200;
 constexpr auto kSpeakingFadeDuration = 400;
 
@@ -38,8 +41,11 @@ public:
 	bool supports(Type type) const;
 
 	virtual int width() const = 0;
+	virtual int widthNoMargins() const {
+		return width();
+	}
 	virtual void paint(
-		Painter &p,
+		QPainter &p,
 		style::color color,
 		int x,
 		int y,
@@ -78,7 +84,7 @@ namespace {
 using ImplementationsMap = QMap<
 	Api::SendProgressType,
 	const SendActionAnimation::Impl::MetaData*>;
-NeverFreedPointer<ImplementationsMap> Implementations;
+base::NeverFreedPointer<ImplementationsMap> Implementations;
 
 class TypingAnimation : public SendActionAnimation::Impl {
 public:
@@ -99,7 +105,7 @@ public:
 	}
 
 	void paint(
-		Painter &p,
+		QPainter &p,
 		style::color color,
 		int x,
 		int y,
@@ -114,7 +120,7 @@ const TypingAnimation::MetaData TypingAnimation::kMeta = {
 };
 
 void TypingAnimation::paint(
-		Painter &p,
+		QPainter &p,
 		style::color color,
 		int x,
 		int y,
@@ -174,7 +180,7 @@ public:
 	}
 
 	void paint(
-		Painter &p,
+		QPainter &p,
 		style::color color,
 		int x,
 		int y,
@@ -189,7 +195,7 @@ const RecordAnimation::MetaData RecordAnimation::kMeta = {
 };
 
 void RecordAnimation::paint(
-		Painter &p,
+		QPainter &p,
 		style::color color,
 		int x,
 		int y,
@@ -208,6 +214,8 @@ void RecordAnimation::paint(
 	auto size = st::historySendActionRecordPosition.x()
 		+ st::historySendActionRecordDelta * progress;
 	y += st::historySendActionRecordPosition.y();
+	constexpr auto kAngleStart = -arc::kFullLength / 24;
+	constexpr auto kAngleSpan = arc::kFullLength / 12;
 	for (auto i = 0; i != kRecordArcsCount; ++i) {
 		p.setOpacity((i == 0)
 			? progress
@@ -215,9 +223,74 @@ void RecordAnimation::paint(
 			? (1. - progress)
 			: 1.);
 		auto rect = QRectF(x - size, y - size, 2 * size, 2 * size);
-		p.drawArc(rect, -FullArcLength / 24, FullArcLength / 12);
+		p.drawArc(rect, kAngleStart, kAngleSpan);
 		size += st::historySendActionRecordDelta;
 	}
+	p.setOpacity(1.);
+}
+
+class RoundAnimation : public SendActionAnimation::Impl {
+public:
+	RoundAnimation() : Impl(kRoundPeriod) {
+	}
+
+	static const MetaData kMeta;
+	static std::unique_ptr<Impl> create() {
+		return std::make_unique<RoundAnimation>();
+	}
+	const MetaData *metaData() const override {
+		return &kMeta;
+	}
+
+	int width() const override {
+		return 2 * st::historySendActionRoundPosition.x()
+			+ 2 * st::historySendActionRoundRadius
+			+ 2 * st::lineWidth;
+	}
+
+	void paint(
+		QPainter &p,
+		style::color color,
+		int x,
+		int y,
+		int outerWidth,
+		crl::time now) override;
+
+};
+
+const RoundAnimation::MetaData RoundAnimation::kMeta = {
+	0,
+	&RoundAnimation::create,
+};
+
+void RoundAnimation::paint(
+		QPainter &p,
+		style::color color,
+		int x,
+		int y,
+		int outerWidth,
+		crl::time now) {
+	auto hq = PainterHighQualityEnabler(p);
+	p.setPen(Qt::NoPen);
+	p.setBrush(color);
+
+	const auto frameMs = frameTime(now);
+	const auto half = period() / 2;
+	const auto progress = anim::Disabled()
+		? 1.
+		: (frameMs < half)
+		? (frameMs / float64(half))
+		: (1. - (frameMs - half) / float64(half));
+
+	constexpr auto kMinOpacity = 55. / 255.;
+	p.setOpacity(kMinOpacity + (1. - kMinOpacity) * progress);
+
+	const auto radius = float64(st::historySendActionRoundRadius);
+	const auto center = QPointF(
+		x + st::historySendActionRoundPosition.x() + radius,
+		y + st::historySendActionRoundPosition.y());
+	p.drawEllipse(center, radius, radius);
+
 	p.setOpacity(1.);
 }
 
@@ -240,7 +313,7 @@ public:
 	}
 
 	void paint(
-		Painter &p,
+		QPainter &p,
 		style::color color,
 		int x,
 		int y,
@@ -255,7 +328,7 @@ const UploadAnimation::MetaData UploadAnimation::kMeta = {
 };
 
 void UploadAnimation::paint(
-		Painter &p,
+		QPainter &p,
 		style::color color,
 		int x,
 		int y,
@@ -323,14 +396,14 @@ public:
 	bool finishNow() override;
 
 	static void PaintIdle(
-		Painter &p,
+		QPainter &p,
 		style::color color,
 		int x,
 		int y,
 		int outerWidth);
 
 	void paint(
-		Painter &p,
+		QPainter &p,
 		style::color color,
 		int x,
 		int y,
@@ -339,7 +412,7 @@ public:
 
 private:
 	static void PaintFrame(
-		Painter &p,
+		QPainter &p,
 		style::color color,
 		int x,
 		int y,
@@ -393,7 +466,7 @@ bool SpeakingAnimation::finishNow() {
 }
 
 void SpeakingAnimation::PaintIdle(
-		Painter &p,
+		QPainter &p,
 		style::color color,
 		int x,
 		int y,
@@ -402,7 +475,7 @@ void SpeakingAnimation::PaintIdle(
 }
 
 void SpeakingAnimation::paint(
-		Painter &p,
+		QPainter &p,
 		style::color color,
 		int x,
 		int y,
@@ -416,7 +489,7 @@ void SpeakingAnimation::paint(
 }
 
 void SpeakingAnimation::PaintFrame(
-		Painter &p,
+		QPainter &p,
 		style::color color,
 		int x,
 		int y,
@@ -520,18 +593,23 @@ public:
 	}
 
 	int width() const override {
+		return widthNoMargins() + _eye.step * 2;
+	}
+
+	int widthNoMargins() const override {
 		return st::historySendActionChooseStickerPosition.x()
 			+ 2 * (_eye.outWidth + _eye.step)
 			+ _eye.step;
 	}
 
 	void paint(
-		Painter &p,
+		QPainter &p,
 		style::color color,
 		int x,
 		int y,
 		int outerWidth,
 		crl::time now) override;
+
 private:
 	const struct {
 		const float64 outWidth;
@@ -555,7 +633,7 @@ const ChooseStickerAnimation::MetaData ChooseStickerAnimation::kMeta = {
 };
 
 void ChooseStickerAnimation::paint(
-		Painter &p,
+		QPainter &p,
 		style::color color,
 		int x,
 		int y,
@@ -628,7 +706,6 @@ void CreateImplementationsMap() {
 	static constexpr auto kRecordTypes = {
 		Type::RecordVideo,
 		Type::RecordVoice,
-		Type::RecordRound,
 	};
 	for (const auto type : kRecordTypes) {
 		Implementations->insert(type, &RecordAnimation::kMeta);
@@ -638,10 +715,16 @@ void CreateImplementationsMap() {
 		Type::UploadPhoto,
 		Type::UploadVideo,
 		Type::UploadVoice,
-		Type::UploadRound,
 	};
 	for (const auto type : kUploadTypes) {
 		Implementations->insert(type, &UploadAnimation::kMeta);
+	}
+	static constexpr auto kRoundTypes = {
+		Type::RecordRound,
+		Type::UploadRound,
+	};
+	for (const auto type : kRoundTypes) {
+		Implementations->insert(type, &RoundAnimation::kMeta);
 	}
 	Implementations->insert(Type::Speaking, &SpeakingAnimation::kMeta);
 	Implementations->insert(
@@ -681,8 +764,12 @@ int SendActionAnimation::width() const {
 	return _impl ? _impl->width() : 0;
 }
 
+int SendActionAnimation::widthNoMargins() const {
+	return _impl ? _impl->widthNoMargins() : 0;
+}
+
 void SendActionAnimation::paint(
-		Painter &p,
+		QPainter &p,
 		style::color color,
 		int x,
 		int y,
@@ -694,7 +781,7 @@ void SendActionAnimation::paint(
 }
 
 void SendActionAnimation::PaintSpeakingIdle(
-		Painter &p,
+		QPainter &p,
 		style::color color,
 		int x,
 		int y,

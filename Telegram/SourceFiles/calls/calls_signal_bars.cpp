@@ -8,6 +8,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "calls/calls_signal_bars.h"
 
 #include "calls/calls_call.h"
+#include "ui/painter.h"
 #include "styles/style_calls.h"
 
 namespace Calls {
@@ -23,13 +24,13 @@ SignalBars::SignalBars(
 		_st.width + (_st.width + _st.skip) * (Call::kSignalBarCount - 1),
 		_st.max);
 	call->signalBarCountValue(
-	) | rpl::start_with_next([=](int count) {
+	) | rpl::on_next([=](int count) {
 		changed(count);
 	}, lifetime());
 }
 
 void SignalBars::paintEvent(QPaintEvent *e) {
-	Painter p(this);
+	auto p = QPainter(this);
 
 	PainterHighQualityEnabler hq(p);
 	p.setPen(Qt::NoPen);

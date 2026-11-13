@@ -21,7 +21,7 @@ class SessionController;
 } // namespace Window
 
 class BotKeyboard
-	: public TWidget
+	: public Ui::RpWidget
 	, public Ui::AbstractTooltipShower
 	, public ClickHandlerHost {
 public:
@@ -29,7 +29,7 @@ public:
 		not_null<Window::SessionController*> controller,
 		QWidget *parent);
 
-	bool moderateKeyActivate(int index);
+	bool moderateKeyActivate(int index, Fn<ClickContext(FullMsgId)> context);
 
 	// With force=true the markup is updated even if it is
 	// already shown for the passed history item.
@@ -41,14 +41,13 @@ public:
 		return _placeholder;
 	}
 
-	void step_selected(crl::time ms, bool timer);
 	void resizeToWidth(int newWidth, int maxOuterHeight) {
 		_maxOuterHeight = maxOuterHeight;
-		return TWidget::resizeToWidth(newWidth);
+		return RpWidget::resizeToWidth(newWidth);
 	}
 
-	[[nodiscard]] bool maximizeSize() const;
 	[[nodiscard]] bool singleUse() const;
+	[[nodiscard]] bool persistent() const;
 
 	[[nodiscard]] FullMsgId forMsgId() const {
 		return _wasForMsgId;
@@ -74,7 +73,7 @@ protected:
 	void mousePressEvent(QMouseEvent *e) override;
 	void mouseMoveEvent(QMouseEvent *e) override;
 	void mouseReleaseEvent(QMouseEvent *e) override;
-	void enterEventHook(QEvent *e) override;
+	void enterEventHook(QEnterEvent *e) override;
 	void leaveEventHook(QEvent *e) override;
 
 private:
@@ -91,6 +90,7 @@ private:
 	bool _maximizeSize = false;
 	bool _singleUse = false;
 	bool _forceReply = false;
+	bool _persistent = false;
 
 	QPoint _lastMousePos;
 	std::unique_ptr<ReplyKeyboard> _impl;

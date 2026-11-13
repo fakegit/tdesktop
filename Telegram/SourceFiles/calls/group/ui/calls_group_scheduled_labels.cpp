@@ -8,12 +8,14 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "calls/group/ui/calls_group_scheduled_labels.h"
 
 #include "ui/rp_widget.h"
+#include "ui/painter.h"
 #include "lang/lang_keys.h"
 #include "base/unixtime.h"
 #include "base/timer_rpl.h"
 #include "styles/style_calls.h"
 
 #include <QtCore/QDateTime>
+#include <QtCore/QLocale>
 
 namespace Calls::Group::Ui {
 
@@ -32,14 +34,15 @@ rpl::producer<QString> StartsWhenText(rpl::producer<TimeId> date) {
 		const auto tillToday = tillTomorrow + kDay;
 		const auto tillAfter = tillToday + kDay;
 
-		const auto time = parsedDate.time().toString(
-			QLocale::system().timeFormat(QLocale::ShortFormat));
+		const auto time = QLocale().toString(
+			parsedDate.time(),
+			QLocale::ShortFormat);
 		auto exact = tr::lng_group_call_starts_short_date(
 			lt_date,
 			rpl::single(langDayOfMonthFull(dateDay.date())),
 			lt_time,
 			rpl::single(time)
-		) | rpl::type_erased();
+		) | rpl::type_erased;
 		auto tomorrow = tr::lng_group_call_starts_short_tomorrow(
 			lt_time,
 			rpl::single(time));
@@ -53,7 +56,7 @@ rpl::producer<QString> StartsWhenText(rpl::producer<TimeId> date) {
 			std::min(tillAfter, kDay) * crl::time(1000)
 		) | rpl::map([=] {
 			return rpl::duplicate(exact);
-		})) | rpl::flatten_latest() | rpl::type_erased();
+		})) | rpl::flatten_latest() | rpl::type_erased;
 
 		auto tomorrowAndAfter = rpl::single(
 			std::move(tomorrow)
@@ -61,7 +64,7 @@ rpl::producer<QString> StartsWhenText(rpl::producer<TimeId> date) {
 			std::min(tillToday, kDay) * crl::time(1000)
 		) | rpl::map([=] {
 			return rpl::duplicate(todayAndAfter);
-		})) | rpl::flatten_latest() | rpl::type_erased();
+		})) | rpl::flatten_latest() | rpl::type_erased;
 
 		auto full = rpl::single(
 			rpl::duplicate(exact)
@@ -69,7 +72,7 @@ rpl::producer<QString> StartsWhenText(rpl::producer<TimeId> date) {
 			tillTomorrow * crl::time(1000)
 		) | rpl::map([=] {
 			return rpl::duplicate(tomorrowAndAfter);
-		})) | rpl::flatten_latest() | rpl::type_erased();
+		})) | rpl::flatten_latest() | rpl::type_erased;
 
 		if (tillTomorrow > 0) {
 			return full;
@@ -96,7 +99,7 @@ object_ptr<Ui::RpWidget> CreateGradientLabel(
 
 	std::move(
 		text
-	) | rpl::start_with_next([=](const QString &text) {
+	) | rpl::on_next([=](const QString &text) {
 		state->path = QPainterPath();
 		const auto &font = st::groupCallCountdownFont;
 		state->path.addText(0, font->ascent, font->f, text);
@@ -113,7 +116,7 @@ object_ptr<Ui::RpWidget> CreateGradientLabel(
 	}, raw->lifetime());
 
 	raw->paintRequest(
-	) | rpl::start_with_next([=] {
+	) | rpl::on_next([=] {
 		auto p = QPainter(raw);
 		auto hq = PainterHighQualityEnabler(p);
 		const auto skip = st::groupCallWidth / 20;

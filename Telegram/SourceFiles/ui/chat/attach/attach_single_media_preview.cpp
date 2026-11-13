@@ -16,48 +16,72 @@ namespace Ui {
 
 SingleMediaPreview *SingleMediaPreview::Create(
 		QWidget *parent,
+		const style::ComposeControls &st,
 		Fn<bool()> gifPaused,
 		const PreparedFile &file,
 		AttachControls::Type type) {
 	auto preview = QImage();
-	bool animated = false;
-	bool animationPreview = false;
+	auto animated = false;
+	auto animationPreview = false;
+	auto hasModifications = false;
 	if (const auto image = std::get_if<PreparedFileInformation::Image>(
 			&file.information->media)) {
 		preview = Editor::ImageModified(image->data, image->modifications);
-		animated = animationPreview = image->animated;
+		animated = image->animated || file.hasAudioEditScene();
+		animationPreview = image->animated;
+		hasModifications = !image->modifications.empty();
 	} else if (const auto video = std::get_if<PreparedFileInformation::Video>(
 			&file.information->media)) {
-		preview = video->thumbnail;
+		preview = file.videoCover
+			? file.videoCover->preview
+			: (video->thumbnail.isNull()
+				|| !video->modifications.geometry)
+			? video->thumbnail
+			: Editor::ImageModified(
+				video->thumbnail,
+				video->modifications.geometry);
 		animated = true;
-		animationPreview = video->isGifv;
+		// The animated preview plays the file itself, which knows nothing
+		// about the crop or the rotation, so show the edited frame instead.
+		animationPreview = video->isGifv && !video->modifications.geometry;
 	}
 	if (preview.isNull()) {
 		return nullptr;
-	} else if (!animated && !ValidateThumbDimensions(
-			preview.width(),
-			preview.height())) {
+	} else if (!animated
+		&& !ValidateThumbDimensions(preview.width(), preview.height())
+		&& !hasModifications) {
 		return nullptr;
 	}
-	return CreateChild<SingleMediaPreview>(
+	const auto result = CreateChild<SingleMediaPreview>(
 		parent,
+		st,
 		std::move(gifPaused),
 		preview,
 		animated,
 		Core::IsMimeSticker(file.information->filemime),
+		file.spoiler,
 		animationPreview ? file.path : QString(),
 		type);
+	result->setModifyAllowed(
+		file.canEditVideo() || file.hasAudioEditScene());
+	result->setCanShowHighQualityBadge(file.canUseHighQualityPhoto());
+	result->setCanShowAnimatedBadge(file.hasAnimatedEditScene()
+		&& !file.hasAudioEditScene());
+	result->setVideoQuality(file.videoQuality());
+	return result;
 }
 
 SingleMediaPreview::SingleMediaPreview(
 	QWidget *parent,
+	const style::ComposeControls &st,
 	Fn<bool()> gifPaused,
 	QImage preview,
 	bool animated,
 	bool sticker,
+	bool spoiler,
 	const QString &animatedPreviewPath,
 	AttachControls::Type type)
-: AbstractSingleMediaPreview(parent, type)
+: AbstractSingleMediaPreview(parent, st, type)
 , _gifPaused(std::move(gifPaused))
 , _sticker(sticker) {
 	Expects(!preview.isNull());
@@ -65,26 +89,24 @@ SingleMediaPreview::SingleMediaPreview(
 
 	preparePreview(preview);
 	prepareAnimatedPreview(animatedPreviewPath, animated);
-	updatePhotoEditorButton();
+	setSpoiler(spoiler);
+}
+
+bool SingleMediaPreview::supportsSpoilers() const {
+	return !_sticker || sendWay().sendImagesAsPhotos();
 }
 
 bool SingleMediaPreview::drawBackground() const {
 	return !_sticker;
 }
 
-bool SingleMediaPreview::tryPaintAnimation(Painter &p) {
+bool SingleMediaPreview::tryPaintAnimation(QPainter &p) {
 	if (_gifPreview && _gifPreview->started()) {
-		auto s = QSize(previewWidth(), previewHeight());
-		auto paused = _gifPaused();
-		auto frame = _gifPreview->current(
-			s.width(),
-			s.height(),
-			s.width(),
-			s.height(),
-			ImageRoundRadius::None,
-			RectPart::None,
-			paused ? 0 : crl::now());
-		p.drawPixmap(previewLeft(), previewTop(), frame);
+		const auto paused = _gifPaused();
+		const auto frame = _gifPreview->current({
+			.frame = QSize(previewWidth(), previewHeight()),
+		}, paused ? 0 : crl::now());
+		p.drawImage(previewLeft(), previewTop(), frame);
 		return true;
 	} else if (_lottiePreview && _lottiePreview->ready()) {
 		const auto frame = _lottiePreview->frame();
@@ -116,7 +138,7 @@ void SingleMediaPreview::prepareAnimatedPreview(
 			Lottie::ReadContent(QByteArray(), animatedPreviewPath),
 			Lottie::FrameRequest{ box });
 		_lottiePreview->updates(
-		) | rpl::start_with_next([=] {
+		) | rpl::on_next([=] {
 			update();
 		}, lifetime());
 	} else if (!animatedPreviewPath.isEmpty()) {
@@ -133,26 +155,21 @@ void SingleMediaPreview::clipCallback(
 		Media::Clip::Notification notification) {
 	using namespace Media::Clip;
 	switch (notification) {
-	case NotificationReinit: {
+	case Notification::Reinit: {
 		if (_gifPreview && _gifPreview->state() == State::Error) {
 			_gifPreview.setBad();
 		}
 
 		if (_gifPreview && _gifPreview->ready() && !_gifPreview->started()) {
-			const auto s = QSize(previewWidth(), previewHeight());
-			_gifPreview->start(
-				s.width(),
-				s.height(),
-				s.width(),
-				s.height(),
-				ImageRoundRadius::None,
-				RectPart::None);
+			_gifPreview->start({
+				.frame = QSize(previewWidth(), previewHeight()),
+			});
 		}
 
 		update();
 	} break;
 
-	case NotificationRepaint: {
+	case Notification::Repaint: {
 		if (_gifPreview && !_gifPreview->currentDisplayed()) {
 			update();
 		}

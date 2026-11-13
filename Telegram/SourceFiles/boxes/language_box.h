@@ -7,35 +7,50 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #pragma once
 
-#include "lang/lang_cloud_manager.h"
-#include "boxes/abstract_box.h"
+#include "ui/layers/box_content.h"
 #include "base/binary_guard.h"
+
+struct LanguageId;
 
 namespace Ui {
 class MultiSelect;
 struct ScrollToRequest;
+class VerticalLayout;
 } // namespace Ui
+
+namespace Window {
+class SessionController;
+} // namespace Window
 
 class LanguageBox : public Ui::BoxContent {
 public:
-	LanguageBox(QWidget*) {
-	}
+	LanguageBox(
+		QWidget*,
+		Window::SessionController *controller,
+		const QString &highlightId = QString());
 
 	void setInnerFocus() override;
 
-	static base::binary_guard Show();
+	[[nodiscard]] static base::binary_guard Show(
+		Window::SessionController *controller,
+		const QString &highlightId = QString());
 
 protected:
 	void prepare() override;
+	void showFinished() override;
 
 	void keyPressEvent(QKeyEvent *e) override;
 
 private:
-	using Languages = Lang::CloudManager::Languages;
+	void setupTop(not_null<Ui::VerticalLayout*> container);
+	[[nodiscard]] int rowsInPage() const;
 
-	not_null<Ui::MultiSelect*> createMultiSelect();
-	int rowsInPage() const;
-
+	Window::SessionController *_controller = nullptr;
+	QString _highlightId;
+	QPointer<Ui::RpWidget> _showButtonToggle;
+	QPointer<Ui::RpWidget> _translateChatsToggle;
+	QPointer<Ui::RpWidget> _doNotTranslateButton;
+	rpl::event_stream<bool> _translateChatTurnOff;
 	Fn<void()> _setInnerFocus;
 	Fn<Ui::ScrollToRequest(int rows)> _jump;
 

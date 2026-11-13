@@ -7,30 +7,64 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #pragma once
 
-#include "boxes/abstract_box.h"
-#include "base/timer.h"
 #include "data/stickers/data_stickers.h"
+#include "ui/layers/box_content.h"
+#include "ui/rect_part.h"
 
-class ConfirmBox;
+namespace Data {
+class StickersSet;
+} // namespace Data
 
-namespace Window {
-class SessionController;
-} // namespace Window
+namespace ChatHelpers {
+class Show;
+} // namespace ChatHelpers
 
-namespace Ui {
-class PlainShadow;
-} // namespace Ui
+class StickerPremiumMark final {
+public:
+	StickerPremiumMark(
+		not_null<Main::Session*> session,
+		const style::icon &lockIcon,
+		RectPart part = RectPart::Bottom);
+
+	void paint(
+		QPainter &p,
+		const QImage &frame,
+		QImage &backCache,
+		QPoint position,
+		QSize singleSize,
+		int outerWidth);
+
+private:
+	void validateLock(const QImage &frame, QImage &backCache);
+	void validateStar();
+
+	const style::icon &_lockIcon;
+	QImage _lockGray;
+	QImage _star;
+	RectPart _part = RectPart::Bottom;
+	bool _premium = false;
+
+	rpl::lifetime _lifetime;
+
+};
 
 class StickerSetBox final : public Ui::BoxContent {
 public:
 	StickerSetBox(
 		QWidget*,
-		not_null<Window::SessionController*> controller,
-		const StickerSetIdentifier &set);
+		std::shared_ptr<ChatHelpers::Show> show,
+		const StickerSetIdentifier &set,
+		Data::StickersType type,
+		DocumentId previewDocumentId = 0);
+	StickerSetBox(
+		QWidget*,
+		std::shared_ptr<ChatHelpers::Show> show,
+		not_null<Data::StickersSet*> set);
 
-	static QPointer<Ui::BoxContent> Show(
-		not_null<Window::SessionController*> controller,
-		not_null<DocumentData*> document);
+	static base::weak_qptr<Ui::BoxContent> Show(
+		std::shared_ptr<ChatHelpers::Show> show,
+		not_null<DocumentData*> document,
+		DocumentId previewDocumentId = 0);
 
 protected:
 	void prepare() override;
@@ -48,10 +82,13 @@ private:
 	void copyStickersLink();
 	void handleError(Error error);
 
-	const not_null<Window::SessionController*> _controller;
+	const std::shared_ptr<ChatHelpers::Show> _show;
+	const not_null<Main::Session*> _session;
 	const StickerSetIdentifier _set;
+	const Data::StickersType _type;
 
 	class Inner;
 	QPointer<Inner> _inner;
+	DocumentId _previewDocumentId = 0;
 
 };

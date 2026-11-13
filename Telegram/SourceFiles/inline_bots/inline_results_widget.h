@@ -9,9 +9,11 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 #include "ui/rp_widget.h"
 #include "ui/abstract_button.h"
+#include "ui/cached_round_corners.h"
 #include "ui/widgets/tooltip.h"
 #include "ui/effects/animations.h"
 #include "ui/effects/panel_animation.h"
+#include "ui/widgets/shadow.h"
 #include "base/timer.h"
 #include "mtproto/sender.h"
 #include "inline_bots/inline_bot_layout_item.h"
@@ -44,7 +46,7 @@ struct ResultSelected;
 } // namespace InlineBots
 
 namespace SendMenu {
-enum class Type;
+struct Details;
 } // namespace SendMenu
 
 namespace InlineBots {
@@ -74,8 +76,7 @@ public:
 	void hideAnimated();
 
 	void setResultSelectedCallback(Fn<void(ResultSelected)> callback);
-	void setSendMenuType(Fn<SendMenu::Type()> &&callback);
-	void setCurrentDialogsEntryState(Dialogs::EntryState state);
+	void setSendMenuDetails(Fn<SendMenu::Details()> &&callback);
 
 	[[nodiscard]] rpl::producer<bool> requesting() const {
 		return _requesting.events();
@@ -85,8 +86,7 @@ protected:
 	void paintEvent(QPaintEvent *e) override;
 
 private:
-	void moveByBottom();
-	void paintContent(Painter &p);
+	void paintContent(QPainter &p);
 
 	style::margins innerPadding() const;
 
@@ -128,7 +128,6 @@ private:
 
 	int _contentMaxHeight = 0;
 	int _contentHeight = 0;
-	bool _horizontal = false;
 
 	int _width = 0;
 	int _height = 0;
@@ -141,9 +140,11 @@ private:
 	QPixmap _cache;
 	Ui::Animations::Simple _a_opacity;
 	bool _inPanelGrab = false;
+	Ui::BoxShadow _shadow;
 
 	object_ptr<Ui::ScrollArea> _scroll;
 	QPointer<Inner> _inner;
+	Ui::CornersPixmaps _innerRounding;
 
 	std::map<QString, std::unique_ptr<CacheEntry>> _inlineCache;
 	base::Timer _inlineRequestTimer;

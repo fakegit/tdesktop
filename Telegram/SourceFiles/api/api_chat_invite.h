@@ -7,72 +7,35 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #pragma once
 
-#include "ui/layers/box_content.h"
+#include "base/weak_ptr.h"
 
-class UserData;
 class ChannelData;
 
 namespace Main {
 class Session;
 } // namespace Main
 
+namespace Ui {
+class Show;
+} // namespace Ui
+
 namespace Window {
 class SessionController;
 } // namespace Window
-
-namespace Data {
-class CloudImageView;
-class PhotoMedia;
-} // namespace Data
-
-namespace Ui {
-class EmptyUserpic;
-} // namespace Ui
 
 namespace Api {
 
 void CheckChatInvite(
 	not_null<Window::SessionController*> controller,
 	const QString &hash,
-	ChannelData *invitePeekChannel = nullptr);
+	ChannelData *invitePeekChannel = nullptr,
+	Fn<void()> loaded = nullptr);
+
+void ProcessChatInviteJoinResult(
+	not_null<Main::Session*> session,
+	std::shared_ptr<Ui::Show> show,
+	const MTPmessages_ChatInviteJoinResult &result,
+	Fn<void(const MTPUpdates &updates)> done,
+	base::weak_ptr<Window::SessionController> controller = {});
 
 } // namespace Api
-
-class ConfirmInviteBox final : public Ui::BoxContent {
-public:
-	ConfirmInviteBox(
-		QWidget*,
-		not_null<Main::Session*> session,
-		const MTPDchatInvite &data,
-		ChannelData *invitePeekChannel,
-		Fn<void()> submit);
-	~ConfirmInviteBox();
-
-protected:
-	void prepare() override;
-
-	void resizeEvent(QResizeEvent *e) override;
-	void paintEvent(QPaintEvent *e) override;
-
-private:
-	struct Participant {
-		not_null<UserData*> user;
-		std::shared_ptr<Data::CloudImageView> userpic;
-	};
-	static std::vector<Participant> GetParticipants(
-		not_null<Main::Session*> session,
-		const MTPDchatInvite &data);
-
-	const not_null<Main::Session*> _session;
-
-	Fn<void()> _submit;
-	object_ptr<Ui::FlatLabel> _title;
-	object_ptr<Ui::FlatLabel> _status;
-	std::shared_ptr<Data::PhotoMedia> _photo;
-	std::unique_ptr<Ui::EmptyUserpic> _photoEmpty;
-	std::vector<Participant> _participants;
-	bool _isChannel = false;
-
-	int _userWidth = 0;
-
-};

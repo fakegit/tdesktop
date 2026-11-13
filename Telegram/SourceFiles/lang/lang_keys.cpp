@@ -7,10 +7,15 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "lang/lang_keys.h"
 
+#include "base/const_string.h"
 #include "lang/lang_file_parser.h"
 #include "ui/integration.h"
 
+#include <QtCore/QLocale>
+
 namespace {
+
+constexpr auto kDefaultLanguage = "en"_cs;
 
 template <typename WithYear, typename WithoutYear>
 inline QString langDateMaybeWithYear(
@@ -45,6 +50,150 @@ inline QString langDateMaybeWithYear(
 		}
 	}
 	return withoutYear(month, year);
+}
+
+using namespace Lang;
+
+} // namespace
+
+bool langFirstNameGoesSecond() {
+	const auto kFirstName = QChar(0x0001);
+	const auto kLastName = QChar(0x0002);
+	const auto fullname = tr::lng_full_name(
+		tr::now,
+		lt_first_name,
+		QString(1, kFirstName),
+		lt_last_name,
+		QString(1, kLastName));
+	return fullname.indexOf(kLastName) < fullname.indexOf(kFirstName);
+}
+
+QString langFullName(
+		const QString &firstName,
+		const QString &lastName) {
+	if (firstName.isEmpty()) {
+		return lastName;
+	} else if (lastName.isEmpty()) {
+		return firstName;
+	}
+	return langFirstNameGoesSecond()
+		? (lastName + u' ' + firstName)
+		: (firstName + u' ' + lastName);
+}
+
+QString langDayOfMonth(const QDate &date) {
+	auto day = date.day();
+	return langDateMaybeWithYear(date, [&](int month, int year) {
+		return tr::lng_month_day_year(
+			tr::now,
+			lt_month,
+			MonthSmall(month)(tr::now),
+			lt_day,
+			QString::number(day),
+			lt_year,
+			QString::number(year));
+	}, [day](int month, int year) {
+		return tr::lng_month_day(
+			tr::now,
+			lt_month,
+			MonthSmall(month)(tr::now),
+			lt_day,
+			QString::number(day));
+	});
+}
+
+QString langDayOfMonthFull(const QDate &date) {
+	auto day = date.day();
+	return langDateMaybeWithYear(date, [day](int month, int year) {
+		return tr::lng_month_day_year(
+			tr::now,
+			lt_month,
+			MonthDay(month)(tr::now),
+			lt_day,
+			QString::number(day),
+			lt_year,
+			QString::number(year));
+	}, [day](int month, int year) {
+		return tr::lng_month_day(
+			tr::now,
+			lt_month,
+			MonthDay(month)(tr::now),
+			lt_day,
+			QString::number(day));
+	});
+}
+
+QString langDayOfMonthShort(const QDate &date) {
+	auto day = date.day();
+	return langDateMaybeWithYear(date, [&](int month, int year) {
+		return QLocale().toString(date, QLocale::ShortFormat);
+	}, [day](int month, int year) {
+		return tr::lng_month_day(
+			tr::now,
+			lt_month,
+			MonthSmall(month)(tr::now),
+			lt_day,
+			QString::number(day));
+	});
+}
+
+QString langMonthOfYearFull(int month, int year) {
+	return (month > 0 && month <= 12)
+		? tr::lng_month_year(
+			tr::now,
+			lt_month,
+			Month(month)(tr::now),
+			lt_year,
+			QString::number(year))
+		: u"MONTH_ERR"_q;
+}
+
+QString langMonthFull(const QDate &date) {
+	return langDateMaybeWithYear(date, [](int month, int year) {
+		return langMonthOfYearFull(month, year);
+	}, [](int month, int year) {
+		return Month(month)(tr::now);
+	});
+}
+
+QString langDayOfWeek(int index) {
+	return (index > 0 && index <= 7)
+		? Weekday(index)(tr::now)
+		: u"DAY_ERR"_q;
+}
+
+QString langDayOfWeekFull(int index) {
+	return (index > 0 && index <= 7)
+		? WeekdayFull(index)(tr::now)
+		: u"DAY_ERR"_q;
+}
+
+QString langDateTime(const QDateTime &date) {
+	return tr::lng_mediaview_date_time(
+		tr::now,
+		lt_date,
+		langDayOfMonth(date.date()),
+		lt_time,
+		QLocale().toString(date.time(), QLocale::ShortFormat));
+}
+
+QString langDateTimeFull(const QDateTime &date) {
+	return tr::lng_mediaview_date_time(
+		tr::now,
+		lt_date,
+		langDayOfMonthFull(date.date()),
+		lt_time,
+		QLocale().toString(date.time(), QLocale::ShortFormat));
+}
+
+namespace Lang {
+
+QString DefaultLanguageId() {
+	return kDefaultLanguage.utf16();
+}
+
+QString LanguageIdOrDefault(const QString &id) {
+	return !id.isEmpty() ? id : DefaultLanguageId();
 }
 
 tr::phrase<> Month(int index) {
@@ -114,118 +263,17 @@ tr::phrase<> Weekday(int index) {
 	Unexpected("Index in Weekday.");
 }
 
-} // namespace
-
-bool langFirstNameGoesSecond() {
-	const auto kFirstName = QChar(0x0001);
-	const auto kLastName = QChar(0x0002);
-	const auto fullname = tr::lng_full_name(
-		tr::now,
-		lt_first_name,
-		QString(1, kFirstName),
-		lt_last_name,
-		QString(1, kLastName));
-	return fullname.indexOf(kLastName) < fullname.indexOf(kFirstName);
+tr::phrase<> WeekdayFull(int index) {
+	switch (index) {
+	case 1: return tr::lng_hours_monday;
+	case 2: return tr::lng_hours_tuesday;
+	case 3: return tr::lng_hours_wednesday;
+	case 4: return tr::lng_hours_thursday;
+	case 5: return tr::lng_hours_friday;
+	case 6: return tr::lng_hours_saturday;
+	case 7: return tr::lng_hours_sunday;
+	}
+	Unexpected("Index in WeekdayFull.");
 }
 
-QString langDayOfMonth(const QDate &date) {
-	auto day = date.day();
-	return langDateMaybeWithYear(date, [&](int month, int year) {
-		return tr::lng_month_day_year(
-			tr::now,
-			lt_month,
-			MonthSmall(month)(tr::now),
-			lt_day,
-			QString::number(day),
-			lt_year,
-			QString::number(year));
-	}, [day](int month, int year) {
-		return tr::lng_month_day(
-			tr::now,
-			lt_month,
-			MonthSmall(month)(tr::now),
-			lt_day,
-			QString::number(day));
-	});
-}
-
-QString langDayOfMonthFull(const QDate &date) {
-	auto day = date.day();
-	return langDateMaybeWithYear(date, [day](int month, int year) {
-		return tr::lng_month_day_year(
-			tr::now,
-			lt_month,
-			MonthDay(month)(tr::now),
-			lt_day,
-			QString::number(day),
-			lt_year,
-			QString::number(year));
-	}, [day](int month, int year) {
-		return tr::lng_month_day(
-			tr::now,
-			lt_month,
-			MonthDay(month)(tr::now),
-			lt_day,
-			QString::number(day));
-	});
-}
-
-QString langMonthOfYear(int month, int year) {
-	return (month > 0 && month <= 12)
-		? tr::lng_month_year(
-			tr::now,
-			lt_month,
-			MonthSmall(month)(tr::now),
-			lt_year,
-			QString::number(year))
-		: u"MONTH_ERR"_q;
-}
-
-QString langMonth(const QDate &date) {
-	return langDateMaybeWithYear(date, [](int month, int year) {
-		return langMonthOfYear(month, year);
-	}, [](int month, int year) {
-		return MonthSmall(month)(tr::now);
-	});
-}
-
-QString langMonthOfYearFull(int month, int year) {
-	return (month > 0 && month <= 12)
-		? tr::lng_month_year(
-			tr::now,
-			lt_month,
-			Month(month)(tr::now),
-			lt_year,
-			QString::number(year))
-		: u"MONTH_ERR"_q;
-}
-
-QString langMonthFull(const QDate &date) {
-	return langDateMaybeWithYear(date, [](int month, int year) {
-		return langMonthOfYearFull(month, year);
-	}, [](int month, int year) {
-		return Month(month)(tr::now);
-	});
-}
-
-QString langDayOfWeek(int index) {
-	return (index > 0 && index <= 7) ? Weekday(index)(tr::now) : u"DAY_ERR"_q;
-}
-
-QString langDateTime(const QDateTime &date) {
-	return tr::lng_mediaview_date_time(
-		tr::now,
-		lt_date,
-		langDayOfMonth(date.date()),
-		lt_time,
-		date.time().toString(Ui::Integration::Instance().timeFormat()));
-}
-
-QString langDateTimeFull(const QDateTime &date) {
-	return tr::lng_mediaview_date_time(
-		tr::now,
-		lt_date,
-		langDayOfMonthFull(date.date()),
-		lt_time,
-		date.time().toString(Ui::Integration::Instance().timeFormat()));
-}
+} // namespace Lang

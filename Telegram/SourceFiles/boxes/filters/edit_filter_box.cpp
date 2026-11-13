@@ -7,32 +7,60 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "boxes/filters/edit_filter_box.h"
 
+#include "apiwrap.h"
+#include "base/event_filter.h"
 #include "boxes/filters/edit_filter_chats_list.h"
+#include "boxes/filters/edit_filter_chats_preview.h"
+#include "boxes/filters/edit_filter_links.h"
+#include "boxes/premium_limits_box.h"
+#include "boxes/premium_preview_box.h"
 #include "chat_helpers/emoji_suggestions_widget.h"
-#include "ui/layers/generic_box.h"
-#include "ui/text/text_utilities.h"
-#include "ui/widgets/buttons.h"
-#include "ui/widgets/input_fields.h"
-#include "ui/effects/panel_animation.h"
-#include "ui/filter_icons.h"
-#include "ui/filter_icon_panel.h"
-#include "data/data_chat_filters.h"
-#include "data/data_peer.h"
-#include "data/data_session.h"
+#include "chat_helpers/message_field.h"
+#include "chat_helpers/tabbed_panel.h"
+#include "chat_helpers/tabbed_selector.h"
 #include "core/application.h"
 #include "core/core_settings.h"
-#include "settings/settings_common.h"
-#include "base/event_filter.h"
-#include "lang/lang_keys.h"
+#include "core/ui_integration.h"
+#include "data/stickers/data_custom_emoji.h"
+#include "data/stickers/data_stickers.h"
+#include "data/data_channel.h"
+#include "data/data_chat_filters.h"
+#include "data/data_document.h"
+#include "data/data_peer.h"
+#include "data/data_peer_values.h" // Data::AmPremiumValue.
+#include "data/data_premium_limits.h"
+#include "data/data_session.h"
+#include "data/data_user.h"
 #include "history/history.h"
+#include "info/userpic/info_userpic_color_circle_button.h"
+#include "lang/lang_keys.h"
 #include "main/main_session.h"
-#include "window/window_session_controller.h"
+#include "settings/settings_common.h"
+#include "ui/chat/chats_filter_tag.h"
+#include "ui/controls/emoji_button_factory.h"
+#include "ui/controls/emoji_button.h"
+#include "ui/effects/animation_value_f.h"
+#include "ui/effects/animations.h"
+#include "ui/effects/panel_animation.h"
+#include "ui/empty_userpic.h"
+#include "ui/filter_icon_panel.h"
+#include "ui/filter_icons.h"
+#include "ui/layers/generic_box.h"
+#include "ui/painter.h"
+#include "ui/rect.h"
+#include "ui/power_saving.h"
+#include "ui/vertical_list.h"
+#include "ui/widgets/buttons.h"
+#include "ui/widgets/fields/input_field.h"
+#include "ui/wrap/slide_wrap.h"
 #include "window/window_controller.h"
-#include "apiwrap.h"
+#include "window/window_session_controller.h"
 #include "styles/style_settings.h"
-#include "styles/style_boxes.h"
 #include "styles/style_layers.h"
 #include "styles/style_window.h"
+#include "styles/style_chat.h"
+#include "styles/style_chat_helpers.h"
+#include "styles/style_info_userpic_builder.h"
 
 namespace {
 
@@ -44,59 +72,6 @@ using Flag = Data::ChatFilter::Flag;
 using Flags = Data::ChatFilter::Flags;
 using ExceptionPeersRef = const base::flat_set<not_null<History*>> &;
 using ExceptionPeersGetter = ExceptionPeersRef(Data::ChatFilter::*)() const;
-
-constexpr auto kAllTypes = {
-	Flag::Contacts,
-	Flag::NonContacts,
-	Flag::Groups,
-	Flag::Channels,
-	Flag::Bots,
-	Flag::NoMuted,
-	Flag::NoRead,
-	Flag::NoArchived,
-};
-
-class FilterChatsPreview final : public Ui::RpWidget {
-public:
-	FilterChatsPreview(
-		not_null<QWidget*> parent,
-		Flags flags,
-		const base::flat_set<not_null<History*>> &peers);
-
-	[[nodiscard]] rpl::producer<Flag> flagRemoved() const;
-	[[nodiscard]] rpl::producer<not_null<History*>> peerRemoved() const;
-
-	void updateData(
-		Flags flags,
-		const base::flat_set<not_null<History*>> &peers);
-
-	int resizeGetHeight(int newWidth) override;
-
-private:
-	using Button = base::unique_qptr<Ui::IconButton>;
-	struct FlagButton {
-		Flag flag = Flag();
-		Button button;
-	};
-	struct PeerButton {
-		not_null<History*> history;
-		std::shared_ptr<Data::CloudImageView> userpic;
-		Button button;
-	};
-
-	void paintEvent(QPaintEvent *e) override;
-
-	void refresh();
-	void removeFlag(Flag flag);
-	void removePeer(not_null<History*> history);
-
-	std::vector<FlagButton> _removeFlag;
-	std::vector<PeerButton> _removePeer;
-
-	rpl::event_stream<Flag> _flagRemoved;
-	rpl::event_stream<not_null<History*>> _peerRemoved;
-
-};
 
 struct NameEditing {
 	not_null<Ui::InputField*> field;
@@ -117,12 +92,13 @@ not_null<FilterChatsPreview*> SetupChatsPreview(
 		(rules.*peers)()));
 
 	preview->flagRemoved(
-	) | rpl::start_with_next([=](Flag flag) {
+	) | rpl::on_next([=](Flag flag) {
 		const auto rules = data->current();
 		auto computed = Data::ChatFilter(
 			rules.id(),
 			rules.title(),
 			rules.iconEmoji(),
+			rules.colorIndex(),
 			(rules.flags() & ~flag),
 			rules.always(),
 			rules.pinned(),
@@ -132,7 +108,7 @@ not_null<FilterChatsPreview*> SetupChatsPreview(
 	}, preview->lifetime());
 
 	preview->peerRemoved(
-	) | rpl::start_with_next([=](not_null<History*> history) {
+	) | rpl::on_next([=](not_null<History*> history) {
 		const auto rules = data->current();
 		auto always = rules.always();
 		auto pinned = rules.pinned();
@@ -144,6 +120,7 @@ not_null<FilterChatsPreview*> SetupChatsPreview(
 			rules.id(),
 			rules.title(),
 			rules.iconEmoji(),
+			rules.colorIndex(),
 			rules.flags(),
 			std::move(always),
 			std::move(pinned),
@@ -155,161 +132,6 @@ not_null<FilterChatsPreview*> SetupChatsPreview(
 	return preview;
 }
 
-FilterChatsPreview::FilterChatsPreview(
-	not_null<QWidget*> parent,
-	Flags flags,
-	const base::flat_set<not_null<History*>> &peers)
-: RpWidget(parent) {
-	updateData(flags, peers);
-}
-
-void FilterChatsPreview::refresh() {
-	resizeToWidth(width());
-}
-
-void FilterChatsPreview::updateData(
-		Flags flags,
-		const base::flat_set<not_null<History*>> &peers) {
-	_removeFlag.clear();
-	_removePeer.clear();
-	const auto makeButton = [&](Fn<void()> handler) {
-		auto result = base::make_unique_q<Ui::IconButton>(
-			this,
-			st::windowFilterSmallRemove);
-		result->setClickedCallback(std::move(handler));
-		return result;
-	};
-	for (const auto flag : kAllTypes) {
-		if (flags & flag) {
-			_removeFlag.push_back({
-				flag,
-				makeButton([=] { removeFlag(flag); }) });
-		}
-	}
-	for (const auto &history : peers) {
-		_removePeer.push_back(PeerButton{
-			.history = history,
-			.button = makeButton([=] { removePeer(history); })
-		});
-	}
-	refresh();
-}
-
-int FilterChatsPreview::resizeGetHeight(int newWidth) {
-	const auto right = st::windowFilterSmallRemoveRight;
-	const auto add = (st::windowFilterSmallItem.height
-		- st::windowFilterSmallRemove.height) / 2;
-	auto top = 0;
-	const auto moveNextButton = [&](not_null<Ui::IconButton*> button) {
-		button->moveToRight(right, top + add, newWidth);
-		top += st::windowFilterSmallItem.height;
-	};
-	for (const auto &[flag, button] : _removeFlag) {
-		moveNextButton(button.get());
-	}
-	for (const auto &[history, userpic, button] : _removePeer) {
-		moveNextButton(button.get());
-	}
-	return top;
-}
-
-void FilterChatsPreview::paintEvent(QPaintEvent *e) {
-	auto p = Painter(this);
-	auto top = 0;
-	const auto &st = st::windowFilterSmallItem;
-	const auto iconLeft = st.photoPosition.x();
-	const auto iconTop = st.photoPosition.y();
-	const auto nameLeft = st.namePosition.x();
-	p.setFont(st::windowFilterSmallItem.nameStyle.font);
-	const auto nameTop = st.namePosition.y();
-	for (const auto &[flag, button] : _removeFlag) {
-		PaintFilterChatsTypeIcon(
-			p,
-			flag,
-			iconLeft,
-			top + iconTop,
-			width(),
-			st.photoSize);
-
-		p.setPen(st::contactsNameFg);
-		p.drawTextLeft(
-			nameLeft,
-			top + nameTop,
-			width(),
-			FilterChatsTypeName(flag));
-		top += st.height;
-	}
-	for (auto &[history, userpic, button] : _removePeer) {
-		const auto savedMessages = history->peer->isSelf();
-		const auto repliesMessages = history->peer->isRepliesChat();
-		if (savedMessages || repliesMessages) {
-			if (savedMessages) {
-				Ui::EmptyUserpic::PaintSavedMessages(
-					p,
-					iconLeft,
-					top + iconTop,
-					width(),
-					st.photoSize);
-			} else {
-				Ui::EmptyUserpic::PaintRepliesMessages(
-					p,
-					iconLeft,
-					top + iconTop,
-					width(),
-					st.photoSize);
-			}
-			p.setPen(st::contactsNameFg);
-			p.drawTextLeft(
-				nameLeft,
-				top + nameTop,
-				width(),
-				(savedMessages
-					? tr::lng_saved_messages(tr::now)
-					: tr::lng_replies_messages(tr::now)));
-		} else {
-			history->peer->paintUserpicLeft(
-				p,
-				userpic,
-				iconLeft,
-				top + iconTop,
-				width(),
-				st.photoSize);
-			p.setPen(st::contactsNameFg);
-			history->peer->nameText().drawLeftElided(
-				p,
-				nameLeft,
-				top + nameTop,
-				button->x() - nameLeft,
-				width());
-		}
-		top += st.height;
-	}
-}
-
-void FilterChatsPreview::removeFlag(Flag flag) {
-	const auto i = ranges::find(_removeFlag, flag, &FlagButton::flag);
-	Assert(i != end(_removeFlag));
-	_removeFlag.erase(i);
-	refresh();
-	_flagRemoved.fire_copy(flag);
-}
-
-void FilterChatsPreview::removePeer(not_null<History*> history) {
-	const auto i = ranges::find(_removePeer, history, &PeerButton::history);
-	Assert(i != end(_removePeer));
-	_removePeer.erase(i);
-	refresh();
-	_peerRemoved.fire_copy(history);
-}
-
-rpl::producer<Flag> FilterChatsPreview::flagRemoved() const {
-	return _flagRemoved.events();
-}
-
-rpl::producer<not_null<History*>> FilterChatsPreview::peerRemoved() const {
-	return _peerRemoved.events();
-}
-
 void EditExceptions(
 		not_null<Window::SessionController*> window,
 		not_null<QObject*> context,
@@ -319,14 +141,23 @@ void EditExceptions(
 		Fn<void()> refresh) {
 	const auto include = (options & Flag::Contacts) != Flags(0);
 	const auto rules = data->current();
+	const auto session = &window->session();
+	const auto limit = Data::PremiumLimits(
+		session
+	).dialogFiltersChatsCurrent();
+	const auto showLimitReached = [=] {
+		window->show(Box(FilterChatsLimitBox, session, limit, include));
+	};
 	auto controller = std::make_unique<EditFilterChatsListController>(
-		&window->session(),
+		session,
 		(include
 			? tr::lng_filters_include_title()
 			: tr::lng_filters_exclude_title()),
 		options,
 		rules.flags() & options,
-		include ? rules.always() : rules.never());
+		include ? rules.always() : rules.never(),
+		limit,
+		showLimitReached);
 	const auto rawController = controller.get();
 	auto initBox = [=](not_null<PeerListBox*> box) {
 		box->setCloseByOutsideClick(false);
@@ -356,6 +187,7 @@ void EditExceptions(
 				rules.id(),
 				rules.title(),
 				rules.iconEmoji(),
+				rules.colorIndex(),
 				((rules.flags() & ~options)
 					| rawController->chosenOptions()),
 				include ? std::move(changed) : std::move(removeFrom),
@@ -369,10 +201,46 @@ void EditExceptions(
 		box->addButton(tr::lng_cancel(), [=] { box->closeBox(); });
 	};
 	window->window().show(
-		Box<PeerListBox>(
-			std::move(controller),
-			std::move(initBox)),
-		Ui::LayerOption::KeepOther);
+		Box<PeerListBox>(std::move(controller), std::move(initBox)));
+}
+
+struct ParabolicPath {
+	float64 a = 0.;
+	float64 b = 0.;
+	int from = 0;
+
+	[[nodiscard]] int y(float64 progress) const {
+		return int(base::SafeRound(
+			(a * progress * progress) + (b * progress) + from));
+	}
+};
+
+[[nodiscard]] ParabolicPath ComputeParabolicPath(int from, int to, int up) {
+	const auto y_1 = to - from;
+	const auto y_0 = std::min(0, y_1) - up;
+	const auto ratio = y_1 ? (float64(y_0) / y_1) : 0.;
+	const auto root = y_1 ? sqrt(ratio * (ratio - 1)) : 0.;
+	const auto t_0 = !y_1
+		? 0.5
+		: (y_1 > 0)
+		? (ratio + root)
+		: (ratio - root);
+	const auto a = y_1 ? (y_1 / (1 - 2 * t_0)) : (-4. * y_0);
+	return { .a = a, .b = y_1 - a, .from = from };
+}
+
+[[nodiscard]] QImage PrepareFlyIcon(
+		not_null<const style::icon*> icon,
+		QColor color) {
+	const auto ratio = style::DevicePixelRatio();
+	auto result = QImage(
+		icon->size() * ratio,
+		QImage::Format_ARGB32_Premultiplied);
+	result.setDevicePixelRatio(ratio);
+	result.fill(Qt::transparent);
+	auto p = QPainter(&result);
+	icon->paint(p, 0, 0, icon->width(), color);
+	return result;
 }
 
 void CreateIconSelector(
@@ -382,32 +250,76 @@ void CreateIconSelector(
 		not_null<Ui::InputField*> input,
 		not_null<rpl::variable<Data::ChatFilter>*> data) {
 	const auto rules = data->current();
+	const auto size = st::windowFilterIconUserpicSize;
+	const auto badge = st::windowFilterIconUserpicBadge;
+	const auto badgePosition = st::windowFilterIconUserpicBadgePosition;
+	const auto border = st::windowFilterIconUserpicBadgeBorder;
 	const auto toggle = Ui::CreateChild<Ui::AbstractButton>(parent.get());
-	toggle->resize(st::windowFilterIconToggleSize);
+	toggle->resize(Size(badgePosition.x() + badge + border));
+
+	struct FlyState {
+		Ui::Animations::Simple animation;
+		Ui::Animations::Simple scaleOut;
+		QImage previous;
+		QImage from;
+		QImage to;
+		QRect fromRect;
+		QRect toRect;
+		QRect bounds;
+		QRect last;
+		ParabolicPath path;
+		base::unique_qptr<Ui::RpWidget> layer;
+	};
+	const auto fly = toggle->lifetime().make_state<FlyState>();
 
 	const auto type = toggle->lifetime().make_state<Ui::FilterIcon>();
 	data->value(
 	) | rpl::map([=](const Data::ChatFilter &filter) {
 		return Ui::ComputeFilterIcon(filter);
-	}) | rpl::start_with_next([=](Ui::FilterIcon icon) {
+	}) | rpl::on_next([=](Ui::FilterIcon icon) {
 		*type = icon;
 		toggle->update();
 	}, toggle->lifetime());
 
 	input->geometryValue(
-	) | rpl::start_with_next([=](QRect geometry) {
-		const auto left = geometry.x() + geometry.width() - toggle->width();
-		const auto position = st::windowFilterIconTogglePosition;
+	) | rpl::on_next([=](QRect geometry) {
 		toggle->move(
-			left - position.x(),
-			geometry.y() + position.y());
+			geometry.x() - st::windowFilterIconUserpicSkip - size,
+			geometry.y() + st::windowFilterIconUserpicTop);
 	}, toggle->lifetime());
 
 	toggle->paintRequest(
-	) | rpl::start_with_next([=] {
+	) | rpl::on_next([=] {
 		auto p = QPainter(toggle);
+		auto hq = PainterHighQualityEnabler(p);
+		const auto userpic = Rect(Size(size));
+		p.setPen(Qt::NoPen);
+		p.setBrush(st::windowBgActive);
+		p.drawEllipse(userpic);
+
 		const auto icons = Ui::LookupFilterIcon(*type);
-		icons.normal->paintInCenter(p, toggle->rect(), st::emojiIconFg->c);
+		if (!fly->animation.animating()) {
+			icons.userpic->paintInCenter(p, userpic);
+		} else if (const auto scale = fly->scaleOut.value(0.); scale > 0.) {
+			const auto ratio = fly->previous.devicePixelRatio();
+			auto shrunk = QRectF(
+				QPointF(),
+				QSizeF(fly->previous.size()) * scale / ratio);
+			shrunk.moveCenter(rect::center(QRectF(userpic)));
+			p.setOpacity(scale);
+			p.drawImage(shrunk, fly->previous);
+			p.setOpacity(1.);
+		}
+
+		const auto badgeRect = Rect(
+			badgePosition.x(),
+			badgePosition.y(),
+			Size(badge));
+		p.setBrush(st::boxBg);
+		p.drawEllipse(badgeRect.marginsAdded(Margins(border)));
+		p.setBrush(st::windowBgActive);
+		p.drawEllipse(badgeRect);
+		st::windowFilterIconUserpicBadgeIcon.paintInCenter(p, badgeRect);
 	}, toggle->lifetime());
 
 	const auto panel = toggle->lifetime().make_state<Ui::FilterIconPanel>(
@@ -416,16 +328,102 @@ void CreateIconSelector(
 	toggle->addClickHandler([=] {
 		panel->toggleAnimated();
 	});
+	const auto startFly = [=](Ui::FilterIconChosen chosen) {
+		fly->previous = PrepareFlyIcon(
+			Ui::LookupFilterIcon(*type).userpic,
+			st::windowFgActive->c);
+		const auto icons = Ui::LookupFilterIcon(chosen.icon);
+		const auto map = [&](not_null<QWidget*> from, QRect geometry) {
+			return QRect(
+				outer->mapFromGlobal(from->mapToGlobal(geometry.topLeft())),
+				geometry.size());
+		};
+		const auto centerOn = [](QRect where, QSize size) {
+			auto result = QRect(QPoint(), size);
+			result.moveCenter(rect::center(where));
+			return result;
+		};
+		fly->from = PrepareFlyIcon(icons.normal, st::dialogsUnreadBgMuted->c);
+		fly->to = PrepareFlyIcon(icons.userpic, st::windowFgActive->c);
+		fly->fromRect = centerOn(
+			map(panel, chosen.geometry),
+			icons.normal->size());
+		fly->toRect = centerOn(
+			map(toggle, Rect(Size(size))),
+			icons.userpic->size());
+		fly->path = ComputeParabolicPath(
+			fly->fromRect.y(),
+			fly->toRect.y(),
+			st::windowFilterIconFlyUp);
+
+		const auto frameRect = [=](float64 progress) {
+			return QRect(
+				anim::interpolate(
+					fly->fromRect.x(),
+					fly->toRect.x(),
+					progress),
+				fly->path.y(progress),
+				anim::interpolate(
+					fly->fromRect.width(),
+					fly->toRect.width(),
+					progress),
+				anim::interpolate(
+					fly->fromRect.height(),
+					fly->toRect.height(),
+					progress));
+		};
+		fly->bounds = fly->fromRect.united(fly->toRect).marginsAdded(
+			{ 0, st::windowFilterIconFlyUp, 0, 0 });
+		fly->last = fly->fromRect;
+
+		fly->layer = base::make_unique_q<Ui::RpWidget>(outer);
+		const auto layer = fly->layer.get();
+		layer->setAttribute(Qt::WA_TransparentForMouseEvents);
+		layer->setGeometry(fly->bounds);
+		layer->show();
+		layer->raise();
+		layer->paintRequest(
+		) | rpl::on_next([=] {
+			auto p = QPainter(layer);
+			auto hq = PainterHighQualityEnabler(p);
+			const auto progress = fly->animation.value(1.);
+			const auto rect = frameRect(progress).translated(
+				-fly->bounds.topLeft());
+			p.setOpacity(1. - progress);
+			p.drawImage(rect, fly->from);
+			p.setOpacity(progress);
+			p.drawImage(rect, fly->to);
+		}, layer->lifetime());
+
+		fly->scaleOut.start([=] {
+			toggle->update();
+		}, 1., 0., st::windowFilterIconScaleOutDuration);
+
+		fly->animation.start([=] {
+			const auto finished = !fly->animation.animating();
+			const auto rect = frameRect(fly->animation.value(1.));
+			layer->update(
+				rect.united(fly->last).translated(-fly->bounds.topLeft()));
+			fly->last = rect;
+			toggle->update();
+			if (finished) {
+				InvokeQueued(toggle, [=] { fly->layer = nullptr; });
+			}
+		}, 0., 1., st::windowFilterIconFlyDuration, anim::sineInOut);
+	};
+
 	panel->chosen(
-	) | rpl::filter([=](Ui::FilterIcon icon) {
-		return icon != Ui::ComputeFilterIcon(data->current());
-	}) | rpl::start_with_next([=](Ui::FilterIcon icon) {
+	) | rpl::filter([=](Ui::FilterIconChosen chosen) {
+		return chosen.icon != Ui::ComputeFilterIcon(data->current());
+	}) | rpl::on_next([=](Ui::FilterIconChosen chosen) {
+		startFly(chosen);
 		panel->hideAnimated();
 		const auto rules = data->current();
 		*data = Data::ChatFilter(
 			rules.id(),
 			rules.title(),
-			Ui::LookupFilterIcon(icon).emoji,
+			Ui::LookupFilterIcon(chosen.icon).emoji,
+			rules.colorIndex(),
 			rules.flags(),
 			rules.always(),
 			rules.pinned(),
@@ -433,15 +431,12 @@ void CreateIconSelector(
 	}, panel->lifetime());
 
 	const auto updatePanelGeometry = [=] {
-		const auto global = toggle->mapToGlobal({
-			toggle->width(),
-			toggle->height()
-		});
+		const auto global = toggle->mapToGlobal({ 0, toggle->height() });
 		const auto local = outer->mapFromGlobal(global);
 		const auto position = st::windwoFilterIconPanelPosition;
 		const auto padding = panel->innerPadding();
 		panel->move(
-			local.x() - panel->width() + position.x() + padding.right(),
+			local.x() + position.x() - padding.left(),
 			local.y() + position.y() - padding.top());
 	};
 
@@ -485,6 +480,24 @@ void CreateIconSelector(
 	return QString();
 }
 
+not_null<Ui::SettingsButton*> AddToggledButton(
+		not_null<Ui::VerticalLayout*> container,
+		rpl::producer<bool> shown,
+		rpl::producer<QString> text,
+		const style::SettingsButton &st,
+		IconDescriptor &&descriptor) {
+	const auto toggled = container->add(
+		object_ptr<Ui::SlideWrap<Ui::SettingsButton>>(
+			container,
+			CreateButtonWithIcon(
+				container,
+				std::move(text),
+				st,
+				std::move(descriptor)))
+	)->toggleOn(std::move(shown), anim::type::instant)->setDuration(0);
+	return toggled->entity();
+}
+
 [[nodiscard]] QString TrimDefaultTitle(const QString &title) {
 	return (title.size() <= kMaxFilterTitleLength) ? title : QString();
 }
@@ -495,39 +508,203 @@ void EditFilterBox(
 		not_null<Ui::GenericBox*> box,
 		not_null<Window::SessionController*> window,
 		const Data::ChatFilter &filter,
-		Fn<void(const Data::ChatFilter &)> doneCallback) {
-	const auto creating = filter.title().isEmpty();
-	box->setTitle(creating ? tr::lng_filters_new() : tr::lng_filters_edit());
+		Fn<void(const Data::ChatFilter &)> doneCallback,
+		Fn<void(
+			const Data::ChatFilter &data,
+			Fn<void(Data::ChatFilter)> next)> saveAnd) {
+	using namespace rpl::mappers;
+	constexpr auto kColorsCount = 8;
+	constexpr auto kNoTag = kColorsCount - 1;
+
+	struct State {
+		rpl::variable<Data::ChatFilter> rules;
+		rpl::variable<std::vector<Data::ChatFilterLink>> links;
+		rpl::variable<bool> hasLinks;
+		rpl::variable<bool> chatlist;
+		rpl::variable<bool> creating;
+		rpl::variable<TextWithEntities> title;
+		rpl::variable<bool> staticTitle;
+		rpl::variable<int> colorIndex;
+		base::unique_qptr<ChatHelpers::TabbedPanel> emojiPanel;
+	};
+	const auto owner = &window->session().data();
+	const auto state = box->lifetime().make_state<State>(State{
+		.rules = filter,
+		.chatlist = filter.chatlist(),
+		.creating = filter.title().empty(),
+		.title = filter.titleText(),
+		.staticTitle = filter.staticTitle(),
+	});
+	state->colorIndex = filter.colorIndex().value_or(kNoTag);
+	state->links = owner->chatsFilters().chatlistLinks(filter.id()),
+	state->hasLinks = state->links.value() | rpl::map([=](const auto &v) {
+		return !v.empty();
+	});
+	state->hasLinks.value() | rpl::filter(
+		_1
+	) | rpl::on_next([=] {
+		state->chatlist = true;
+	}, box->lifetime());
+
+	const auto data = &state->rules;
+
+	owner->chatsFilters().isChatlistChanged(
+	) | rpl::filter([=](FilterId id) {
+		return (id == data->current().id());
+	}) | rpl::on_next([=](FilterId id) {
+		const auto filters = &owner->chatsFilters();
+		const auto &list = filters->list();
+		const auto i = ranges::find(list, id, &Data::ChatFilter::id);
+		if (i == end(list)) {
+			return;
+		}
+		*data = data->current().withChatlist(i->chatlist(), i->hasMyLinks());
+		if (!i->chatlist() && !state->hasLinks.current()) {
+			state->chatlist = false;
+		}
+	}, box->lifetime());
+
+	box->setWidth(st::boxWideWidth);
+	box->setTitle(rpl::conditional(
+		state->creating.value(),
+		tr::lng_filters_new(),
+		tr::lng_filters_edit()));
 	box->setCloseByOutsideClick(false);
 
-	using State = rpl::variable<Data::ChatFilter>;
-	const auto data = box->lifetime().make_state<State>(filter);
+	const auto session = &window->session();
+	Data::AmPremiumValue(
+		session
+	) | rpl::on_next([=] {
+		box->closeBox();
+	}, box->lifetime());
 
 	const auto content = box->verticalLayout();
+	const auto current = state->title.current();
 	const auto name = content->add(
 		object_ptr<Ui::InputField>(
 			box,
 			st::windowFilterNameInput,
-			tr::lng_filters_new_name(),
-			filter.title()),
-		st::markdownLinkFieldPadding);
-	name->setMaxLength(kMaxFilterTitleLength);
-	name->setInstantReplaces(Ui::InstantReplaces::Default());
-	name->setInstantReplacesEnabled(
-		Core::App().settings().replaceEmojiValue());
-	Ui::Emoji::SuggestionsController::Init(
-		box->getDelegate()->outerContainer(),
+			Ui::InputField::Mode::SingleLine,
+			tr::lng_filters_new_name()),
+		st::windowFilterNameInputPadding);
+	InitMessageFieldHandlers(window, name, ChatHelpers::PauseReason::Layer);
+	name->setTextWithTags({
+		current.text,
+		TextUtilities::ConvertEntitiesToTextTags(current.entities),
+	}, Ui::InputField::HistoryAction::Clear);
+	Ui::AddLengthLimitLabel(
 		name,
-		&window->session());
+		kMaxFilterTitleLength,
+		Ui::LengthLimitLabelOptions{
+			.customThreshold = 0,
+			.customUpdatePosition = [=](QSize parent, QSize label) {
+				return QPoint(
+					parent.width()
+						- st::windowFilterNameCharsLimitRightPosition.x()
+						- label.width() / 2,
+					st::windowFilterNameCharsLimitRightPosition.y());
+			},
+			.customCharactersCount = [=] {
+				return Ui::ComputeFieldCharacterCount(name);
+			},
+		});
 
 	const auto nameEditing = box->lifetime().make_state<NameEditing>(
 		NameEditing{ name });
-	nameEditing->custom = !creating;
-	QObject::connect(name, &Ui::InputField::changed, [=] {
+
+	const auto staticTitle = Ui::CreateChild<Ui::LinkButton>(
+		name,
+		QString());
+	staticTitle->setClickedCallback([=] {
+		state->staticTitle = !state->staticTitle.current();
+	});
+	state->staticTitle.value() | rpl::on_next([=](bool value) {
+		staticTitle->setText(value
+			? tr::lng_filters_enable_animations(tr::now)
+			: tr::lng_filters_disable_animations(tr::now));
+		const auto paused = [=] {
+			using namespace Window;
+			return window->isGifPausedAtLeastFor(GifPauseReason::Layer);
+		};
+		name->setCustomTextContext(Core::TextContext({
+			.session = session,
+			.customEmojiLoopLimit = value ? -1 : 0,
+		}), [paused] {
+			return On(PowerSaving::kEmojiChat) || paused();
+		}, [paused] {
+			return On(PowerSaving::kChatSpoiler) || paused();
+		});
+		name->update();
+	}, staticTitle->lifetime());
+
+	rpl::combine(
+		staticTitle->widthValue(),
+		name->widthValue()
+	) | rpl::on_next([=](int inner, int outer) {
+		staticTitle->moveToRight(
+			st::windowFilterStaticTitlePosition.x(),
+			st::windowFilterStaticTitlePosition.y(),
+			outer);
+	}, staticTitle->lifetime());
+
+	state->creating.value(
+	) | rpl::filter(!_1) | rpl::on_next([=] {
+		nameEditing->custom = true;
+	}, box->lifetime());
+
+	using Selector = ChatHelpers::TabbedSelector;
+	state->emojiPanel = base::make_unique_q<ChatHelpers::TabbedPanel>(
+		box->getDelegate()->outerContainer(),
+		window,
+		object_ptr<Selector>(
+			nullptr,
+			window->uiShow(),
+			Window::GifPauseReason::Layer,
+			Selector::Mode::EmojiOnly));
+	state->emojiPanel->setDesiredHeightValues(
+		1.,
+		st::emojiPanMinHeight / 2,
+		st::emojiPanMinHeight);
+	state->emojiPanel->hide();
+	state->emojiPanel->selector()->setCurrentPeer(window->session().user());
+	state->emojiPanel->selector()->emojiChosen(
+	) | rpl::on_next([=](ChatHelpers::EmojiChosen data) {
+		Ui::InsertEmojiAtCursor(name->textCursor(), data.emoji);
+	}, name->lifetime());
+	state->emojiPanel->selector()->customEmojiChosen(
+	) | rpl::on_next([=](ChatHelpers::FileChosen data) {
+		const auto info = data.document->sticker();
+		if (info
+			&& info->setType == Data::StickersType::Emoji
+			&& !window->session().premium()) {
+			ShowPremiumPreviewBox(
+				window,
+				PremiumFeature::AnimatedEmoji);
+		} else {
+			Data::InsertCustomEmoji(name, data.document);
+		}
+	}, name->lifetime());
+
+	const auto emojiButton = Ui::AddEmojiToggleToField(
+		name,
+		box,
+		window,
+		state->emojiPanel.get(),
+		st::windowFilterNameEmojiPosition);
+	emojiButton->show();
+
+	name->changes(
+	) | rpl::on_next([=] {
 		if (!nameEditing->settingDefault) {
 			nameEditing->custom = true;
 		}
-	});
+		auto entered = name->getTextWithTags();
+		state->title = TextWithEntities{
+			std::move(entered.text),
+			TextUtilities::ConvertTextTagsToEntities(entered.tags),
+		};
+	}, name->lifetime());
+
 	const auto updateDefaultTitle = [=](const Data::ChatFilter &filter) {
 		if (nameEditing->custom) {
 			return;
@@ -539,6 +716,11 @@ void EditFilterBox(
 			nameEditing->settingDefault = false;
 		}
 	};
+
+	state->title.value(
+	) | rpl::on_next([=](const TextWithEntities &value) {
+		staticTitle->setVisible(!value.entities.isEmpty());
+	}, staticTitle->lifetime());
 
 	const auto outer = box->getDelegate()->outerContainer();
 	CreateIconSelector(
@@ -561,15 +743,16 @@ void EditFilterBox(
 		name->setFocusFast();
 	});
 
-	AddSkip(content);
-	AddDivider(content);
-	AddSkip(content);
-	AddSubsectionTitle(content, tr::lng_filters_include());
+	Ui::AddSkip(content);
+	Ui::AddDivider(content);
+	Ui::AddSkip(content);
+	Ui::AddSubsectionTitle(content, tr::lng_filters_include());
 
-	const auto includeAdd = AddButton(
+	const auto includeAdd = AddButtonWithIcon(
 		content,
-		tr::lng_filters_add_chats() | Ui::Text::ToUpper(),
-		st::settingsUpdate);
+		tr::lng_filters_add_chats(),
+		st::settingsButtonActive,
+		{ &st::settingsIconAdd, IconType::Round, &st::windowBgActive });
 
 	const auto include = SetupChatsPreview(
 		content,
@@ -578,38 +761,340 @@ void EditFilterBox(
 		kTypes,
 		&Data::ChatFilter::always);
 
-	AddSkip(content);
-	content->add(
-		object_ptr<Ui::FlatLabel>(
+	Ui::AddSkip(content);
+	Ui::AddDividerText(content, tr::lng_filters_include_about());
+	Ui::AddSkip(content);
+
+	auto excludeWrap = content->add(
+		object_ptr<Ui::SlideWrap<Ui::VerticalLayout>>(
 			content,
-			tr::lng_filters_include_about(),
-			st::boxDividerLabel),
-		st::windowFilterAboutPadding);
-	AddDivider(content);
-	AddSkip(content);
+			object_ptr<Ui::VerticalLayout>(content))
+	)->setDuration(0);
+	excludeWrap->toggleOn(state->chatlist.value() | rpl::map(!_1));
+	const auto excludeInner = excludeWrap->entity();
 
-	AddSubsectionTitle(content, tr::lng_filters_exclude());
+	Ui::AddSubsectionTitle(excludeInner, tr::lng_filters_exclude());
 
-	const auto excludeAdd = AddButton(
-		content,
-		tr::lng_filters_remove_chats() | Ui::Text::ToUpper(),
-		st::settingsUpdate);
+	const auto excludeAdd = AddButtonWithIcon(
+		excludeInner,
+		tr::lng_filters_remove_chats(),
+		st::settingsButtonActive,
+		{ &st::settingsIconRemove, IconType::Round, &st::windowBgActive });
 
 	const auto exclude = SetupChatsPreview(
-		content,
+		excludeInner,
 		data,
 		updateDefaultTitle,
 		kExcludeTypes,
 		&Data::ChatFilter::never);
 
-	AddSkip(content);
-	content->add(
-		object_ptr<Ui::FlatLabel>(
-			content,
-			tr::lng_filters_exclude_about(),
-			st::boxDividerLabel),
-		st::windowFilterAboutPadding);
+	Ui::AddSkip(excludeInner);
+	Ui::AddDividerText(excludeInner, tr::lng_filters_exclude_about());
+	Ui::AddSkip(excludeInner);
 
+	{
+		const auto wrap = content->add(
+			object_ptr<Ui::SlideWrap<Ui::VerticalLayout>>(
+				content,
+				object_ptr<Ui::VerticalLayout>(content)));
+		const auto colors = wrap->entity();
+		const auto session = &window->session();
+
+		wrap->toggleOn(
+			rpl::combine(
+				session->premiumPossibleValue(),
+				session->data().chatsFilters().tagsEnabledValue(),
+				Data::AmPremiumValue(session)
+			) | rpl::map([=] (bool possible, bool tagsEnabled, bool premium) {
+				return possible && (tagsEnabled || !premium);
+			}),
+			anim::type::instant);
+
+		const auto &padding = st::defaultSubsectionTitlePadding;
+		const auto isPremium = session->premium();
+		const auto titleWrap = colors->add(
+			object_ptr<Ui::FixedHeightWidget>(
+				colors,
+				rect::m::sum::v(padding)
+					+ st::defaultSubsectionTitle.style.font->height));
+		const auto title = Ui::CreateChild<Ui::FlatLabel>(
+			titleWrap,
+			tr::lng_filters_tag_color_subtitle(),
+			st::defaultSubsectionTitle);
+		title->move(rect::m::pos::tl(padding));
+		const auto preview = Ui::CreateChild<Ui::RpWidget>(titleWrap);
+		rpl::combine(
+			title->sizeValue(),
+			titleWrap->widthValue()
+		) | rpl::on_next([=](const QSize &s, int w) {
+			const auto h = st::normalFont->height;
+			const auto left = padding.left()
+				+ s.width()
+				+ st::settingsFilterTagPreviewSkip;
+			preview->setGeometry(
+				left,
+				padding.top() + (s.height() - h) / 2,
+				w - left,
+				h);
+		}, preview->lifetime());
+
+		struct TagState {
+			Ui::Animations::Simple animation;
+			Ui::ChatsFilterTagContext context;
+			QImage frame;
+			float64 alpha = 1.;
+		};
+		const auto tag = preview->lifetime().make_state<TagState>();
+		tag->context.textContext = Core::TextContext({ .session = session });
+		const auto shift = st::settingsFilterTagPreviewSkip / 2;
+		preview->paintRequest() | rpl::on_next([=] {
+			auto p = QPainter(preview);
+			p.setOpacity(tag->alpha);
+			const auto size = tag->frame.size() / style::DevicePixelRatio();
+			const auto rect = QRect(
+				preview->width()
+					- size.width()
+					- st::boxRowPadding.right()
+					- shift,
+				(st::normalFont->height - size.height()) / 2,
+				size.width(),
+				size.height());
+			p.drawImage(rect.topLeft(), tag->frame);
+			if (p.opacity() < 1) {
+				p.setOpacity(1. - p.opacity());
+				p.setFont(st::normalFont);
+				p.setPen(st::windowSubTextFg);
+				p.drawText(
+					preview->rect().translated(-shift, 0) - st::boxRowPadding,
+					tr::lng_filters_tag_color_no(tr::now),
+					style::al_right);
+			}
+		}, preview->lifetime());
+
+		const auto side = st::userpicBuilderEmojiAccentColorSize;
+		const auto line = colors->add(
+			Ui::CreateSkipWidget(colors, side),
+			st::boxRowPadding);
+		auto buttons = std::vector<not_null<UserpicBuilder::CircleButton*>>();
+		const auto palette = [](int i) {
+			return Ui::EmptyUserpic::UserpicColor(i).color2;
+		};
+		const auto upperTitle = [=] {
+			auto value = state->title.current();
+			value.text = value.text.toUpper();
+			return value;
+		};
+		state->title.changes(
+		) | rpl::on_next([=] {
+			tag->context.color = palette(state->colorIndex.current())->c;
+			tag->frame = Ui::ChatsFilterTag(
+				upperTitle(),
+				tag->context);
+			preview->update();
+		}, preview->lifetime());
+		for (auto i = 0; i < kColorsCount; ++i) {
+			const auto button = Ui::CreateChild<UserpicBuilder::CircleButton>(
+				line);
+			button->resize(side, side);
+			const auto progress = isPremium
+				? (state->colorIndex.current() == i)
+				: (i == kNoTag);
+			button->setSelectedProgress(progress);
+			const auto color = palette(i);
+			button->setBrush(color);
+			if (progress == 1) {
+				tag->context.color = color->c;
+				tag->frame = Ui::ChatsFilterTag(
+					upperTitle(),
+					tag->context);
+				if (i == kNoTag) {
+					tag->alpha = 0.;
+				}
+			}
+			buttons.push_back(button);
+		}
+		for (auto i = 0; i < kColorsCount; ++i) {
+			const auto &button = buttons[i];
+			button->setClickedCallback([=] {
+				const auto was = state->colorIndex.current();
+				const auto now = i;
+				if (was != now) {
+					const auto c1 = palette(was);
+					const auto c2 = palette(now);
+					const auto a1 = (was == kNoTag) ? 0. : 1.;
+					const auto a2 = (now == kNoTag) ? 0. : 1.;
+					tag->animation.stop();
+					tag->animation.start([=](float64 progress) {
+						if (was >= 0) {
+							buttons[was]->setSelectedProgress(1. - progress);
+						}
+						buttons[now]->setSelectedProgress(progress);
+						tag->context.color = anim::color(c1, c2, progress);
+						tag->frame = Ui::ChatsFilterTag(
+							upperTitle(),
+							tag->context);
+						tag->alpha = anim::interpolateF(a1, a2, progress);
+						preview->update();
+					}, 0., 1., st::universalDuration);
+				}
+				state->colorIndex = now;
+			});
+			if (!session->premium()) {
+				button->setClickedCallback([w = window] {
+					ShowPremiumPreviewToBuy(w, PremiumFeature::FilterTags);
+				});
+			}
+		}
+		line->sizeValue() | rpl::on_next([=](const QSize &size) {
+			const auto count = int(buttons.size());
+			const auto totalWidth = count * side;
+			const auto spacing = (size.width() - totalWidth) / (count - 1);
+			for (auto i = 0; i < kColorsCount; ++i) {
+				const auto &button = buttons[i];
+				button->moveToLeft(i * (side + spacing), 0);
+			}
+		}, line->lifetime());
+
+		{
+			const auto last = buttons.back();
+			const auto icon = Ui::CreateChild<Ui::RpWidget>(last);
+			icon->resize(side, side);
+			icon->paintRequest() | rpl::on_next([=] {
+				auto p = QPainter(icon);
+				(session->premium()
+					? st::windowFilterSmallRemove.icon
+					: st::historySendDisabledIcon).paintInCenter(
+						p,
+						QRectF(icon->rect()),
+						st::historyPeerUserpicFg->c);
+			}, icon->lifetime());
+			icon->setAttribute(Qt::WA_TransparentForMouseEvents);
+			last->setBrush(st::historyPeerArchiveUserpicBg);
+		}
+
+		Ui::AddSkip(colors);
+		Ui::AddSkip(colors);
+		Ui::AddDividerText(colors, tr::lng_filters_tag_color_about());
+		Ui::AddSkip(colors);
+	}
+
+	const auto collect = [=]() -> std::optional<Data::ChatFilter> {
+		auto title = state->title.current();
+		const auto staticTitle = !title.entities.isEmpty()
+			&& state->staticTitle.current();
+		const auto rules = data->current();
+		if (Ui::ComputeFieldCharacterCount(name) > kMaxFilterTitleLength
+			|| title.empty()) {
+			name->showError();
+			box->scrollToY(0);
+			return {};
+		} else if (!(rules.flags() & kTypes) && rules.always().empty()) {
+			window->window().showToast(tr::lng_filters_empty(tr::now));
+			return {};
+		} else if ((rules.flags() == (kTypes | Flag::NoArchived))
+			&& rules.always().empty()
+			&& rules.never().empty()) {
+			window->window().showToast(tr::lng_filters_default(tr::now));
+			return {};
+		}
+		const auto rawColorIndex = state->colorIndex.current();
+		const auto colorIndex = (rawColorIndex >= kNoTag
+			? std::nullopt
+			: std::make_optional(rawColorIndex));
+		return rules.withTitle(
+			{ std::move(title), staticTitle }
+		).withColorIndex(colorIndex);
+	};
+
+	Ui::AddSubsectionTitle(
+		content,
+		rpl::conditional(
+			state->hasLinks.value(),
+			tr::lng_filters_link_has(),
+			tr::lng_filters_link()));
+
+	state->hasLinks.changes() | rpl::on_next([=] {
+		content->resizeToWidth(content->widthNoMargins());
+	}, content->lifetime());
+
+	if (filter.chatlist()) {
+		window->session().data().chatsFilters().reloadChatlistLinks(
+			filter.id());
+	}
+
+	const auto createLink = AddToggledButton(
+		content,
+		state->hasLinks.value() | rpl::map(!rpl::mappers::_1),
+		tr::lng_filters_link_create(),
+		st::settingsButtonActive,
+		{ &st::settingsFolderShareIcon, IconType::Simple });
+	const auto addLink = AddToggledButton(
+		content,
+		state->hasLinks.value(),
+		tr::lng_group_invite_add(),
+		st::settingsButtonActive,
+		{ &st::settingsIconAdd, IconType::Round, &st::windowBgActive });
+
+	SetupFilterLinks(
+		content,
+		window,
+		state->links.value(),
+		[=] { return collect().value_or(Data::ChatFilter()); });
+
+	rpl::merge(
+		createLink->clicks(),
+		addLink->clicks()
+	) | rpl::filter(
+		(rpl::mappers::_1 == Qt::LeftButton)
+	) | rpl::on_next([=](Qt::MouseButton button) {
+		const auto result = collect();
+		if (!result || !GoodForExportFilterLink(window, *result)) {
+			return;
+		}
+		const auto shared = CollectFilterLinkChats(*result);
+		if (shared.empty()) {
+			window->show(ShowLinkBox(window, *result, {}));
+			return;
+		}
+		saveAnd(*result, crl::guard(box, [=](Data::ChatFilter updated) {
+			state->creating = false;
+
+			// Comparison of ChatFilter-s don't take id into account!
+			data->force_assign(updated);
+			const auto id = updated.id();
+			state->links = owner->chatsFilters().chatlistLinks(id);
+			ExportFilterLink(id, shared, crl::guard(box, [=](
+					Data::ChatFilterLink link) {
+				Expects(link.id == id);
+
+				*data = data->current().withChatlist(true, true);
+				window->show(ShowLinkBox(window, updated, link));
+			}), crl::guard(box, [=](QString error) {
+				const auto session = &window->session();
+				if (error == u"CHATLISTS_TOO_MUCH"_q) {
+					window->show(Box(ShareableFiltersLimitBox, session));
+				} else if (error == u"INVITES_TOO_MUCH"_q) {
+					window->show(Box(FilterLinksLimitBox, session));
+				} else if (error == u"CHANNELS_TOO_MUCH"_q) {
+					window->show(Box(ChannelsLimitBox, session));
+				} else if (error == u"USER_CHANNELS_TOO_MUCH"_q) {
+					window->showToast(
+						{ tr::lng_filters_link_group_admin_error(tr::now) });
+				} else {
+					window->show(ShowLinkBox(window, updated, { .id = id }));
+				}
+			}));
+		}));
+	}, createLink->lifetime());
+	Ui::AddSkip(content);
+	Ui::AddDividerText(
+		content,
+		rpl::conditional(
+			state->hasLinks.value(),
+			tr::lng_filters_link_about_many(),
+			tr::lng_filters_link_about()));
+
+	const auto show = box->uiShow();
 	const auto refreshPreviews = [=] {
 		include->updateData(
 			data->current().flags() & kTypes,
@@ -622,7 +1107,7 @@ void EditFilterBox(
 		EditExceptions(
 			window,
 			box,
-			kTypes,
+			kTypes | (state->chatlist.current() ? Flag::Chatlist : Flag()),
 			data,
 			updateDefaultTitle,
 			refreshPreviews);
@@ -638,41 +1123,26 @@ void EditFilterBox(
 	});
 
 	const auto save = [=] {
-		const auto title = name->getLastText().trimmed();
-		const auto rules = data->current();
-		const auto result = Data::ChatFilter(
-			rules.id(),
-			title,
-			rules.iconEmoji(),
-			rules.flags(),
-			rules.always(),
-			rules.pinned(),
-			rules.never());
-		if (title.isEmpty()) {
-			name->showError();
-			return;
-		} else if (!(rules.flags() & kTypes) && rules.always().empty()) {
-			window->window().showToast(tr::lng_filters_empty(tr::now));
-			return;
-		} else if ((rules.flags() == (kTypes | Flag::NoArchived))
-			&& rules.always().empty()
-			&& rules.never().empty()) {
-			window->window().showToast(tr::lng_filters_default(tr::now));
-			return;
+		if (const auto result = collect()) {
+			box->closeBox();
+			doneCallback(*result);
 		}
-		box->closeBox();
-
-		doneCallback(result);
 	};
-	box->addButton(
-		creating ? tr::lng_filters_create_button() : tr::lng_settings_save(),
-		save);
+	name->submits() | rpl::on_next(save, name->lifetime());
+
+	box->addButton(rpl::conditional(
+		state->creating.value(),
+		tr::lng_filters_create_button(),
+		tr::lng_settings_save()
+	), save);
 	box->addButton(tr::lng_cancel(), [=] { box->closeBox(); });
 }
 
 void EditExistingFilter(
 		not_null<Window::SessionController*> window,
 		FilterId id) {
+	Expects(id != 0);
+
 	const auto session = &window->session();
 	const auto &list = session->data().chatsFilters().list();
 	const auto i = ranges::find(list, id, &Data::ChatFilter::id);
@@ -693,9 +1163,16 @@ void EditExistingFilter(
 			tl
 		)).send();
 	};
+	const auto saveAnd = [=](
+			const Data::ChatFilter &data,
+			Fn<void(Data::ChatFilter)> next) {
+		doneCallback(data);
+		next(data);
+	};
 	window->window().show(Box(
 		EditFilterBox,
 		window,
 		*i,
-		crl::guard(session, doneCallback)));
+		crl::guard(session, doneCallback),
+		crl::guard(session, saveAnd)));
 }

@@ -8,9 +8,11 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #pragma once
 
 #include "base/flags.h"
+#include "data/data_chat_participant_status.h"
 
 class History;
 class PeerData;
+class UserData;
 class HistoryItem;
 
 namespace Dialogs {
@@ -21,9 +23,7 @@ namespace Main {
 class Session;
 } // namespace Main
 
-namespace Data {
-
-namespace details {
+namespace Data::details {
 
 template <typename Flag>
 inline constexpr int CountBit(Flag Last = Flag::LastUsedBit) {
@@ -32,10 +32,16 @@ inline constexpr int CountBit(Flag Last = Flag::LastUsedBit) {
 		++i;
 		Assert(i != 64);
 	}
-	return (i + 1);
+	return i;
 }
 
-} // namespace details
+} // namespace Data::details
+
+namespace Data {
+
+class ForumTopic;
+class SavedSublist;
+class Story;
 
 struct NameUpdate {
 	NameUpdate(
@@ -50,51 +56,80 @@ struct NameUpdate {
 };
 
 struct PeerUpdate {
-	enum class Flag : uint32 {
+	enum class Flag : uint64 {
 		None = 0,
 
 		// Common flags
-		Name              = (1U << 0),
-		Username          = (1U << 1),
-		Photo             = (1U << 2),
-		About             = (1U << 3),
-		Notifications     = (1U << 4),
-		Migration         = (1U << 5),
-		UnavailableReason = (1U << 6),
-		ChatThemeEmoji    = (1U << 7),
-		IsBlocked         = (1U << 8),
-		MessagesTTL       = (1U << 9),
+		Name                = (1ULL << 0),
+		Username            = (1ULL << 1),
+		Photo               = (1ULL << 2),
+		About               = (1ULL << 3),
+		Notifications       = (1ULL << 4),
+		Migration           = (1ULL << 5),
+		UnavailableReason   = (1ULL << 6),
+		ChatThemeToken      = (1ULL << 7),
+		ChatWallPaper       = (1ULL << 8),
+		IsBlocked           = (1ULL << 9),
+		MessagesTTL         = (1ULL << 10),
+		FullInfo            = (1ULL << 11),
+		Usernames           = (1ULL << 12),
+		TranslationDisabled = (1ULL << 13),
+		Color               = (1ULL << 14),
+		ColorProfile        = (1ULL << 15),
+		BackgroundEmoji     = (1ULL << 16),
+		StoriesState        = (1ULL << 17),
+		VerifyInfo          = (1ULL << 18),
+		StarsPerMessage     = (1ULL << 19),
 
 		// For users
-		CanShareContact   = (1U << 10),
-		IsContact         = (1U << 11),
-		PhoneNumber       = (1U << 12),
-		OnlineStatus      = (1U << 13),
-		BotCommands       = (1U << 14),
-		BotCanBeInvited   = (1U << 15),
-		BotStartToken     = (1U << 16),
-		CommonChats       = (1U << 17),
-		HasCalls          = (1U << 18),
-		SupportInfo       = (1U << 19),
-		IsBot             = (1U << 20),
+		CanShareContact     = (1ULL << 20),
+		IsContact           = (1ULL << 21),
+		PhoneNumber         = (1ULL << 22),
+		OnlineStatus        = (1ULL << 23),
+		BotCommands         = (1ULL << 24),
+		BotCanBeInvited     = (1ULL << 25),
+		BotStartToken       = (1ULL << 26),
+		CommonChats         = (1ULL << 27),
+		PeerGifts           = (1ULL << 28),
+		HasCalls            = (1ULL << 29),
+		SupportInfo         = (1ULL << 30),
+		IsBot               = (1ULL << 31),
+		EmojiStatus         = (1ULL << 32),
+		BusinessDetails     = (1ULL << 33),
+		Birthday            = (1ULL << 34),
+		PersonalChannel     = (1ULL << 35),
+		StarRefProgram      = (1ULL << 36),
+		PaysPerMessage      = (1ULL << 37),
+		GiftSettings        = (1ULL << 38),
+		StarsRating         = (1ULL << 39),
+		ContactNote         = (1ULL << 40),
 
 		// For chats and channels
-		InviteLinks       = (1U << 21),
-		Members           = (1U << 22),
-		Admins            = (1U << 23),
-		BannedUsers       = (1U << 24),
-		Rights            = (1U << 25),
+		InviteLinks         = (1ULL << 41),
+		Members             = (1ULL << 42),
+		Admins              = (1ULL << 43),
+		BannedUsers         = (1ULL << 44),
+		Rights              = (1ULL << 45),
+		PendingRequests     = (1ULL << 46),
+		Reactions           = (1ULL << 47),
 
 		// For channels
-		ChannelAmIn       = (1U << 26),
-		StickersSet       = (1U << 27),
-		ChannelLinkedChat = (1U << 28),
-		ChannelLocation   = (1U << 29),
-		Slowmode          = (1U << 30),
-		GroupCall         = (1U << 31),
+		ChannelAmIn         = (1ULL << 48),
+		StickersSet         = (1ULL << 49),
+		EmojiSet            = (1ULL << 50),
+		DiscussionLink      = (1ULL << 51),
+		MonoforumLink       = (1ULL << 52),
+		ChannelLocation     = (1ULL << 53),
+		Slowmode            = (1ULL << 54),
+		GroupCall           = (1ULL << 55),
+		ManagedBot          = (1ULL << 56),
+
+		MainProfileTab      = (1ULL << 57),
+		WalletCard          = (1ULL << 58),
+		BarSettings         = (1ULL << 59),
 
 		// For iteration
-		LastUsedBit       = (1U << 31),
+		LastUsedBit         = (1ULL << 59),
 	};
 	using Flags = base::flags<Flag>;
 	friend inline constexpr auto is_flag_type(Flag) { return true; }
@@ -108,28 +143,78 @@ struct HistoryUpdate {
 	enum class Flag : uint32 {
 		None = 0,
 
-		IsPinned       = (1U << 0),
-		UnreadView     = (1U << 1),
-		TopPromoted    = (1U << 2),
-		Folder         = (1U << 3),
-		UnreadMentions = (1U << 4),
-		LocalMessages  = (1U << 5),
-		ChatOccupied   = (1U << 6),
-		MessageSent    = (1U << 7),
-		ScheduledSent  = (1U << 8),
-		ForwardDraft   = (1U << 9),
-		OutboxRead     = (1U << 10),
-		BotKeyboard    = (1U << 11),
-		CloudDraft     = (1U << 12),
-		LocalDraftSet  = (1U << 13),
-		PinnedMessages = (1U << 14),
+		IsPinned           = (1U << 0),
+		UnreadView         = (1U << 1),
+		TopPromoted        = (1U << 2),
+		Folder             = (1U << 3),
+		UnreadMentions     = (1U << 4),
+		UnreadReactions    = (1U << 5),
+		ClientSideMessages = (1U << 6),
+		ChatOccupied       = (1U << 7),
+		MessageSent        = (1U << 8),
+		ScheduledSent      = (1U << 9),
+		OutboxRead         = (1U << 10),
+		BotKeyboard        = (1U << 11),
+		CloudDraft         = (1U << 12),
+		TranslateFrom      = (1U << 13),
+		TranslatedTo       = (1U << 14),
+		UnreadPollVotes    = (1U << 15),
+		StreamedDrafts     = (1U << 16),
+		ComposeStash       = (1U << 17),
 
-		LastUsedBit    = (1U << 14),
+		LastUsedBit        = (1U << 17),
 	};
 	using Flags = base::flags<Flag>;
 	friend inline constexpr auto is_flag_type(Flag) { return true; }
 
 	not_null<History*> history;
+	Flags flags = 0;
+
+};
+
+struct TopicUpdate {
+	enum class Flag : uint32 {
+		None = 0,
+
+		UnreadView      = (1U << 1),
+		UnreadMentions  = (1U << 2),
+		UnreadReactions = (1U << 3),
+		Notifications   = (1U << 4),
+		Title           = (1U << 5),
+		IconId          = (1U << 6),
+		ColorId         = (1U << 7),
+		CloudDraft      = (1U << 8),
+		Closed          = (1U << 9),
+		Creator         = (1U << 10),
+		Destroyed       = (1U << 11),
+		UnreadPollVotes = (1U << 12),
+
+		LastUsedBit     = (1U << 12),
+	};
+	using Flags = base::flags<Flag>;
+	friend inline constexpr auto is_flag_type(Flag) { return true; }
+
+	not_null<ForumTopic*> topic;
+	Flags flags = 0;
+
+};
+
+struct SublistUpdate {
+	enum class Flag : uint32 {
+		None = 0,
+
+		UnreadView = (1U << 1),
+		UnreadReactions = (1U << 2),
+		CloudDraft = (1U << 3),
+		Destroyed = (1U << 4),
+		UnreadPollVotes = (1U << 5),
+
+		LastUsedBit = (1U << 5),
+	};
+	using Flags = base::flags<Flag>;
+	friend inline constexpr auto is_flag_type(Flag) { return true; }
+
+	not_null<SavedSublist*> sublist;
 	Flags flags = 0;
 
 };
@@ -146,9 +231,10 @@ struct MessageUpdate {
 		ReplyMarkup        = (1U << 5),
 		BotCallbackSent    = (1U << 6),
 		NewMaybeAdded      = (1U << 7),
-		RepliesUnreadCount = (1U << 8),
+		ReplyToTopAdded    = (1U << 8),
+		NewUnreadReaction  = (1U << 9),
 
-		LastUsedBit        = (1U << 7),
+		LastUsedBit        = (1U << 9),
 	};
 	using Flags = base::flags<Flag>;
 	friend inline constexpr auto is_flag_type(Flag) { return true; }
@@ -162,9 +248,14 @@ struct EntryUpdate {
 	enum class Flag : uint32 {
 		None = 0,
 
-		Repaint = (1U << 0),
+		Repaint           = (1U << 0),
+		HasPinnedMessages = (1U << 1),
+		ForwardDraft      = (1U << 2),
+		LocalDraftSet     = (1U << 3),
+		Height            = (1U << 4),
+		Destroyed         = (1U << 5),
 
-		LastUsedBit = (1U << 0),
+		LastUsedBit       = (1U << 5),
 	};
 	using Flags = base::flags<Flag>;
 	friend inline constexpr auto is_flag_type(Flag) { return true; }
@@ -172,6 +263,40 @@ struct EntryUpdate {
 	not_null<Dialogs::Entry*> entry;
 	Flags flags = 0;
 
+};
+
+struct StoryUpdate {
+	enum class Flag : uint32 {
+		None = 0,
+
+		Edited       = (1U << 0),
+		Destroyed    = (1U << 1),
+		NewAdded     = (1U << 2),
+		ViewsChanged = (1U << 3),
+		MarkRead     = (1U << 4),
+		Reaction     = (1U << 5),
+
+		LastUsedBit  = (1U << 5),
+	};
+	using Flags = base::flags<Flag>;
+	friend inline constexpr auto is_flag_type(Flag) { return true; }
+
+	not_null<Story*> story;
+	Flags flags = 0;
+
+};
+
+struct ChatAdminChange {
+	not_null<PeerData*> peer;
+	not_null<UserData*> user;
+	ChatAdminRights rights;
+	QString rank;
+};
+
+struct ChatMemberRankChange {
+	not_null<PeerData*> peer;
+	not_null<UserData*> user;
+	QString rank;
 };
 
 class Changes final {
@@ -196,8 +321,6 @@ public:
 	[[nodiscard]] rpl::producer<PeerUpdate> peerFlagsValue(
 		not_null<PeerData*> peer,
 		PeerUpdate::Flags flags) const;
-	[[nodiscard]] rpl::producer<PeerUpdate> realtimePeerUpdates(
-		PeerUpdate::Flag flag) const;
 
 	void historyUpdated(
 		not_null<History*> history,
@@ -207,11 +330,34 @@ public:
 	[[nodiscard]] rpl::producer<HistoryUpdate> historyUpdates(
 		not_null<History*> history,
 		HistoryUpdate::Flags flags) const;
+	[[nodiscard]] rpl::producer<HistoryUpdate> realtimeHistoryUpdates(
+		HistoryUpdate::Flag flag) const;
 	[[nodiscard]] rpl::producer<HistoryUpdate> historyFlagsValue(
 		not_null<History*> history,
 		HistoryUpdate::Flags flags) const;
-	[[nodiscard]] rpl::producer<HistoryUpdate> realtimeHistoryUpdates(
-		HistoryUpdate::Flag flag) const;
+
+	void topicUpdated(
+		not_null<ForumTopic*> topic,
+		TopicUpdate::Flags flags);
+	[[nodiscard]] rpl::producer<TopicUpdate> topicUpdates(
+		TopicUpdate::Flags flags) const;
+	[[nodiscard]] rpl::producer<TopicUpdate> topicUpdates(
+		not_null<ForumTopic*> topic,
+		TopicUpdate::Flags flags) const;
+	[[nodiscard]] rpl::producer<TopicUpdate> topicFlagsValue(
+		not_null<ForumTopic*> topic,
+		TopicUpdate::Flags flags) const;
+	void topicRemoved(not_null<ForumTopic*> topic);
+
+	void sublistUpdated(
+		not_null<SavedSublist*> sublist,
+		SublistUpdate::Flags flags);
+	[[nodiscard]] rpl::producer<SublistUpdate> sublistUpdates(
+		SublistUpdate::Flags flags) const;
+	[[nodiscard]] rpl::producer<SublistUpdate> sublistUpdates(
+		not_null<SavedSublist*> sublist,
+		SublistUpdate::Flags flags) const;
+	void sublistRemoved(not_null<SavedSublist*> sublist);
 
 	void messageUpdated(
 		not_null<HistoryItem*> item,
@@ -238,8 +384,29 @@ public:
 	[[nodiscard]] rpl::producer<EntryUpdate> entryFlagsValue(
 		not_null<Dialogs::Entry*> entry,
 		EntryUpdate::Flags flags) const;
-	[[nodiscard]] rpl::producer<EntryUpdate> realtimeEntryUpdates(
-		EntryUpdate::Flag flag) const;
+	void entryRemoved(not_null<Dialogs::Entry*> entry);
+
+	void storyUpdated(
+		not_null<Story*> story,
+		StoryUpdate::Flags flags);
+	[[nodiscard]] rpl::producer<StoryUpdate> storyUpdates(
+		StoryUpdate::Flags flags) const;
+	[[nodiscard]] rpl::producer<StoryUpdate> storyUpdates(
+		not_null<Story*> story,
+		StoryUpdate::Flags flags) const;
+
+	void chatAdminChanged(
+		not_null<PeerData*> peer,
+		not_null<UserData*> user,
+		ChatAdminRights rights,
+		QString rank);
+	[[nodiscard]] rpl::producer<ChatAdminChange> chatAdminChanges() const;
+
+	void chatMemberRankChanged(
+		not_null<PeerData*> peer,
+		not_null<UserData*> user,
+		QString rank);
+	[[nodiscard]] rpl::producer<ChatMemberRankChange> chatMemberRankChanges() const;
 
 	void sendNotifications();
 
@@ -264,12 +431,16 @@ private:
 		[[nodiscard]] rpl::producer<UpdateType> realtimeUpdates(
 			Flag flag) const;
 
+		void drop(not_null<DataType*> data);
+
 		void sendNotifications();
 
 	private:
-		static constexpr auto kCount = details::CountBit<Flag>();
+		static constexpr auto kCount = details::CountBit<Flag>() + 1;
 
-		void sendRealtimeNotifications(not_null<DataType*> data, Flags flags);
+		void sendRealtimeNotifications(
+			not_null<DataType*> data,
+			Flags flags);
 
 		std::array<rpl::event_stream<UpdateType>, kCount> _realtimeStreams;
 		base::flat_map<not_null<DataType*>, Flags> _updates;
@@ -284,8 +455,13 @@ private:
 	rpl::event_stream<NameUpdate> _nameStream;
 	Manager<PeerData, PeerUpdate> _peerChanges;
 	Manager<History, HistoryUpdate> _historyChanges;
+	Manager<ForumTopic, TopicUpdate> _topicChanges;
+	Manager<SavedSublist, SublistUpdate> _sublistChanges;
 	Manager<HistoryItem, MessageUpdate> _messageChanges;
 	Manager<Dialogs::Entry, EntryUpdate> _entryChanges;
+	Manager<Story, StoryUpdate> _storyChanges;
+	rpl::event_stream<ChatAdminChange> _chatAdminChanges;
+	rpl::event_stream<ChatMemberRankChange> _chatMemberRankChanges;
 
 	bool _notify = false;
 

@@ -9,11 +9,13 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 #include "ui/widgets/menu/menu_action.h"
 #include "ui/effects/ripple_animation.h"
+#include "ui/painter.h"
 #include "lang/lang_keys.h"
 #include "base/call_delayed.h"
 #include "base/unixtime.h"
 #include "base/timer.h"
 #include "styles/style_chat.h"
+#include "styles/style_menu_icons.h"
 
 namespace Ui {
 namespace {
@@ -21,7 +23,7 @@ namespace {
 class ActionWithTimer final : public Menu::ItemBase {
 public:
 	ActionWithTimer(
-		not_null<RpWidget*> parent,
+		not_null<Menu::Menu*> parent,
 		const style::Menu &st,
 		TimeId destroyAt,
 		Fn<void()> callback,
@@ -32,13 +34,12 @@ public:
 
 	void handleKeyPress(not_null<QKeyEvent*> e) override;
 
-protected:
+private:
 	QPoint prepareRippleStartPosition() const override;
 	QImage prepareRippleMask() const override;
 
 	int contentHeight() const override;
 
-private:
 	void prepare();
 	void refreshAutoDeleteText();
 	void paint(Painter &p);
@@ -58,14 +59,14 @@ private:
 };
 
 TextParseOptions MenuTextOptions = {
-	TextParseLinks | TextParseRichText, // flags
+	TextParseLinks, // flags
 	0, // maxw
 	0, // maxh
 	Qt::LayoutDirectionAuto, // dir
 };
 
 ActionWithTimer::ActionWithTimer(
-	not_null<RpWidget*> parent,
+	not_null<Menu::Menu*> parent,
 	const style::Menu &st,
 	TimeId destroyAt,
 	Fn<void()> callback,
@@ -82,11 +83,11 @@ ActionWithTimer::ActionWithTimer(
 		+ st::ttlItemTimerFont->height
 		+ st::ttlItemPadding.bottom()) {
 	setAcceptBoth(true);
-	initResizeHook(parent->sizeValue());
-	setClickedCallback(std::move(callback));
+	fitToMenuWidth();
+	setActionTriggered(std::move(callback));
 
 	paintRequest(
-	) | rpl::start_with_next([=] {
+	) | rpl::on_next([=] {
 		Painter p(this);
 		paint(p);
 	}, lifetime());
@@ -104,6 +105,16 @@ void ActionWithTimer::paint(Painter &p) {
 	if (isEnabled()) {
 		paintRipple(p, 0, 0);
 	}
+
+	const auto normalHeight = _st.itemPadding.top()
+		+ _st.itemStyle.font->height
+		+ _st.itemPadding.bottom();
+	const auto deltaHeight = _height - normalHeight;
+	st::menuIconDelete.paint(
+		p,
+		_st.itemIconPosition + QPoint(0, deltaHeight / 2),
+		width());
+
 	p.setPen(selected ? _st.itemFgOver : _st.itemFg);
 	_text.drawLeftElided(
 		p,
@@ -126,10 +137,7 @@ void ActionWithTimer::refreshAutoDeleteText() {
 	const auto left = (_destroyAt > now) ? (_destroyAt - now) : 0;
 	const auto text = [&] {
 		const auto duration = (left >= 86400)
-			? tr::lng_group_call_duration_days(
-				tr::now,
-				lt_count,
-				((left + 43200) / 86400))
+			? tr::lng_days(tr::now, lt_count, ((left + 43200) / 86400))
 			: (left >= 3600)
 			? QString("%1:%2:%3"
 			).arg(left / 3600
@@ -180,10 +188,7 @@ void ActionWithTimer::prepare() {
 			+ padding.right();
 	};
 	const auto maxWidth1 = ttlMaxWidth("23:59:59");
-	const auto maxWidth2 = ttlMaxWidth(tr::lng_group_call_duration_days(
-		tr::now,
-		lt_count,
-		7));
+	const auto maxWidth2 = ttlMaxWidth(tr::lng_days(tr::now, lt_count, 7));
 
 	const auto w = std::clamp(
 		std::max({ goodWidth, maxWidth1, maxWidth2 }),
@@ -207,7 +212,7 @@ QPoint ActionWithTimer::prepareRippleStartPosition() const {
 }
 
 QImage ActionWithTimer::prepareRippleMask() const {
-	return Ui::RippleAnimation::rectMask(size());
+	return Ui::RippleAnimation::RectMask(size());
 }
 
 int ActionWithTimer::contentHeight() const {
@@ -239,8 +244,8 @@ base::unique_qptr<Menu::ItemBase> DeleteMessageContextAction(
 				menu,
 				tr::lng_context_delete_msg(tr::now),
 				std::move(callback)),
-			nullptr,
-			nullptr);
+			&st::menuIconDelete,
+			&st::menuIconDelete);
 	}
 	return base::make_unique_q<ActionWithTimer>(
 		menu,

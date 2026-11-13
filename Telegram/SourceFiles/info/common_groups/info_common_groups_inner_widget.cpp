@@ -7,6 +7,7 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "info/common_groups/info_common_groups_inner_widget.h"
 
+#include "base/weak_ptr.h"
 #include "info/common_groups/info_common_groups_widget.h"
 #include "info/info_controller.h"
 #include "lang/lang_keys.h"
@@ -18,7 +19,6 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "data/data_user.h"
 #include "data/data_session.h"
 #include "styles/style_info.h"
-#include "styles/style_widgets.h"
 
 namespace Info {
 namespace CommonGroups {
@@ -27,10 +27,12 @@ namespace {
 constexpr auto kCommonGroupsPerPage = 40;
 constexpr auto kCommonGroupsSearchAfter = 20;
 
-class ListController final : public PeerListController {
+class ListController final
+	: public PeerListController
+	, public base::has_weak_ptr {
 public:
 	ListController(
-		not_null<Controller*> controller,
+		not_null<AbstractController*> controller,
 		not_null<UserData*> user);
 
 	Main::Session &session() const override;
@@ -54,7 +56,7 @@ private:
 		bool allLoaded = false;
 		bool wasLoading = false;
 	};
-	const not_null<Controller*> _controller;
+	const not_null<AbstractController*> _controller;
 	MTP::Sender _api;
 	not_null<UserData*> _user;
 	mtpRequestId _preloadRequestId = 0;
@@ -64,7 +66,7 @@ private:
 };
 
 ListController::ListController(
-	not_null<Controller*> controller,
+	not_null<AbstractController*> controller,
 	not_null<UserData*> user)
 : PeerListController()
 , _controller(controller)
@@ -95,7 +97,7 @@ void ListController::loadMoreRows() {
 		return;
 	}
 	_preloadRequestId = _api.request(MTPmessages_GetCommonChats(
-		_user->inputUser,
+		_user->inputUser(),
 		MTP_long(peerIsChat(_preloadGroupId)
 			? peerToChat(_preloadGroupId).bare
 			: peerToChannel(_preloadGroupId).bare),
@@ -108,16 +110,30 @@ void ListController::loadMoreRows() {
 			return data.vchats().v;
 		});
 		if (!chats.empty()) {
+			auto add = std::vector<not_null<PeerData*>>();
+			auto allLoaded = _allLoaded;
+			auto preloadGroupId = _preloadGroupId;
+			const auto owner = &_user->owner();
+			const auto weak = base::make_weak(this);
 			for (const auto &chat : chats) {
-				if (const auto peer = _user->owner().processChat(chat)) {
+				if (const auto peer = owner->processChat(chat)) {
 					if (!peer->migrateTo()) {
-						delegate()->peerListAppendRow(
-							createRow(peer));
+						add.push_back(peer);
 					}
-					_preloadGroupId = peer->id;
-					_allLoaded = false;
+					preloadGroupId = peer->id;
+					allLoaded = false;
 				}
 			}
+			if (!weak) {
+				return;
+			}
+			for (const auto &peer : add) {
+				if (!delegate()->peerListFindRow(peer->id.value)) {
+					delegate()->peerListAppendRow(createRow(peer));
+				}
+			}
+			_preloadGroupId = preloadGroupId;
+			_allLoaded = allLoaded;
 			delegate()->peerListRefreshRows();
 		}
 		auto fullCount = delegate()->peerListFullRowsCount();
@@ -160,18 +176,25 @@ void ListController::restoreState(
 }
 
 void ListController::rowClicked(not_null<PeerListRow*> row) {
-	_controller->parentController()->showPeerHistory(
-		row->peer(),
-		Window::SectionShow::Way::Forward);
+	const auto peer = row->peer();
+	const auto controller = _controller->parentController();
+	if (const auto forum = peer->forum()) {
+		controller->showForum(forum);
+	} else {
+		controller->showPeerHistory(
+			peer,
+			Window::SectionShow::Way::Forward);
+	}
 }
 
 } // namespace
 
 InnerWidget::InnerWidget(
 	QWidget *parent,
-	not_null<Controller*> controller,
+	not_null<AbstractController*> controller,
 	not_null<UserData*> user)
 : RpWidget(parent)
+, _show(controller->uiShow())
 , _controller(controller)
 , _user(user)
 , _listController(std::make_unique<ListController>(controller, _user))
@@ -179,11 +202,13 @@ InnerWidget::InnerWidget(
 	setContent(_list.data());
 	_listController->setDelegate(static_cast<PeerListDelegate*>(this));
 
-	_controller->searchFieldController()->queryValue(
-	) | rpl::start_with_next([this](QString &&query) {
-		peerListScrollToTop();
-		content()->searchQueryChanged(std::move(query));
-	}, lifetime());
+	if (const auto search = _controller->searchFieldController()) {
+		search->queryValue(
+		) | rpl::on_next([this](QString &&query) {
+			peerListScrollToTop();
+			content()->searchQueryChanged(std::move(query));
+		}, lifetime());
+	}
 }
 
 void InnerWidget::visibleTopBottomUpdated(
@@ -206,10 +231,10 @@ rpl::producer<Ui::ScrollToRequest> InnerWidget::scrollToRequests() const {
 
 int InnerWidget::desiredHeight() const {
 	auto desired = 0;
-	auto count = qMax(_user->commonChatsCount(), 1);
-	desired += qMax(count, _list->fullRowsCount())
+	auto count = std::max(_user->commonChatsCount(), 1);
+	desired += std::max(count, _list->fullRowsCount())
 		* st::infoCommonGroupsList.item.height;
-	return qMax(height(), desired);
+	return std::max(height(), desired);
 }
 
 object_ptr<InnerWidget::ListWidget> InnerWidget::setupList(
@@ -220,7 +245,7 @@ object_ptr<InnerWidget::ListWidget> InnerWidget::setupList(
 		parent,
 		controller);
 	result->scrollToRequests(
-	) | rpl::start_with_next([this](Ui::ScrollToRequest request) {
+	) | rpl::on_next([this](Ui::ScrollToRequest request) {
 		auto addmin = (request.ymin < 0)
 			? 0
 			: st::infoCommonGroupsMargin.top();
@@ -233,11 +258,11 @@ object_ptr<InnerWidget::ListWidget> InnerWidget::setupList(
 	}, result->lifetime());
 	result->moveToLeft(0, st::infoCommonGroupsMargin.top());
 	parent->widthValue(
-	) | rpl::start_with_next([list = result.data()](int newWidth) {
+	) | rpl::on_next([list = result.data()](int newWidth) {
 		list->resizeToWidth(newWidth);
 	}, result->lifetime());
 	result->heightValue(
-	) | rpl::start_with_next([parent](int listHeight) {
+	) | rpl::on_next([parent](int listHeight) {
 		auto newHeight = st::infoCommonGroupsMargin.top()
 			+ listHeight
 			+ st::infoCommonGroupsMargin.bottom();
@@ -280,6 +305,9 @@ void InnerWidget::peerListSetDescription(
 	description.destroy();
 }
 
+std::shared_ptr<Main::SessionShow> InnerWidget::peerListUiShow() {
+	return _show;
+}
+
 } // namespace CommonGroups
 } // namespace Info
-

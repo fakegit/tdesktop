@@ -7,55 +7,128 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 */
 #include "api/api_cloud_password.h"
 
-#include "base/openssl_help.h"
-#include "core/core_cloud_password.h"
 #include "apiwrap.h"
+#include "base/random.h"
+#include "core/core_cloud_password.h"
+#include "mtproto/mtproto_response.h"
+#include "passport/passport_encryption.h"
+
+#include "base/unixtime.h"
+#include "base/call_delayed.h"
 
 namespace Api {
+namespace {
 
-// #TODO Add ability to set recovery email separately.
+[[nodiscard]] Core::CloudPasswordState ProcessMtpState(
+		const MTPaccount_password &state) {
+	return state.match([&](const MTPDaccount_password &data) {
+		base::RandomAddSeed(bytes::make_span(data.vsecure_random().v));
+		return Core::ParseCloudPasswordState(data);
+	});
+}
+
+[[nodiscard]] Core::CloudPasswordResult GeneratePasswordCheck(
+		const QString &password,
+		const Core::CloudPasswordState &latestState) {
+	if (password.isEmpty() || !latestState.hasPassword) {
+		// ComputeCloudPasswordHash() aborts on the passwordless null algorithm.
+		return Core::CloudPasswordResult{
+			MTP_inputCheckPasswordEmpty()
+		};
+	}
+	const auto hash = Core::ComputeCloudPasswordHash(
+		latestState.mtp.request.algo,
+		bytes::make_span(password.toUtf8()));
+	return Core::ComputeCloudPasswordCheck(
+		latestState.mtp.request,
+		hash);
+}
+
+} // namespace
 
 CloudPassword::CloudPassword(not_null<ApiWrap*> api)
 : _api(&api->instance()) {
 }
 
-void CloudPassword::reload() {
-	if (_requestId) {
+void CloudPassword::apply(Core::CloudPasswordState state) {
+	if (_state) {
+		*_state = std::move(state);
+	} else {
+		_state = std::make_unique<Core::CloudPasswordState>(std::move(state));
+	}
+	_stateChanges.fire_copy(*_state);
+}
+
+void CloudPassword::finishSet(
+		rpl::consumer<SetOk, QString> consumer,
+		int codeLength) {
+	_api.request(MTPaccount_GetPassword(
+	)).done([=](const MTPaccount_Password &result) {
+		apply(ProcessMtpState(result));
+		if (codeLength) {
+			consumer.put_next(SetOk{ codeLength });
+		} else {
+			consumer.put_done();
+		}
+	}).fail([=](const MTP::Error &error) {
+		consumer.put_error_copy(error.type());
+	}).handleFloodErrors().send();
+}
+
+void CloudPassword::reload(
+		Fn<void(std::optional<Core::CloudPasswordState>)> callback) {
+	if (callback) {
+		_callbacks.push_back(std::move(callback));
+	}
+	if (_reloadRequestId || _cancelEmailRequestId) {
 		return;
 	}
-	_requestId = _api.request(MTPaccount_GetPassword(
-	)).done([=](const MTPaccount_Password &result) {
-		_requestId = 0;
-		result.match([&](const MTPDaccount_password &data) {
-			openssl::AddRandomSeed(bytes::make_span(data.vsecure_random().v));
-			if (_state) {
-				*_state = Core::ParseCloudPasswordState(data);
-			} else {
-				_state = std::make_unique<Core::CloudPasswordState>(
-					Core::ParseCloudPasswordState(data));
-			}
-			_stateChanges.fire_copy(*_state);
-		});
-	}).fail([=](const MTP::Error &error) {
-		_requestId = 0;
+	_reloadRequestId = _api.request(MTPaccount_GetPassword(
+	)).done([=](const MTPaccount_Password &result, mtpRequestId requestId) {
+		if (_reloadRequestId != requestId) {
+			return;
+		}
+		_reloadRequestId = 0;
+		const auto callbacks = base::take(_callbacks);
+		const auto state = ProcessMtpState(result);
+		apply(state);
+		for (const auto &callback : callbacks) {
+			callback(state);
+		}
+	}).fail([=](const MTP::Error &error, mtpRequestId requestId) {
+		if (_reloadRequestId != requestId) {
+			return;
+		}
+		_reloadRequestId = 0;
+		for (const auto &callback : base::take(_callbacks)) {
+			callback(std::nullopt);
+		}
 	}).send();
 }
 
 void CloudPassword::clearUnconfirmedPassword() {
-	_requestId = _api.request(MTPaccount_CancelPasswordEmail(
-	)).done([=](const MTPBool &result) {
-		_requestId = 0;
-		reload();
-	}).fail([=](const MTP::Error &error) {
-		_requestId = 0;
-		reload();
+	if (_cancelEmailRequestId) {
+		return;
+	}
+	_api.request(base::take(_reloadRequestId)).cancel();
+	const auto finished = [=](mtpRequestId requestId) {
+		if (_cancelEmailRequestId == requestId) {
+			_cancelEmailRequestId = 0;
+			reload();
+		}
+	};
+	_cancelEmailRequestId = _api.request(MTPaccount_CancelPasswordEmail(
+	)).done([=](const MTPBool &result, mtpRequestId requestId) {
+		finished(requestId);
+	}).fail([=](const MTP::Error &error, mtpRequestId requestId) {
+		finished(requestId);
 	}).send();
 }
 
 rpl::producer<Core::CloudPasswordState> CloudPassword::state() const {
 	return _state
 		? _stateChanges.events_starting_with_copy(*_state)
-		: (_stateChanges.events() | rpl::type_erased());
+		: (_stateChanges.events() | rpl::type_erased);
 }
 
 auto CloudPassword::stateCurrent() const
@@ -65,7 +138,7 @@ auto CloudPassword::stateCurrent() const
 		: std::nullopt;
 }
 
-auto CloudPassword::resetPassword()
+auto CloudPassword::resetPassword(bool ignoreSilentErrors)
 -> rpl::producer<CloudPassword::ResetRetryDate, QString> {
 	return [=](auto consumer) {
 		_api.request(MTPaccount_ResetPassword(
@@ -87,7 +160,9 @@ auto CloudPassword::resetPassword()
 			});
 			consumer.put_done();
 		}).fail([=](const MTP::Error &error) {
-			consumer.put_error_copy(error.type());
+			consumer.put_error_copy((ignoreSilentErrors && MTP::IgnoreError(error))
+				? QString()
+				: error.type());
 		}).send();
 
 		return rpl::lifetime();
@@ -107,6 +182,392 @@ auto CloudPassword::cancelResetPassword()
 
 		return rpl::lifetime();
 	};
+}
+
+rpl::producer<CloudPassword::SetOk, QString> CloudPassword::set(
+		const QString &oldPassword,
+		const QString &newPassword,
+		const QString &hint,
+		bool hasRecoveryEmail,
+		const QString &recoveryEmail) {
+
+	const auto sendMTPaccountUpdatePasswordSettings = [=](
+			const Core::CloudPasswordState &latestState,
+			const QByteArray &secureSecret,
+			auto consumer) {
+		const auto newPasswordBytes = newPassword.toUtf8();
+		const auto newPasswordHash = Core::ComputeCloudPasswordDigest(
+			latestState.mtp.newPassword,
+			bytes::make_span(newPasswordBytes));
+		if (!newPassword.isEmpty() && newPasswordHash.modpow.empty()) {
+			consumer.put_error("INTERNAL_SERVER_ERROR");
+			return;
+		}
+		using Flag = MTPDaccount_passwordInputSettings::Flag;
+		const auto flags = Flag::f_new_algo
+			| Flag::f_new_password_hash
+			| Flag::f_hint
+			| (secureSecret.isEmpty() ? Flag(0) : Flag::f_new_secure_settings)
+			| ((!hasRecoveryEmail) ? Flag(0) : Flag::f_email);
+
+		auto newSecureSecret = bytes::vector();
+		auto newSecureSecretId = 0ULL;
+		if (!secureSecret.isEmpty()) {
+			newSecureSecretId = Passport::CountSecureSecretId(
+				bytes::make_span(secureSecret));
+			newSecureSecret = Passport::EncryptSecureSecret(
+				bytes::make_span(secureSecret),
+				Core::ComputeSecureSecretHash(
+					latestState.mtp.newSecureSecret,
+					bytes::make_span(newPasswordBytes)));
+		}
+		const auto settings = MTP_account_passwordInputSettings(
+			MTP_flags(flags),
+			Core::PrepareCloudPasswordAlgo(newPassword.isEmpty()
+				? v::null
+				: latestState.mtp.newPassword),
+			newPassword.isEmpty()
+				? MTP_bytes()
+				: MTP_bytes(newPasswordHash.modpow),
+			MTP_string(hint),
+			MTP_string(recoveryEmail),
+			MTP_secureSecretSettings(
+				Core::PrepareSecureSecretAlgo(
+					latestState.mtp.newSecureSecret),
+				MTP_bytes(newSecureSecret),
+				MTP_long(newSecureSecretId)));
+		_api.request(MTPaccount_UpdatePasswordSettings(
+			GeneratePasswordCheck(oldPassword, latestState).result,
+			settings
+		)).done([=] {
+			finishSet(consumer, 0);
+		}).fail([=](const MTP::Error &error) {
+			const auto &type = error.type();
+			const auto prefix = u"EMAIL_UNCONFIRMED_"_q;
+			if (type.startsWith(prefix)) {
+				const auto codeLength = base::StringViewMid(
+					type,
+					prefix.size()).toInt();
+
+				finishSet(consumer, codeLength);
+			} else {
+				consumer.put_error_copy(type);
+			}
+		}).handleFloodErrors().send();
+	};
+
+	return [=](auto consumer) {
+		_api.request(MTPaccount_GetPassword(
+		)).done([=](const MTPaccount_Password &result) {
+			const auto latestState = ProcessMtpState(result);
+
+			if (latestState.hasPassword
+					&& !oldPassword.isEmpty()
+					&& !newPassword.isEmpty()) {
+
+				_api.request(MTPaccount_GetPasswordSettings(
+					GeneratePasswordCheck(oldPassword, latestState).result
+				)).done([=](const MTPaccount_PasswordSettings &result) {
+					using Settings = MTPDaccount_passwordSettings;
+					const auto &data = result.match([&](
+							const Settings &data) -> const Settings & {
+						return data;
+					});
+					auto secureSecret = QByteArray();
+					if (const auto wrapped = data.vsecure_settings()) {
+						using Secure = MTPDsecureSecretSettings;
+						const auto &settings = wrapped->match([](
+								const Secure &data) -> const Secure & {
+							return data;
+						});
+						const auto passwordUtf = oldPassword.toUtf8();
+						const auto secret = Passport::DecryptSecureSecret(
+							bytes::make_span(settings.vsecure_secret().v),
+							Core::ComputeSecureSecretHash(
+								Core::ParseSecureSecretAlgo(
+									settings.vsecure_algo()),
+								bytes::make_span(passwordUtf)));
+						if (secret.empty()) {
+							LOG(("API Error: "
+								"Failed to decrypt secure secret."));
+							consumer.put_error("SUGGEST_SECRET_RESET");
+							return;
+						} else if (Passport::CountSecureSecretId(secret)
+								!= settings.vsecure_secret_id().v) {
+							LOG(("API Error: Wrong secure secret id."));
+							consumer.put_error("SUGGEST_SECRET_RESET");
+							return;
+						} else {
+							secureSecret = QByteArray(
+								reinterpret_cast<const char*>(secret.data()),
+								secret.size());
+						}
+					}
+					_api.request(MTPaccount_GetPassword(
+					)).done([=](const MTPaccount_Password &result) {
+						const auto latestState = ProcessMtpState(result);
+						sendMTPaccountUpdatePasswordSettings(
+							latestState,
+							secureSecret,
+							consumer);
+					}).fail([=](const MTP::Error &error) {
+						consumer.put_error_copy(error.type());
+					}).send();
+				}).fail([=](const MTP::Error &error) {
+					consumer.put_error_copy(error.type());
+				}).send();
+			} else {
+				sendMTPaccountUpdatePasswordSettings(
+					latestState,
+					QByteArray(),
+					consumer);
+			}
+		}).fail([=](const MTP::Error &error) {
+			consumer.put_error_copy(error.type());
+		}).send();
+		return rpl::lifetime();
+	};
+}
+
+rpl::producer<rpl::no_value, QString> CloudPassword::check(
+		const QString &password) {
+	return [=](auto consumer) {
+		_api.request(MTPaccount_GetPassword(
+		)).done([=](const MTPaccount_Password &result) {
+			const auto latestState = ProcessMtpState(result);
+			const auto input = GeneratePasswordCheck(password, latestState);
+
+			_api.request(MTPaccount_GetPasswordSettings(
+				input.result
+			)).done([=](const MTPaccount_PasswordSettings &result) {
+				consumer.put_done();
+			}).fail([=](const MTP::Error &error) {
+				consumer.put_error_copy(error.type());
+			}).send();
+		}).fail([=](const MTP::Error &error) {
+			consumer.put_error_copy(error.type());
+		}).send();
+
+		return rpl::lifetime();
+	};
+}
+
+rpl::producer<rpl::no_value, QString> CloudPassword::confirmEmail(
+		const QString &code) {
+	return [=](auto consumer) {
+		_api.request(MTPaccount_ConfirmPasswordEmail(
+			MTP_string(code)
+		)).done([=] {
+			_api.request(MTPaccount_GetPassword(
+			)).done([=](const MTPaccount_Password &result) {
+				apply(ProcessMtpState(result));
+				consumer.put_done();
+			}).fail([=](const MTP::Error &error) {
+				consumer.put_error_copy(error.type());
+			}).send();
+		}).fail([=](const MTP::Error &error) {
+			consumer.put_error_copy(error.type());
+		}).handleFloodErrors().send();
+
+		return rpl::lifetime();
+	};
+}
+
+rpl::producer<rpl::no_value, QString> CloudPassword::resendEmailCode() {
+	return [=](auto consumer) {
+		_api.request(MTPaccount_ResendPasswordEmail(
+		)).done([=] {
+			_api.request(MTPaccount_GetPassword(
+			)).done([=](const MTPaccount_Password &result) {
+				apply(ProcessMtpState(result));
+				consumer.put_done();
+			}).fail([=](const MTP::Error &error) {
+				consumer.put_error_copy(error.type());
+			}).send();
+		}).fail([=](const MTP::Error &error) {
+			consumer.put_error_copy(error.type());
+		}).handleFloodErrors().send();
+
+		return rpl::lifetime();
+	};
+}
+
+rpl::producer<CloudPassword::SetOk, QString> CloudPassword::setEmail(
+		const QString &oldPassword,
+		const QString &recoveryEmail) {
+	const auto sendMTPaccountUpdatePasswordSettings = [=](
+			const Core::CloudPasswordState &latestState,
+			auto consumer) {
+		const auto settings = MTP_account_passwordInputSettings(
+			MTP_flags(MTPDaccount_passwordInputSettings::Flag::f_email),
+			MTP_passwordKdfAlgoUnknown(),
+			MTP_bytes(),
+			MTP_string(),
+			MTP_string(recoveryEmail),
+			MTPSecureSecretSettings());
+		_api.request(MTPaccount_UpdatePasswordSettings(
+			GeneratePasswordCheck(oldPassword, latestState).result,
+			settings
+		)).done([=] {
+			finishSet(consumer, 0);
+		}).fail([=](const MTP::Error &error) {
+			const auto &type = error.type();
+			const auto prefix = u"EMAIL_UNCONFIRMED_"_q;
+			if (type.startsWith(prefix)) {
+				const auto codeLength = base::StringViewMid(
+					type,
+					prefix.size()).toInt();
+
+				finishSet(consumer, codeLength);
+			} else {
+				consumer.put_error_copy(type);
+			}
+		}).handleFloodErrors().send();
+	};
+
+	return [=](auto consumer) {
+		_api.request(MTPaccount_GetPassword(
+		)).done([=](const MTPaccount_Password &result) {
+			const auto latestState = ProcessMtpState(result);
+			sendMTPaccountUpdatePasswordSettings(latestState, consumer);
+		}).fail([=](const MTP::Error &error) {
+			consumer.put_error_copy(error.type());
+		}).send();
+		return rpl::lifetime();
+	};
+}
+
+rpl::producer<rpl::no_value, QString> CloudPassword::recoverPassword(
+		const QString &code,
+		const QString &newPassword,
+		const QString &newHint) {
+
+	const auto finish = [=](auto consumer) {
+		_api.request(MTPaccount_GetPassword(
+		)).done([=](const MTPaccount_Password &result) {
+			apply(ProcessMtpState(result));
+			consumer.put_done();
+		}).fail([=](const MTP::Error &error) {
+			consumer.put_error_copy(error.type());
+		}).handleFloodErrors().send();
+	};
+
+	const auto sendMTPaccountUpdatePasswordSettings = [=](
+			const Core::CloudPasswordState &latestState,
+			auto consumer) {
+		const auto newPasswordBytes = newPassword.toUtf8();
+		const auto newPasswordHash = Core::ComputeCloudPasswordDigest(
+			latestState.mtp.newPassword,
+			bytes::make_span(newPasswordBytes));
+		if (!newPassword.isEmpty() && newPasswordHash.modpow.empty()) {
+			consumer.put_error("INTERNAL_SERVER_ERROR");
+			return;
+		}
+		using Flag = MTPDaccount_passwordInputSettings::Flag;
+		const auto flags = Flag::f_new_algo
+			| Flag::f_new_password_hash
+			| Flag::f_hint;
+
+		const auto settings = MTP_account_passwordInputSettings(
+			MTP_flags(flags),
+			Core::PrepareCloudPasswordAlgo(newPassword.isEmpty()
+				? v::null
+				: latestState.mtp.newPassword),
+			newPassword.isEmpty()
+				? MTP_bytes()
+				: MTP_bytes(newPasswordHash.modpow),
+			MTP_string(newHint),
+			MTP_string(),
+			MTPSecureSecretSettings());
+
+		_api.request(MTPauth_RecoverPassword(
+			MTP_flags(newPassword.isEmpty()
+				? MTPauth_RecoverPassword::Flags(0)
+				: MTPauth_RecoverPassword::Flag::f_new_settings),
+			MTP_string(code),
+			settings
+		)).done([=](const MTPauth_Authorization &result) {
+			finish(consumer);
+		}).fail([=](const MTP::Error &error) {
+			const auto &type = error.type();
+			consumer.put_error_copy(type);
+		}).handleFloodErrors().send();
+	};
+
+	return [=](auto consumer) {
+		_api.request(MTPaccount_GetPassword(
+		)).done([=](const MTPaccount_Password &result) {
+			const auto latestState = ProcessMtpState(result);
+			sendMTPaccountUpdatePasswordSettings(latestState, consumer);
+		}).fail([=](const MTP::Error &error) {
+			consumer.put_error_copy(error.type());
+		}).send();
+		return rpl::lifetime();
+	};
+}
+
+rpl::producer<QString, QString> CloudPassword::requestPasswordRecovery() {
+	return [=](auto consumer) {
+		_api.request(MTPauth_RequestPasswordRecovery(
+		)).done([=](const MTPauth_PasswordRecovery &result) {
+			result.match([&](const MTPDauth_passwordRecovery &data) {
+				consumer.put_next(qs(data.vemail_pattern().v));
+			});
+			consumer.put_done();
+		}).fail([=](const MTP::Error &error) {
+			consumer.put_error_copy(error.type());
+		}).send();
+		return rpl::lifetime();
+	};
+}
+
+auto CloudPassword::checkRecoveryEmailAddressCode(const QString &code)
+-> rpl::producer<rpl::no_value, QString> {
+	return [=](auto consumer) {
+		_api.request(MTPauth_CheckRecoveryPassword(
+			MTP_string(code)
+		)).done([=] {
+			consumer.put_done();
+		}).fail([=](const MTP::Error &error) {
+			consumer.put_error_copy(error.type());
+		}).handleFloodErrors().send();
+
+		return rpl::lifetime();
+	};
+}
+
+void RequestLoginEmailCode(
+		MTP::Sender &api,
+		const QString &sendToEmail,
+		Fn<void(int length, const QString &pattern)> done,
+		Fn<void(const QString &error)> fail) {
+	api.request(MTPaccount_SendVerifyEmailCode(
+		MTP_emailVerifyPurposeLoginChange(),
+		MTP_string(sendToEmail)
+	)).done([=](const MTPaccount_SentEmailCode &result) {
+		done(result.data().vlength().v, qs(result.data().vemail_pattern()));
+	}).fail([=](const MTP::Error &error) {
+		fail(error.type());
+	}).send();
+}
+
+void VerifyLoginEmail(
+		MTP::Sender &api,
+		const QString &code,
+		Fn<void()> done,
+		Fn<void(const QString &error)> fail) {
+	api.request(MTPaccount_VerifyEmail(
+		MTP_emailVerifyPurposeLoginChange(),
+		MTP_emailVerificationCode(MTP_string(code))
+	)).done([=](const MTPaccount_EmailVerified &result) {
+		result.match([=](const MTPDaccount_emailVerified &data) {
+			done();
+		}, [=](const MTPDaccount_emailVerifiedLogin &data) {
+			fail(QString());
+		});
+	}).fail([=](const MTP::Error &error) {
+		fail(error.type());
+	}).send();
 }
 
 } // namespace Api

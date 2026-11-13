@@ -9,8 +9,13 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 
 #include "ui/rp_widget.h"
 #include "ui/effects/animations.h"
-#include "boxes/abstract_box.h"
+#include "ui/layers/box_content.h"
 #include "base/bytes.h"
+#include "base/timer.h"
+
+namespace base {
+enum class SystemUnlockResult;
+} // namespace base
 
 namespace Ui {
 class PasswordInput;
@@ -26,29 +31,44 @@ class Session;
 namespace Window {
 
 class Controller;
+class SlideAnimation;
+
+enum class PasscodeAttempt : uchar {
+	Empty,
+	Flood,
+	Busy,
+	Started,
+};
+
+// Empty and Flood are answered at once, before any derivation. Otherwise the
+// derivation runs on a worker and done runs on the main thread with the
+// verdict, after the bad tries counters were bumped for a wrong one. Busy
+// while any lock screen's attempt is in flight: nothing starts and done is
+// never invoked. Does not unlock: Core::App().unlockPasscode() destroys the
+// main lock screen widget, so the caller runs it as its own last statement.
+[[nodiscard]] PasscodeAttempt TryPasscode(
+	const QString &passcode,
+	Fn<void(bool correct)> done);
 
 class LockWidget : public Ui::RpWidget {
 public:
 	LockWidget(QWidget *parent, not_null<Controller*> window);
+	~LockWidget();
 
-	not_null<Controller*> window() const;
+	[[nodiscard]] not_null<Controller*> window() const;
 
 	virtual void setInnerFocus();
 
-	void showAnimated(const QPixmap &bgAnimCache, bool back = false);
+	void showAnimated(QPixmap oldContentCache);
 	void showFinished();
 
 protected:
 	void paintEvent(QPaintEvent *e) override;
-	virtual void paintContent(Painter &p);
+	virtual void paintContent(QPainter &p);
 
 private:
-	void animationCallback();
-
 	const not_null<Controller*> _window;
-	Ui::Animations::Simple _a_show;
-	bool _showBack = false;
-	QPixmap _cacheUnder, _cacheOver;
+	std::unique_ptr<SlideAnimation> _showAnimation;
 
 };
 
@@ -62,15 +82,33 @@ protected:
 	void resizeEvent(QResizeEvent *e) override;
 
 private:
-	void paintContent(Painter &p) override;
+	enum class SystemUnlockType : uchar {
+		None,
+		Default,
+		Biometrics,
+		Companion,
+	};
+
+	void paintContent(QPainter &p) override;
+
+	void setupSystemUnlockInfo();
+	void setupSystemUnlock();
+	void suggestSystemUnlock();
+	void systemUnlockDone(base::SystemUnlockResult result);
 	void changed();
 	void submit();
 	void error();
+	void setDeriving(bool deriving);
 
+	rpl::variable<SystemUnlockType> _systemUnlockAvailable;
+	rpl::variable<SystemUnlockType> _systemUnlockAllowed;
 	object_ptr<Ui::PasswordInput> _passcode;
 	object_ptr<Ui::RoundButton> _submit;
 	object_ptr<Ui::LinkButton> _logout;
 	QString _error;
+
+	rpl::lifetime _systemUnlockSuggested;
+	base::Timer _systemUnlockCooldown;
 
 };
 

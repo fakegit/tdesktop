@@ -11,9 +11,11 @@ https://github.com/telegramdesktop/tdesktop/blob/master/LEGAL
 #include "mtproto/mtp_instance.h"
 #include "base/unixtime.h"
 #include "base/openssl_help.h"
+#include "base/random.h"
 #include "scheme.h"
 
 #include <QtCore/QPointer>
+#include <QtCore/QtEndian>
 
 namespace MTP::details {
 namespace {
@@ -57,9 +59,8 @@ namespace {
 	constexpr auto kMessageKeyBytes = 4 * sizeof(mtpPrime);
 	constexpr auto kPrefix = (kAuthKeyIdBytes + kMessageKeyBytes);
 	auto encrypted = QByteArray(kPrefix + sizeInBytes, Qt::Uninitialized);
-	*reinterpret_cast<uint64*>(encrypted.data()) = persistentKey->keyId();
-	*reinterpret_cast<MTPint128*>(encrypted.data() + kMessageKeyPosition)
-		= msgKey;
+	qToUnaligned(persistentKey->keyId(), encrypted.data());
+	qToUnaligned(msgKey, encrypted.data() + kMessageKeyPosition);
 
 	aesIgeEncrypt_oldmtp(
 		serialized->constData(),
@@ -84,7 +85,7 @@ SerializedRequest DcKeyBinder::prepareRequest(
 	Expects(temporaryKey != nullptr);
 	Expects(temporaryKey->expiresAt() != 0);
 
-	const auto nonce = openssl::RandomValue<uint64>();
+	const auto nonce = base::RandomValue<uint64>();
 	const auto msgId = base::unixtime::mtproto_msg_id();
 	auto result = SerializedRequest::Serialize(MTPauth_BindTempAuthKey(
 		MTP_long(_persistentKey->keyId()),
@@ -106,7 +107,7 @@ SerializedRequest DcKeyBinder::prepareRequest(
 DcKeyBindState DcKeyBinder::handleResponse(const mtpBuffer &response) {
 	Expects(!response.isEmpty());
 
-	auto from = response.begin();
+	auto from = response.data();
 	const auto end = from + response.size();
 	auto error = MTPRpcError();
 	if (response[0] == mtpc_boolTrue) {
